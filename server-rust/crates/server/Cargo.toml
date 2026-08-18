@@ -1,0 +1,12 @@
+[package]
+name = "crystal-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+crystal-protocol = { path = "../protocol" }
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

@@ -364,3 +364,9 @@ FodyWeavers.xsd
 /Build
 /.idea/.idea.Legend of Mir/.idea
 /.idea/config
+
+# --- Web3 MMORPG 改造新增 ---
+# Rust 服务器
+/server-rust/target/
+# Godot 客户端
+/client-godot/.godot/
