@@ -313,57 +313,195 @@ impl PacketCodec for Chat {
     }
 }
 
-// ----------------------------- 分发枚举 -----------------------------
+// ----------------------------- 分发（宏驱动） -----------------------------
 
-/// 已移植客户端包的分发枚举（随移植进度扩展）
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ClientPacket {
-    ClientVersion(ClientVersion),
-    Disconnect(Disconnect),
-    KeepAlive(KeepAlive),
-    NewAccount(NewAccount),
-    ChangePassword(ChangePassword),
-    Login(Login),
-    NewCharacter(NewCharacter),
-    DeleteCharacter(DeleteCharacter),
-    StartGame(StartGame),
-    LogOut(LogOut),
-    Turn(Turn),
-    Walk(Walk),
-    Run(Run),
-    Chat(Chat),
+pub mod batch_1;
+pub mod batch_2;
+pub mod batch_3;
+pub mod batch_4;
+pub mod batch_7;
+
+pub use batch_1::*;
+pub use batch_2::*;
+pub use batch_3::*;
+pub use batch_4::*;
+pub use batch_7::*;
+
+/// 客户端数据包分发宏: 由 (变体名 => 类型) 列表生成枚举与按 ID 解码。
+/// 每移植一批，在 `client_packet_dispatch!` 调用中追加条目。
+macro_rules! client_packet_dispatch {
+    ($($v:ident => $t:ty),* $(,)?) => {
+        #[derive(Debug, Clone, PartialEq)]
+        pub enum ClientPacket {
+            $( $v($t) ),*
+        }
+        impl ClientPacket {
+            /// 按 ID 解码（未移植的 ID 返回 `InvalidPacketId`）
+            pub fn decode(id: i16, payload: &[u8]) -> Result<Self> {
+                use crate::frame::PacketCodec as _;
+                $(
+                    if id == <$t as PacketCodec>::ID {
+                        return Ok(ClientPacket::$v(crate::frame::decode_packet::<$t>(id, payload)?));
+                    }
+                )*
+                Err(crate::ProtocolError::InvalidPacketId(id))
+            }
+        }
+    };
 }
 
-impl ClientPacket {
-    /// 按 ID 解码（未移植的 ID 返回 `InvalidPacketId`）
-    pub fn decode(id: i16, payload: &[u8]) -> Result<Self> {
-        use ClientPacketId::*;
-        Ok(
-            match ClientPacketId::from_i16(id).ok_or(crate::ProtocolError::InvalidPacketId(id))? {
-                ClientVersion => {
-                    ClientPacket::ClientVersion(crate::frame::decode_packet(id, payload)?)
-                }
-                Disconnect => ClientPacket::Disconnect(crate::frame::decode_packet(id, payload)?),
-                KeepAlive => ClientPacket::KeepAlive(crate::frame::decode_packet(id, payload)?),
-                NewAccount => ClientPacket::NewAccount(crate::frame::decode_packet(id, payload)?),
-                ChangePassword => {
-                    ClientPacket::ChangePassword(crate::frame::decode_packet(id, payload)?)
-                }
-                Login => ClientPacket::Login(crate::frame::decode_packet(id, payload)?),
-                NewCharacter => {
-                    ClientPacket::NewCharacter(crate::frame::decode_packet(id, payload)?)
-                }
-                DeleteCharacter => {
-                    ClientPacket::DeleteCharacter(crate::frame::decode_packet(id, payload)?)
-                }
-                StartGame => ClientPacket::StartGame(crate::frame::decode_packet(id, payload)?),
-                LogOut => ClientPacket::LogOut(crate::frame::decode_packet(id, payload)?),
-                Turn => ClientPacket::Turn(crate::frame::decode_packet(id, payload)?),
-                Walk => ClientPacket::Walk(crate::frame::decode_packet(id, payload)?),
-                Run => ClientPacket::Run(crate::frame::decode_packet(id, payload)?),
-                Chat => ClientPacket::Chat(crate::frame::decode_packet(id, payload)?),
-                _ => return Err(crate::ProtocolError::InvalidPacketId(id)),
-            },
-        )
-    }
+client_packet_dispatch! {
+    ClientVersion => ClientVersion,
+    Disconnect => Disconnect,
+    KeepAlive => KeepAlive,
+    NewAccount => NewAccount,
+    ChangePassword => ChangePassword,
+    Login => Login,
+    NewCharacter => NewCharacter,
+    DeleteCharacter => DeleteCharacter,
+    StartGame => StartGame,
+    LogOut => LogOut,
+    Turn => Turn,
+    Walk => Walk,
+    Run => Run,
+    Chat => Chat,
+    MarketPage => MarketPage,
+    MarketBuy => MarketBuy,
+    MarketSellNow => MarketSellNow,
+    MarketGetBack => MarketGetBack,
+    RequestUserName => RequestUserName,
+    RequestChatItem => RequestChatItem,
+    EditGuildMember => EditGuildMember,
+    EditGuildNotice => EditGuildNotice,
+    GuildInvite => GuildInvite,
+    RequestGuildInfo => RequestGuildInfo,
+    GuildNameReturn => GuildNameReturn,
+    GuildWarReturn => GuildWarReturn,
+    EquipSlotItem => EquipSlotItem,
+    FishingCast => FishingCast,
+    FishingChangeAutocast => FishingChangeAutocast,
+    AcceptQuest => AcceptQuest,
+    FinishQuest => FinishQuest,
+    AbandonQuest => AbandonQuest,
+    ShareQuest => ShareQuest,
+    AcceptReincarnation => AcceptReincarnation,
+    CancelReincarnation => CancelReincarnation,
+    CombineItem => CombineItem,
+    AwakeningNeedMaterials => AwakeningNeedMaterials,
+    AwakeningLockedItem => AwakeningLockedItem,
+    Awakening => Awakening,
+    DisassembleItem => DisassembleItem,
+    DowngradeAwakening => DowngradeAwakening,
+    ResetAddedItem => ResetAddedItem,
+    SendMail => SendMail,
+    ReadMail => ReadMail,
+    CollectParcel => CollectParcel,
+    DeleteMail => DeleteMail,
+    LockMail => LockMail,
+    MailLockedItem => MailLockedItem,
+    MailCost => MailCost,
+    RequestIntelligentCreatureUpdates => RequestIntelligentCreatureUpdates,
+    UpdateIntelligentCreature => UpdateIntelligentCreature,
+    IntelligentCreaturePickup => IntelligentCreaturePickup,
+    AddFriend => AddFriend,
+    RemoveFriend => RemoveFriend,
+    RefreshFriends => RefreshFriends,
+    AddMemo => AddMemo,
+    GuildBuffUpdate => GuildBuffUpdate,
+    GameshopBuy => GameshopBuy,
+    NPCConfirmInput => NPCConfirmInput,
+    ReportIssue => ReportIssue,
+    GetRanking => GetRanking,
+    Opendoor => Opendoor,
+    GetRentedItems => GetRentedItems,
+    ItemRentalRequest => ItemRentalRequest,
+    ItemRentalFee => ItemRentalFee,
+    ItemRentalPeriod => ItemRentalPeriod,
+    DepositRentalItem => DepositRentalItem,
+    RetrieveRentalItem => RetrieveRentalItem,
+    CancelItemRental => CancelItemRental,
+    ItemRentalLockFee => ItemRentalLockFee,
+    ItemRentalLockItem => ItemRentalLockItem,
+    ConfirmItemRental => ConfirmItemRental,
+    DeleteItem => DeleteItem,
+    MoveItem => MoveItem,
+    StoreItem => StoreItem,
+    DepositRefineItem => DepositRefineItem,
+    RetrieveRefineItem => RetrieveRefineItem,
+    RefineCancel => RefineCancel,
+    RefineItem => RefineItem,
+    CheckRefine => CheckRefine,
+    ReplaceWedRing => ReplaceWedRing,
+    DepositTradeItem => DepositTradeItem,
+    RetrieveTradeItem => RetrieveTradeItem,
+    TakeBackItem => TakeBackItem,
+    MergeItem => MergeItem,
+    EquipItem => EquipItem,
+    RemoveItem => RemoveItem,
+    RemoveSlotItem => RemoveSlotItem,
+    SplitItem => SplitItem,
+    UseItem => UseItem,
+    DropItem => DropItem,
+    TakeBackHeroItem => TakeBackHeroItem,
+    TransferHeroItem => TransferHeroItem,
+    DropGold => DropGold,
+    PickUp => PickUp,
+    Inspect => Inspect,
+    Observe => Observe,
+    ChangeAMode => ChangeAMode,
+    ChangePMode => ChangePMode,
+    ChangeTrade => ChangeTrade,
+    Attack => Attack,
+    RangeAttack => RangeAttack,
+    Harvest => Harvest,
+    CallNPC => CallNPC,
+    BuyItem => BuyItem,
+    SellItem => SellItem,
+    CraftItem => CraftItem,
+    RepairItem => RepairItem,
+    BuyItemBack => BuyItemBack,
+    SRepairItem => SRepairItem,
+    RequestMapInfo => RequestMapInfo,
+    RequestMonsterInfo => RequestMonsterInfo,
+    RequestNPCInfo => RequestNPCInfo,
+    RequestItemInfo => RequestItemInfo,
+    TeleportToNPC => TeleportToNPC,
+    SearchMap => SearchMap,
+    MagicKey => MagicKey,
+    Magic => Magic,
+    SwitchGroup => SwitchGroup,
+    AddMember => AddMember,
+    DelMember => DelMember,
+    GroupInvite => GroupInvite,
+    NewHero => NewHero,
+    SetAutoPotValue => SetAutoPotValue,
+    SetAutoPotItem => SetAutoPotItem,
+    SetHeroBehaviour => SetHeroBehaviour,
+    ChangeHero => ChangeHero,
+    MarriageRequest => MarriageRequest,
+    MarriageReply => MarriageReply,
+    ChangeMarriage => ChangeMarriage,
+    DivorceRequest => DivorceRequest,
+    DivorceReply => DivorceReply,
+    AddMentor => AddMentor,
+    MentorReply => MentorReply,
+    AllowMentor => AllowMentor,
+    CancelMentor => CancelMentor,
+    TradeRequest => TradeRequest,
+    TradeReply => TradeReply,
+    TradeGold => TradeGold,
+    TradeConfirm => TradeConfirm,
+    TradeCancel => TradeCancel,
+    TownRevive => TownRevive,
+    SpellToggle => SpellToggle,
+    ConsignItem => ConsignItem,
+    GuildTerritoryPage => GuildTerritoryPage,
+    PurchaseGuildTerritory => PurchaseGuildTerritory,
+    MarketSearch => MarketSearch,
+    MarketRefresh => MarketRefresh,
+    UnlockStorage => UnlockStorage,
+    SetStoragePassword => SetStoragePassword,
+    RemoveStoragePassword => RemoveStoragePassword,
+    GuildStorageGoldChange => GuildStorageGoldChange,
+    GuildStorageItemChange => GuildStorageItemChange,
 }

@@ -14,7 +14,9 @@ use crate::Result;
 /// 可空物品槽（同 C# 的 `UserItem[]`，元素可 null）
 pub type ItemSlots = Vec<Option<UserItem>>;
 
-fn read_item_slots(r: &mut Reader) -> Result<Option<ItemSlots>> {
+pub(crate) fn read_item_slots(r: &mut Reader) -> Result<Option<ItemSlots>> {
+    // C#（UserInformation/UserSlotsRefresh）: 外层 bool = 数组是否存在；
+    // 逐槽 bool = 该槽是否有物品（true=有）。与 UserItem 内部 Slots 方向相反！
     if !r.read_bool()? {
         return Ok(None);
     }
@@ -22,15 +24,15 @@ fn read_item_slots(r: &mut Reader) -> Result<Option<ItemSlots>> {
     let mut slots = Vec::with_capacity(len.max(0) as usize);
     for _ in 0..len.max(0) {
         if r.read_bool()? {
-            slots.push(None);
-        } else {
             slots.push(Some(UserItem::read(r)?));
+        } else {
+            slots.push(None);
         }
     }
     Ok(Some(slots))
 }
 
-fn write_item_slots(w: &mut Writer, slots: &Option<ItemSlots>) {
+pub(crate) fn write_item_slots(w: &mut Writer, slots: &Option<ItemSlots>) {
     match slots {
         None => w.write_bool(false),
         Some(items) => {
@@ -38,9 +40,9 @@ fn write_item_slots(w: &mut Writer, slots: &Option<ItemSlots>) {
             w.write_i32(items.len() as i32);
             for item in items {
                 match item {
-                    None => w.write_bool(true),
+                    None => w.write_bool(false),
                     Some(item) => {
-                        w.write_bool(false);
+                        w.write_bool(true);
                         item.write(w);
                     }
                 }
@@ -1121,127 +1123,325 @@ impl PacketCodec for TimeOfDay {
     }
 }
 
-// ----------------------------- 分发枚举 -----------------------------
+// ----------------------------- 分发（宏驱动） -----------------------------
 
-/// 已移植服务器包的分发枚举（随移植进度扩展）
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ServerPacket {
-    Connected(Connected),
-    ClientVersion(ClientVersion),
-    Disconnect(Disconnect),
-    KeepAlive(KeepAlive),
-    NewAccount(NewAccount),
-    ChangePassword(ChangePassword),
-    ChangePasswordBanned(ChangePasswordBanned),
-    Login(Login),
-    LoginBanned(LoginBanned),
-    LoginSuccess(LoginSuccess),
-    NewCharacter(NewCharacter),
-    NewCharacterSuccess(NewCharacterSuccess),
-    DeleteCharacter(DeleteCharacter),
-    DeleteCharacterSuccess(DeleteCharacterSuccess),
-    StartGame(StartGame),
-    StartGameBanned(StartGameBanned),
-    StartGameDelay(StartGameDelay),
-    MapInformation(MapInformation),
-    NewMapInfo(NewMapInfo),
-    WorldMapSetupInfo(WorldMapSetupInfo),
-    SearchMapResult(SearchMapResult),
-    UserInformation(UserInformation),
-    UserSlotsRefresh(UserSlotsRefresh),
-    UserLocation(UserLocation),
-    ObjectPlayer(ObjectPlayer),
-    ObjectHero(ObjectHero),
-    ObjectRemove(ObjectRemove),
-    ObjectTurn(ObjectTurn),
-    ObjectWalk(ObjectWalk),
-    ObjectRun(ObjectRun),
-    Chat(Chat),
-    ObjectChat(ObjectChat),
-    TimeOfDay(TimeOfDay),
+pub mod batch_1;
+pub mod batch_2;
+pub mod batch_3;
+pub mod batch_4;
+pub mod batch_5;
+pub mod batch_6;
+pub mod batch_7;
+
+pub use batch_1::*;
+pub use batch_2::*;
+pub use batch_3::*;
+pub use batch_4::*;
+pub use batch_5::*;
+pub use batch_6::*;
+pub use batch_7::*;
+
+/// 服务器数据包分发宏: 由类型列表生成枚举与按 ID 解码。
+/// 每移植一批，在 `server_packet_dispatch!` 调用中追加类型名。
+macro_rules! server_packet_dispatch {
+    ($($v:ident => $t:ty),* $(,)?) => {
+        #[derive(Debug, Clone, PartialEq)]
+        pub enum ServerPacket {
+            $( $v($t) ),*
+        }
+        impl ServerPacket {
+            /// 按 ID 解码（未移植的 ID 返回 `InvalidPacketId`）
+            pub fn decode(id: i16, payload: &[u8]) -> Result<Self> {
+                use crate::frame::PacketCodec as _;
+                $(
+                    if id == <$t as PacketCodec>::ID {
+                        return Ok(ServerPacket::$v(crate::frame::decode_packet::<$t>(id, payload)?));
+                    }
+                )*
+                Err(crate::ProtocolError::InvalidPacketId(id))
+            }
+        }
+    };
 }
 
-impl ServerPacket {
-    /// 按 ID 解码（未移植的 ID 返回 `InvalidPacketId`）
-    pub fn decode(id: i16, payload: &[u8]) -> Result<Self> {
-        use ServerPacketId::*;
-        Ok(
-            match ServerPacketId::from_i16(id).ok_or(crate::ProtocolError::InvalidPacketId(id))? {
-                Connected => ServerPacket::Connected(crate::frame::decode_packet(id, payload)?),
-                ClientVersion => {
-                    ServerPacket::ClientVersion(crate::frame::decode_packet(id, payload)?)
-                }
-                Disconnect => ServerPacket::Disconnect(crate::frame::decode_packet(id, payload)?),
-                KeepAlive => ServerPacket::KeepAlive(crate::frame::decode_packet(id, payload)?),
-                NewAccount => ServerPacket::NewAccount(crate::frame::decode_packet(id, payload)?),
-                ChangePassword => {
-                    ServerPacket::ChangePassword(crate::frame::decode_packet(id, payload)?)
-                }
-                ChangePasswordBanned => {
-                    ServerPacket::ChangePasswordBanned(crate::frame::decode_packet(id, payload)?)
-                }
-                Login => ServerPacket::Login(crate::frame::decode_packet(id, payload)?),
-                LoginBanned => ServerPacket::LoginBanned(crate::frame::decode_packet(id, payload)?),
-                LoginSuccess => {
-                    ServerPacket::LoginSuccess(crate::frame::decode_packet(id, payload)?)
-                }
-                NewCharacter => {
-                    ServerPacket::NewCharacter(crate::frame::decode_packet(id, payload)?)
-                }
-                NewCharacterSuccess => {
-                    ServerPacket::NewCharacterSuccess(crate::frame::decode_packet(id, payload)?)
-                }
-                DeleteCharacter => {
-                    ServerPacket::DeleteCharacter(crate::frame::decode_packet(id, payload)?)
-                }
-                DeleteCharacterSuccess => {
-                    ServerPacket::DeleteCharacterSuccess(crate::frame::decode_packet(id, payload)?)
-                }
-                StartGame => ServerPacket::StartGame(crate::frame::decode_packet(id, payload)?),
-                StartGameBanned => {
-                    ServerPacket::StartGameBanned(crate::frame::decode_packet(id, payload)?)
-                }
-                StartGameDelay => {
-                    ServerPacket::StartGameDelay(crate::frame::decode_packet(id, payload)?)
-                }
-                MapInformation => {
-                    ServerPacket::MapInformation(crate::frame::decode_packet(id, payload)?)
-                }
-                NewMapInfo => ServerPacket::NewMapInfo(crate::frame::decode_packet(id, payload)?),
-                WorldMapSetup => {
-                    ServerPacket::WorldMapSetupInfo(crate::frame::decode_packet(id, payload)?)
-                }
-                SearchMapResult => {
-                    ServerPacket::SearchMapResult(crate::frame::decode_packet(id, payload)?)
-                }
-                UserInformation => {
-                    ServerPacket::UserInformation(crate::frame::decode_packet(id, payload)?)
-                }
-                UserSlotsRefresh => {
-                    ServerPacket::UserSlotsRefresh(crate::frame::decode_packet(id, payload)?)
-                }
-                UserLocation => {
-                    ServerPacket::UserLocation(crate::frame::decode_packet(id, payload)?)
-                }
-                ObjectPlayer => {
-                    ServerPacket::ObjectPlayer(crate::frame::decode_packet(id, payload)?)
-                }
-                ObjectHero => ServerPacket::ObjectHero(crate::frame::decode_packet(id, payload)?),
-                ObjectRemove => {
-                    ServerPacket::ObjectRemove(crate::frame::decode_packet(id, payload)?)
-                }
-                ObjectTurn => ServerPacket::ObjectTurn(crate::frame::decode_packet(id, payload)?),
-                ObjectWalk => ServerPacket::ObjectWalk(crate::frame::decode_packet(id, payload)?),
-                ObjectRun => ServerPacket::ObjectRun(crate::frame::decode_packet(id, payload)?),
-                Chat => ServerPacket::Chat(crate::frame::decode_packet(id, payload)?),
-                ObjectChat => ServerPacket::ObjectChat(crate::frame::decode_packet(id, payload)?),
-                TimeOfDay => ServerPacket::TimeOfDay(crate::frame::decode_packet(id, payload)?),
-                _ => return Err(crate::ProtocolError::InvalidPacketId(id)),
-            },
-        )
-    }
+server_packet_dispatch! {
+    Connected => Connected,
+    ClientVersion => ClientVersion,
+    Disconnect => Disconnect,
+    KeepAlive => KeepAlive,
+    NewAccount => NewAccount,
+    ChangePassword => ChangePassword,
+    ChangePasswordBanned => ChangePasswordBanned,
+    Login => Login,
+    LoginBanned => LoginBanned,
+    LoginSuccess => LoginSuccess,
+    NewCharacter => NewCharacter,
+    NewCharacterSuccess => NewCharacterSuccess,
+    DeleteCharacter => DeleteCharacter,
+    DeleteCharacterSuccess => DeleteCharacterSuccess,
+    StartGame => StartGame,
+    StartGameBanned => StartGameBanned,
+    StartGameDelay => StartGameDelay,
+    MapInformation => MapInformation,
+    NewMapInfo => NewMapInfo,
+    WorldMapSetupInfo => WorldMapSetupInfo,
+    SearchMapResult => SearchMapResult,
+    UserInformation => UserInformation,
+    UserSlotsRefresh => UserSlotsRefresh,
+    UserLocation => UserLocation,
+    ObjectPlayer => ObjectPlayer,
+    ObjectHero => ObjectHero,
+    ObjectRemove => ObjectRemove,
+    ObjectTurn => ObjectTurn,
+    ObjectWalk => ObjectWalk,
+    ObjectRun => ObjectRun,
+    Chat => Chat,
+    ObjectChat => ObjectChat,
+    TimeOfDay => TimeOfDay,
+    NewHeroInfo => NewHeroInfo,
+    NewChatItem => NewChatItem,
+    MoveItem => MoveItem,
+    EquipItem => EquipItem,
+    MergeItem => MergeItem,
+    RemoveItem => RemoveItem,
+    RemoveSlotItem => RemoveSlotItem,
+    TakeBackItem => TakeBackItem,
+    StoreItem => StoreItem,
+    DepositRefineItem => DepositRefineItem,
+    RetrieveRefineItem => RetrieveRefineItem,
+    RefineCancel => RefineCancel,
+    RefineItem => RefineItem,
+    DepositTradeItem => DepositTradeItem,
+    RetrieveTradeItem => RetrieveTradeItem,
+    SplitItem => SplitItem,
+    UseItem => UseItem,
+    DropItem => DropItem,
+    TakeBackHeroItem => TakeBackHeroItem,
+    TransferHeroItem => TransferHeroItem,
+    PlayerUpdate => PlayerUpdate,
+    PlayerInspect => PlayerInspect,
+    MarriageRequest => MarriageRequest,
+    DivorceRequest => DivorceRequest,
+    MentorRequest => MentorRequest,
+    TradeRequest => TradeRequest,
+    TradeAccept => TradeAccept,
+    TradeGold => TradeGold,
+    TradeItem => TradeItem,
+    TradeConfirm => TradeConfirm,
+    TradeCancel => TradeCancel,
+    LogOutSuccess => LogOutSuccess,
+    LogOutFailed => LogOutFailed,
+    ReturnToLogin => ReturnToLogin,
+    ChangeAMode => ChangeAMode,
+    ChangePMode => ChangePMode,
+    ObjectItem => ObjectItem,
+    ObjectGold => ObjectGold,
+    GainedItem => GainedItem,
+    GainedGold => GainedGold,
+    LoseGold => LoseGold,
+    GainedCredit => GainedCredit,
+    LoseCredit => LoseCredit,
+    ObjectMonster => ObjectMonster,
+    ObjectAttack => ObjectAttack,
+    Struck => Struck,
+    ObjectStruck => ObjectStruck,
+    DamageIndicator => DamageIndicator,
+    DuraChanged => DuraChanged,
+    HealthChanged => HealthChanged,
+    HeroHealthChanged => HeroHealthChanged,
+    DeleteItem => DeleteItem,
+    Death => Death,
+    ObjectDied => ObjectDied,
+    ColourChanged => ColourChanged,
+    ObjectColourChanged => ObjectColourChanged,
+    ObjectGuildNameChanged => ObjectGuildNameChanged,
+    GainExperience => GainExperience,
+    GainHeroExperience => GainHeroExperience,
+    LevelChanged => LevelChanged,
+    HeroLevelChanged => HeroLevelChanged,
+    ObjectLeveled => ObjectLeveled,
+    ObjectHarvest => ObjectHarvest,
+    ObjectHarvested => ObjectHarvested,
+    ObjectNPC => ObjectNPC,
+    NPCResponse => NPCResponse,
+    ObjectHide => ObjectHide,
+    ObjectShow => ObjectShow,
+    Poisoned => Poisoned,
+    ObjectPoisoned => ObjectPoisoned,
+    MapChanged => MapChanged,
+    ObjectTeleportOut => ObjectTeleportOut,
+    ObjectTeleportIn => ObjectTeleportIn,
+    TeleportIn => TeleportIn,
+    NPCGoods => NPCGoods,
+    NPCSell => NPCSell,
+    NPCRepair => NPCRepair,
+    NPCSRepair => NPCSRepair,
+    NPCRefine => NPCRefine,
+    NPCCheckRefine => NPCCheckRefine,
+    NPCCollectRefine => NPCCollectRefine,
+    NPCReplaceWedRing => NPCReplaceWedRing,
+    NPCStorage => NPCStorage,
+    SellItem => SellItem,
+    RepairItem => RepairItem,
+    ItemRepaired => ItemRepaired,
+    ItemSlotSizeChanged => ItemSlotSizeChanged,
+    ItemSealChanged => ItemSealChanged,
+    NewMagic => NewMagic,
+    RemoveMagic => RemoveMagic,
+    MagicLeveled => MagicLeveled,
+    Magic => Magic,
+    MagicDelay => MagicDelay,
+    MagicCast => MagicCast,
+    ObjectMagic => ObjectMagic,
+    ObjectEffect => ObjectEffect,
+    ObjectProjectile => ObjectProjectile,
+    RangeAttack => RangeAttack,
+    Pushed => Pushed,
+    ObjectPushed => ObjectPushed,
+    ObjectName => ObjectName,
+    UserStorage => UserStorage,
+    SwitchGroup => SwitchGroup,
+    DeleteGroup => DeleteGroup,
+    DeleteMember => DeleteMember,
+    GroupInvite => GroupInvite,
+    AddMember => AddMember,
+    Revived => Revived,
+    ObjectRevived => ObjectRevived,
+    SpellToggle => SpellToggle,
+    ObjectHealth => ObjectHealth,
+    ObjectMana => ObjectMana,
+    MapEffect => MapEffect,
+    AllowObserve => AllowObserve,
+    ObjectRangeAttack => ObjectRangeAttack,
+    AddBuff => AddBuff,
+    RemoveBuff => RemoveBuff,
+    GroupMembersMap => GroupMembersMap,
+    SendMemberLocation => SendMemberLocation,
+    HeroInformation => HeroInformation,
+    UnlockHeroAutoPot => UnlockHeroAutoPot,
+    SetAutoPotValue => SetAutoPotValue,
+    SetAutoPotItem => SetAutoPotItem,
+    SetHeroBehaviour => SetHeroBehaviour,
+    ManageHeroes => ManageHeroes,
+    ChangeHero => ChangeHero,
+    DefaultNPC => DefaultNPC,
+    NPCUpdate => NPCUpdate,
+    NPCImageUpdate => NPCImageUpdate,
+    MountUpdate => MountUpdate,
+    TransformUpdate => TransformUpdate,
+    EquipSlotItem => EquipSlotItem,
+    FishingUpdate => FishingUpdate,
+    ChangeQuest => ChangeQuest,
+    CompleteQuest => CompleteQuest,
+    ShareQuest => ShareQuest,
+    NewQuestInfo => NewQuestInfo,
+    GainedQuestItem => GainedQuestItem,
+    DeleteQuestItem => DeleteQuestItem,
+    GameShopInfo => GameShopInfo,
+    GameShopStock => GameShopStock,
+    CancelReincarnation => CancelReincarnation,
+    RequestReincarnation => RequestReincarnation,
+    UserBackStep => UserBackStep,
+    ObjectBackStep => ObjectBackStep,
+    UserDashAttack => UserDashAttack,
+    ObjectDashAttack => ObjectDashAttack,
+    UserAttackMove => UserAttackMove,
+    CombineItem => CombineItem,
+    ItemUpgraded => ItemUpgraded,
+    SetConcentration => SetConcentration,
+    SetElemental => SetElemental,
+    ObjectDeco => ObjectDeco,
+    ObjectSneaking => ObjectSneaking,
+    ObjectLevelEffects => ObjectLevelEffects,
+    SetBindingShot => SetBindingShot,
+    SendOutputMessage => SendOutputMessage,
+    NPCAwakening => NPCAwakening,
+    NPCDisassemble => NPCDisassemble,
+    NPCDowngrade => NPCDowngrade,
+    NPCReset => NPCReset,
+    AwakeningNeedMaterials => AwakeningNeedMaterials,
+    AwakeningLockedItem => AwakeningLockedItem,
+    Awakening => Awakening,
+    ReceiveMail => ReceiveMail,
+    MailLockedItem => MailLockedItem,
+    MailSendRequest => MailSendRequest,
+    MailSent => MailSent,
+    ParcelCollected => ParcelCollected,
+    MailCost => MailCost,
+    ResizeInventory => ResizeInventory,
+    ResizeStorage => ResizeStorage,
+    NewIntelligentCreature => NewIntelligentCreature,
+    UpdateIntelligentCreatureList => UpdateIntelligentCreatureList,
+    IntelligentCreatureEnableRename => IntelligentCreatureEnableRename,
+    IntelligentCreaturePickup => IntelligentCreaturePickup,
+    NPCPearlGoods => NPCPearlGoods,
+    FriendUpdate => FriendUpdate,
+    LoverUpdate => LoverUpdate,
+    MentorUpdate => MentorUpdate,
+    GuildBuffList => GuildBuffList,
+    NPCRequestInput => NPCRequestInput,
+    Rankings => Rankings,
+    Opendoor => Opendoor,
+    GetRentedItems => GetRentedItems,
+    ItemRentalRequest => ItemRentalRequest,
+    ItemRentalFee => ItemRentalFee,
+    ItemRentalPeriod => ItemRentalPeriod,
+    DepositRentalItem => DepositRentalItem,
+    RetrieveRentalItem => RetrieveRentalItem,
+    UpdateRentalItem => UpdateRentalItem,
+    CancelItemRental => CancelItemRental,
+    ItemRentalLock => ItemRentalLock,
+    ItemRentalPartnerLock => ItemRentalPartnerLock,
+    CanConfirmItemRental => CanConfirmItemRental,
+    ConfirmItemRental => ConfirmItemRental,
+    NewRecipeInfo => NewRecipeInfo,
+    CraftItem => CraftItem,
+    OpenBrowser => OpenBrowser,
+    PlaySound => PlaySound,
+    SetTimer => SetTimer,
+    ExpireTimer => ExpireTimer,
+    UpdateNotice => UpdateNotice,
+    Roll => Roll,
+    SetCompass => SetCompass,
+    NewMonsterInfo => NewMonsterInfo,
+    NewNPCInfo => NewNPCInfo,
+    BaseStatsInfo => BaseStatsInfo,
+    ChatItemStats => ChatItemStats,
+    ConsignItem => ConsignItem,
+    GuildExpGain => GuildExpGain,
+    GuildInvite => GuildInvite,
+    GuildMemberChange => GuildMemberChange,
+    GuildNameRequest => GuildNameRequest,
+    GuildNoticeChange => GuildNoticeChange,
+    GuildRequestWar => GuildRequestWar,
+    GuildStatus => GuildStatus,
+    GuildStorageGoldChange => GuildStorageGoldChange,
+    GuildStorageItemChange => GuildStorageItemChange,
+    GuildStorageList => GuildStorageList,
+    GuildTerritoryPage => GuildTerritoryPage,
+    HeroBaseStatsInfo => HeroBaseStatsInfo,
+    HeroCreateRequest => HeroCreateRequest,
+    InTrapRock => InTrapRock,
+    MarketFail => MarketFail,
+    MarketSuccess => MarketSuccess,
+    NPCConsign => NPCConsign,
+    NPCMarket => NPCMarket,
+    NPCMarketPage => NPCMarketPage,
+    NewHero => NewHero,
+    ObjectHidden => ObjectHidden,
+    ObjectSitDown => ObjectSitDown,
+    ObjectSpell => ObjectSpell,
+    PauseBuff => PauseBuff,
+    RefreshItem => RefreshItem,
+    RemoveDelayedExplosion => RemoveDelayedExplosion,
+    UpdateHeroSpawnState => UpdateHeroSpawnState,
+    UserName => UserName,
+    StorageUnlockResult => StorageUnlockResult,
+    StoragePasswordResult => StoragePasswordResult,
+    SplitItem1 => SplitItem1,
+    NewItemInfo => NewItemInfo,
+    UserDash => UserDash,
+    ObjectDash => ObjectDash,
+    UserDashFail => UserDashFail,
+    ObjectDashFail => ObjectDashFail,
 }
-
-// 保留 MirGridType 引用，确保与 Items 系列包后续移植的依赖可见
-#[allow(unused_imports)]
-use MirGridType as _GridTypeReexport;

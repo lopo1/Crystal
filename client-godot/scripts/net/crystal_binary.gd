@@ -61,10 +61,10 @@ class Reader:
 		return v - 18446744073709551616 if v >= 9223372036854775808 else v
 
 	func read_f32() -> float:
-		return bytes_to_float32(read_u32())
+		return _take(4).decode_float(0)
 
 	func read_f64() -> float:
-		return bytes_to_float64(read_u64())
+		return _take(8).decode_double(0)
 
 	## .NET WriteString: 7-bit 编码长度 + UTF-8
 	func read_string() -> String:
@@ -83,18 +83,6 @@ class Reader:
 			if b & 0x80 == 0:
 				break
 		return result
-
-	func bytes_to_float32(v: int) -> float:
-		var bytes := PackedByteArray()
-		bytes.resize(4)
-		bytes.encode_u32(0, v)
-		return bytes.to_float32()
-
-	func bytes_to_float64(v: int) -> float:
-		var bytes := PackedByteArray()
-		bytes.resize(8)
-		bytes.encode_u64(0, v)
-		return bytes.to_float64()
 
 
 ## 写入器（对应 C# BinaryWriter）
@@ -140,13 +128,13 @@ class Writer:
 	func write_f32(v: float) -> void:
 		var b := PackedByteArray()
 		b.resize(4)
-		b.encode_float32(0, v)
+		b.encode_float(0, v)
 		data.append_array(b)
 
 	func write_f64(v: float) -> void:
 		var b := PackedByteArray()
 		b.resize(8)
-		b.encode_float64(0, v)
+		b.encode_double(0, v)
 		data.append_array(b)
 
 	func write_string(s: String) -> void:

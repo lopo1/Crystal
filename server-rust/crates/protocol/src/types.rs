@@ -993,3 +993,790 @@ impl ClientMapInfo {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// ItemInfo（对应 ItemData.cs ItemInfo 类，最新线格式）
+// 枚举字段按线上原文保留为 u8/u16/i16（避免庞大枚举移植，见 PROTOCOL.md）
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ItemInfo {
+    pub index: i32,
+    pub name: String,
+    /// ItemType (u8)
+    pub item_type: u8,
+    /// ItemGrade (u8)
+    pub grade: u8,
+    /// RequiredType (u8)
+    pub required_type: u8,
+    /// RequiredClass (u8)
+    pub required_class: u8,
+    /// RequiredGender (u8)
+    pub required_gender: u8,
+    /// ItemSet (u8)
+    pub set: u8,
+    pub shape: i16,
+    pub weight: u8,
+    pub light: u8,
+    pub required_amount: u8,
+    pub image: u16,
+    pub durability: u16,
+    pub stack_size: u16,
+    pub price: u32,
+    pub start_item: bool,
+    pub effect: u8,
+    pub need_identify: bool,
+    pub show_group_pickup: bool,
+    pub class_based: bool,
+    pub level_based: bool,
+    pub can_mine: bool,
+    pub global_drop_notify: bool,
+    /// BindMode (i16)
+    pub bind: i16,
+    /// SpecialItemMode (i16)
+    pub unique: i16,
+    pub random_stats_id: u8,
+    pub can_fast_run: bool,
+    pub can_awakening: bool,
+    pub slots: u8,
+    pub stats: Stats,
+    pub tool_tip: Option<String>,
+}
+
+impl ItemInfo {
+    pub fn read(r: &mut Reader) -> Result<Self> {
+        let index = r.read_i32()?;
+        let name = r.read_string()?;
+        let item_type = r.read_u8()?;
+        let grade = r.read_u8()?;
+        let required_type = r.read_u8()?;
+        let required_class = r.read_u8()?;
+        let required_gender = r.read_u8()?;
+        let set = r.read_u8()?;
+        let shape = r.read_i16()?;
+        let weight = r.read_u8()?;
+        let light = r.read_u8()?;
+        let required_amount = r.read_u8()?;
+        let image = r.read_u16()?;
+        let durability = r.read_u16()?;
+        let stack_size = r.read_u16()?;
+        let price = r.read_u32()?;
+        let start_item = r.read_bool()?;
+        let effect = r.read_u8()?;
+        let bools = r.read_u8()?;
+        let need_identify = bools & 0x01 == 0x01;
+        let show_group_pickup = bools & 0x02 == 0x02;
+        let class_based = bools & 0x04 == 0x04;
+        let level_based = bools & 0x08 == 0x08;
+        let can_mine = bools & 0x10 == 0x10;
+        let global_drop_notify = bools & 0x20 == 0x20;
+        let bind = r.read_i16()?;
+        let unique = r.read_i16()?;
+        let random_stats_id = r.read_u8()?;
+        let can_fast_run = r.read_bool()?;
+        let can_awakening = r.read_bool()?;
+        let slots = r.read_u8()?;
+        let stats = Stats::read(r)?;
+        let tool_tip = if r.read_bool()? {
+            Some(r.read_string()?)
+        } else {
+            None
+        };
+        Ok(ItemInfo {
+            index,
+            name,
+            item_type,
+            grade,
+            required_type,
+            required_class,
+            required_gender,
+            set,
+            shape,
+            weight,
+            light,
+            required_amount,
+            image,
+            durability,
+            stack_size,
+            price,
+            start_item,
+            effect,
+            need_identify,
+            show_group_pickup,
+            class_based,
+            level_based,
+            can_mine,
+            global_drop_notify,
+            bind,
+            unique,
+            random_stats_id,
+            can_fast_run,
+            can_awakening,
+            slots,
+            stats,
+            tool_tip,
+        })
+    }
+
+    pub fn write(&self, w: &mut Writer) {
+        w.write_i32(self.index);
+        w.write_string(&self.name);
+        w.write_u8(self.item_type);
+        w.write_u8(self.grade);
+        w.write_u8(self.required_type);
+        w.write_u8(self.required_class);
+        w.write_u8(self.required_gender);
+        w.write_u8(self.set);
+        w.write_i16(self.shape);
+        w.write_u8(self.weight);
+        w.write_u8(self.light);
+        w.write_u8(self.required_amount);
+        w.write_u16(self.image);
+        w.write_u16(self.durability);
+        w.write_u16(self.stack_size);
+        w.write_u32(self.price);
+        w.write_bool(self.start_item);
+        w.write_u8(self.effect);
+        let mut bools = 0u8;
+        if self.need_identify {
+            bools |= 0x01;
+        }
+        if self.show_group_pickup {
+            bools |= 0x02;
+        }
+        if self.class_based {
+            bools |= 0x04;
+        }
+        if self.level_based {
+            bools |= 0x08;
+        }
+        if self.can_mine {
+            bools |= 0x10;
+        }
+        if self.global_drop_notify {
+            bools |= 0x20;
+        }
+        w.write_u8(bools);
+        w.write_i16(self.bind);
+        w.write_i16(self.unique);
+        w.write_u8(self.random_stats_id);
+        w.write_bool(self.can_fast_run);
+        w.write_bool(self.can_awakening);
+        w.write_u8(self.slots);
+        self.stats.write(w);
+        match &self.tool_tip {
+            Some(t) => {
+                w.write_bool(true);
+                w.write_string(t);
+            }
+            None => w.write_bool(false),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// QuestItemReward（SharedData.cs）
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QuestItemReward {
+    pub item: ItemInfo,
+    pub count: u16,
+}
+
+impl QuestItemReward {
+    pub fn read(r: &mut Reader) -> Result<Self> {
+        Ok(QuestItemReward {
+            item: ItemInfo::read(r)?,
+            count: r.read_u16()?,
+        })
+    }
+    pub fn write(&self, w: &mut Writer) {
+        self.item.write(w);
+        w.write_u16(self.count);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ClientRecipeInfo（ClientData.cs）
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClientRecipeInfo {
+    pub gold: u32,
+    pub chance: u8,
+    pub item: UserItem,
+    pub tools: Vec<UserItem>,
+    pub ingredients: Vec<UserItem>,
+}
+
+impl ClientRecipeInfo {
+    pub fn read(r: &mut Reader) -> Result<Self> {
+        let gold = r.read_u32()?;
+        let chance = r.read_u8()?;
+        let item = UserItem::read(r)?;
+        let mut tools = Vec::new();
+        let tcount = r.read_i32()?;
+        for _ in 0..tcount.max(0) {
+            tools.push(UserItem::read(r)?);
+        }
+        let mut ingredients = Vec::new();
+        let icount = r.read_i32()?;
+        for _ in 0..icount.max(0) {
+            ingredients.push(UserItem::read(r)?);
+        }
+        Ok(ClientRecipeInfo {
+            gold,
+            chance,
+            item,
+            tools,
+            ingredients,
+        })
+    }
+    pub fn write(&self, w: &mut Writer) {
+        w.write_u32(self.gold);
+        w.write_u8(self.chance);
+        self.item.write(w);
+        w.write_i32(self.tools.len() as i32);
+        for t in &self.tools {
+            t.write(w);
+        }
+        w.write_i32(self.ingredients.len() as i32);
+        for i in &self.ingredients {
+            i.write(w);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ClientFriend / ClientMail / ClientAuction（ClientData.cs）
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClientFriend {
+    pub index: i32,
+    pub name: String,
+    pub memo: String,
+    pub blocked: bool,
+    pub online: bool,
+}
+
+impl ClientFriend {
+    pub fn read(r: &mut Reader) -> Result<Self> {
+        Ok(ClientFriend {
+            index: r.read_i32()?,
+            name: r.read_string()?,
+            memo: r.read_string()?,
+            blocked: r.read_bool()?,
+            online: r.read_bool()?,
+        })
+    }
+    pub fn write(&self, w: &mut Writer) {
+        w.write_i32(self.index);
+        w.write_string(&self.name);
+        w.write_string(&self.memo);
+        w.write_bool(self.blocked);
+        w.write_bool(self.online);
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClientMail {
+    pub mail_id: u64,
+    pub sender_name: String,
+    pub message: String,
+    pub opened: bool,
+    pub locked: bool,
+    pub can_reply: bool,
+    pub collected: bool,
+    pub date_sent: i64,
+    pub gold: u32,
+    pub items: Vec<UserItem>,
+}
+
+impl ClientMail {
+    pub fn read(r: &mut Reader) -> Result<Self> {
+        let mail_id = r.read_u64()?;
+        let sender_name = r.read_string()?;
+        let message = r.read_string()?;
+        let opened = r.read_bool()?;
+        let locked = r.read_bool()?;
+        let can_reply = r.read_bool()?;
+        let collected = r.read_bool()?;
+        let date_sent = r.read_i64()?;
+        let gold = r.read_u32()?;
+        let mut items = Vec::new();
+        let icount = r.read_i32()?;
+        for _ in 0..icount.max(0) {
+            items.push(UserItem::read(r)?);
+        }
+        Ok(ClientMail {
+            mail_id,
+            sender_name,
+            message,
+            opened,
+            locked,
+            can_reply,
+            collected,
+            date_sent,
+            gold,
+            items,
+        })
+    }
+    pub fn write(&self, w: &mut Writer) {
+        w.write_u64(self.mail_id);
+        w.write_string(&self.sender_name);
+        w.write_string(&self.message);
+        w.write_bool(self.opened);
+        w.write_bool(self.locked);
+        w.write_bool(self.can_reply);
+        w.write_bool(self.collected);
+        w.write_i64(self.date_sent);
+        w.write_u32(self.gold);
+        w.write_i32(self.items.len() as i32);
+        for i in &self.items {
+            i.write(w);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClientAuction {
+    pub auction_id: u64,
+    pub item: UserItem,
+    pub seller: String,
+    pub price: u32,
+    pub consignment_date: i64,
+    /// MarketItemType (u8)
+    pub item_type: u8,
+}
+
+impl ClientAuction {
+    pub fn read(r: &mut Reader) -> Result<Self> {
+        Ok(ClientAuction {
+            auction_id: r.read_u64()?,
+            item: UserItem::read(r)?,
+            seller: r.read_string()?,
+            price: r.read_u32()?,
+            consignment_date: r.read_i64()?,
+            item_type: r.read_u8()?,
+        })
+    }
+    pub fn write(&self, w: &mut Writer) {
+        w.write_u64(self.auction_id);
+        self.item.write(w);
+        w.write_string(&self.seller);
+        w.write_u32(self.price);
+        w.write_i64(self.consignment_date);
+        w.write_u8(self.item_type);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ClientQuestInfo / ClientQuestProgress（ClientData.cs）
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClientQuestInfo {
+    pub index: i32,
+    pub npc_index: u32,
+    pub name: String,
+    pub group: String,
+    pub description: Vec<String>,
+    pub task_description: Vec<String>,
+    pub return_description: Vec<String>,
+    pub completion_description: Vec<String>,
+    pub min_level_needed: i32,
+    pub max_level_needed: i32,
+    pub quest_needed: i32,
+    /// RequiredClass (u8)
+    pub class_needed: u8,
+    /// QuestType (u8)
+    pub quest_type: u8,
+    pub time_limit_in_seconds: i32,
+    pub reward_gold: u32,
+    pub reward_exp: u32,
+    pub reward_credit: u32,
+    pub rewards_fixed_item: Vec<QuestItemReward>,
+    pub rewards_select_item: Vec<QuestItemReward>,
+    pub finish_npc_index: u32,
+}
+
+impl ClientQuestInfo {
+    pub fn read(r: &mut Reader) -> Result<Self> {
+        let index = r.read_i32()?;
+        let npc_index = r.read_u32()?;
+        let name = r.read_string()?;
+        let group = r.read_string()?;
+        let mut description = Vec::new();
+        let dcount = r.read_i32()?;
+        for _ in 0..dcount.max(0) {
+            description.push(r.read_string()?);
+        }
+        let mut task_description = Vec::new();
+        let tcount = r.read_i32()?;
+        for _ in 0..tcount.max(0) {
+            task_description.push(r.read_string()?);
+        }
+        let mut return_description = Vec::new();
+        let rcount = r.read_i32()?;
+        for _ in 0..rcount.max(0) {
+            return_description.push(r.read_string()?);
+        }
+        let mut completion_description = Vec::new();
+        let ccount = r.read_i32()?;
+        for _ in 0..ccount.max(0) {
+            completion_description.push(r.read_string()?);
+        }
+        let min_level_needed = r.read_i32()?;
+        let max_level_needed = r.read_i32()?;
+        let quest_needed = r.read_i32()?;
+        let class_needed = r.read_u8()?;
+        let quest_type = r.read_u8()?;
+        let time_limit_in_seconds = r.read_i32()?;
+        let reward_gold = r.read_u32()?;
+        let reward_exp = r.read_u32()?;
+        let reward_credit = r.read_u32()?;
+        let mut rewards_fixed_item = Vec::new();
+        let fcount = r.read_i32()?;
+        for _ in 0..fcount.max(0) {
+            rewards_fixed_item.push(QuestItemReward::read(r)?);
+        }
+        let mut rewards_select_item = Vec::new();
+        let scount = r.read_i32()?;
+        for _ in 0..scount.max(0) {
+            rewards_select_item.push(QuestItemReward::read(r)?);
+        }
+        let finish_npc_index = r.read_u32()?;
+        Ok(ClientQuestInfo {
+            index,
+            npc_index,
+            name,
+            group,
+            description,
+            task_description,
+            return_description,
+            completion_description,
+            min_level_needed,
+            max_level_needed,
+            quest_needed,
+            class_needed,
+            quest_type,
+            time_limit_in_seconds,
+            reward_gold,
+            reward_exp,
+            reward_credit,
+            rewards_fixed_item,
+            rewards_select_item,
+            finish_npc_index,
+        })
+    }
+
+    pub fn write(&self, w: &mut Writer) {
+        w.write_i32(self.index);
+        w.write_u32(self.npc_index);
+        w.write_string(&self.name);
+        w.write_string(&self.group);
+        w.write_i32(self.description.len() as i32);
+        for s in &self.description {
+            w.write_string(s);
+        }
+        w.write_i32(self.task_description.len() as i32);
+        for s in &self.task_description {
+            w.write_string(s);
+        }
+        w.write_i32(self.return_description.len() as i32);
+        for s in &self.return_description {
+            w.write_string(s);
+        }
+        w.write_i32(self.completion_description.len() as i32);
+        for s in &self.completion_description {
+            w.write_string(s);
+        }
+        w.write_i32(self.min_level_needed);
+        w.write_i32(self.max_level_needed);
+        w.write_i32(self.quest_needed);
+        w.write_u8(self.class_needed);
+        w.write_u8(self.quest_type);
+        w.write_i32(self.time_limit_in_seconds);
+        w.write_u32(self.reward_gold);
+        w.write_u32(self.reward_exp);
+        w.write_u32(self.reward_credit);
+        w.write_i32(self.rewards_fixed_item.len() as i32);
+        for r in &self.rewards_fixed_item {
+            r.write(w);
+        }
+        w.write_i32(self.rewards_select_item.len() as i32);
+        for r in &self.rewards_select_item {
+            r.write(w);
+        }
+        w.write_u32(self.finish_npc_index);
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClientQuestProgress {
+    pub id: i32,
+    pub task_list: Vec<String>,
+    pub taken: bool,
+    pub completed: bool,
+    pub new: bool,
+}
+
+impl ClientQuestProgress {
+    pub fn read(r: &mut Reader) -> Result<Self> {
+        let id = r.read_i32()?;
+        let mut task_list = Vec::new();
+        let tcount = r.read_i32()?;
+        for _ in 0..tcount.max(0) {
+            task_list.push(r.read_string()?);
+        }
+        let taken = r.read_bool()?;
+        let completed = r.read_bool()?;
+        let new = r.read_bool()?;
+        Ok(ClientQuestProgress {
+            id,
+            task_list,
+            taken,
+            completed,
+            new,
+        })
+    }
+    pub fn write(&self, w: &mut Writer) {
+        w.write_i32(self.id);
+        w.write_i32(self.task_list.len() as i32);
+        for s in &self.task_list {
+            w.write_string(s);
+        }
+        w.write_bool(self.taken);
+        w.write_bool(self.completed);
+        w.write_bool(self.new);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ClientBuff（ClientData.cs）
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClientBuff {
+    /// BuffType (u8)
+    pub buff_type: u8,
+    pub visible: bool,
+    pub object_id: u32,
+    pub expire_time: i64,
+    pub infinite: bool,
+    pub paused: bool,
+    pub stats: Stats,
+    pub values: Vec<i32>,
+}
+
+impl ClientBuff {
+    pub fn read(r: &mut Reader) -> Result<Self> {
+        let buff_type = r.read_u8()?;
+        let visible = r.read_bool()?;
+        let object_id = r.read_u32()?;
+        let expire_time = r.read_i64()?;
+        let infinite = r.read_bool()?;
+        let paused = r.read_bool()?;
+        let stats = Stats::read(r)?;
+        let mut values = Vec::new();
+        let vcount = r.read_i32()?;
+        for _ in 0..vcount.max(0) {
+            values.push(r.read_i32()?);
+        }
+        Ok(ClientBuff {
+            buff_type,
+            visible,
+            object_id,
+            expire_time,
+            infinite,
+            paused,
+            stats,
+            values,
+        })
+    }
+    pub fn write(&self, w: &mut Writer) {
+        w.write_u8(self.buff_type);
+        w.write_bool(self.visible);
+        w.write_u32(self.object_id);
+        w.write_i64(self.expire_time);
+        w.write_bool(self.infinite);
+        w.write_bool(self.paused);
+        self.stats.write(w);
+        w.write_i32(self.values.len() as i32);
+        for v in &self.values {
+            w.write_i32(*v);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ClientHeroInformation（ClientData.cs）
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClientHeroInformation {
+    pub index: i32,
+    pub name: String,
+    pub level: u16,
+    pub class: MirClass,
+    pub gender: MirGender,
+}
+
+impl ClientHeroInformation {
+    pub fn read(r: &mut Reader) -> Result<Self> {
+        Ok(ClientHeroInformation {
+            index: r.read_i32()?,
+            name: r.read_string()?,
+            level: r.read_u16()?,
+            class: match r.read_u8()? {
+                0 => MirClass::Warrior,
+                1 => MirClass::Wizard,
+                2 => MirClass::Taoist,
+                3 => MirClass::Assassin,
+                _ => MirClass::Archer,
+            },
+            gender: match r.read_u8()? {
+                0 => MirGender::Male,
+                _ => MirGender::Female,
+            },
+        })
+    }
+    pub fn write(&self, w: &mut Writer) {
+        w.write_i32(self.index);
+        w.write_string(&self.name);
+        w.write_u16(self.level);
+        w.write_u8(self.class as u8);
+        w.write_u8(self.gender as u8);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ClientMonsterInfo（MonsterData.cs）
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClientMonsterInfo {
+    pub index: i32,
+    pub name: String,
+    pub game_name: String,
+    /// Monster (u16)
+    pub image: u16,
+    pub ai: u8,
+    pub effect: u8,
+    pub level: u16,
+    pub view_range: u8,
+    pub cool_eye: u8,
+    pub light: u8,
+    pub attack_speed: u16,
+    pub move_speed: u16,
+    pub experience: u32,
+    pub can_push: bool,
+    pub can_tame: bool,
+    pub auto_rev: bool,
+    pub undead: bool,
+    pub can_recall: bool,
+    pub stats: Stats,
+}
+
+impl ClientMonsterInfo {
+    pub fn read(r: &mut Reader) -> Result<Self> {
+        let index = r.read_i32()?;
+        let name = r.read_string()?;
+        let game_name = r.read_string()?;
+        let image = r.read_u16()?;
+        let ai = r.read_u8()?;
+        let effect = r.read_u8()?;
+        let level = r.read_u16()?;
+        let view_range = r.read_u8()?;
+        let cool_eye = r.read_u8()?;
+        let light = r.read_u8()?;
+        let attack_speed = r.read_u16()?;
+        let move_speed = r.read_u16()?;
+        let experience = r.read_u32()?;
+        let can_push = r.read_bool()?;
+        let can_tame = r.read_bool()?;
+        let auto_rev = r.read_bool()?;
+        let undead = r.read_bool()?;
+        let can_recall = r.read_bool()?;
+        let stats = Stats::read(r)?;
+        Ok(ClientMonsterInfo {
+            index,
+            name,
+            game_name,
+            image,
+            ai,
+            effect,
+            level,
+            view_range,
+            cool_eye,
+            light,
+            attack_speed,
+            move_speed,
+            experience,
+            can_push,
+            can_tame,
+            auto_rev,
+            undead,
+            can_recall,
+            stats,
+        })
+    }
+    pub fn write(&self, w: &mut Writer) {
+        w.write_i32(self.index);
+        w.write_string(&self.name);
+        w.write_string(&self.game_name);
+        w.write_u16(self.image);
+        w.write_u8(self.ai);
+        w.write_u8(self.effect);
+        w.write_u16(self.level);
+        w.write_u8(self.view_range);
+        w.write_u8(self.cool_eye);
+        w.write_u8(self.light);
+        w.write_u16(self.attack_speed);
+        w.write_u16(self.move_speed);
+        w.write_u32(self.experience);
+        w.write_bool(self.can_push);
+        w.write_bool(self.can_tame);
+        w.write_bool(self.auto_rev);
+        w.write_bool(self.undead);
+        w.write_bool(self.can_recall);
+        self.stats.write(w);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RankCharacterInfo（SharedData.cs）
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RankCharacterInfo {
+    pub player_id: i64,
+    pub name: String,
+    pub level: i32,
+    pub class: MirClass,
+}
+
+impl RankCharacterInfo {
+    pub fn read(r: &mut Reader) -> Result<Self> {
+        Ok(RankCharacterInfo {
+            player_id: r.read_i64()?,
+            name: r.read_string()?,
+            level: r.read_i32()?,
+            class: match r.read_u8()? {
+                0 => MirClass::Warrior,
+                1 => MirClass::Wizard,
+                2 => MirClass::Taoist,
+                3 => MirClass::Assassin,
+                _ => MirClass::Archer,
+            },
+        })
+    }
+    pub fn write(&self, w: &mut Writer) {
+        w.write_i64(self.player_id);
+        w.write_string(&self.name);
+        w.write_i32(self.level);
+        w.write_u8(self.class as u8);
+    }
+}

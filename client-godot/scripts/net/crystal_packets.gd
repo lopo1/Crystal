@@ -308,9 +308,76 @@ static func write_client_map_info(w: Writer, info: Dictionary) -> void:
 		w.write_i32(npc.get("icon", 0))
 		w.write_bool(npc.get("can_teleport_to", false))
 
-# ---------------------------------------------------------------------------
-# 客户端 → 服务器 包
-# ---------------------------------------------------------------------------
+# --- 灵兽（ClientIntelligentCreature，对应 Rust types.rs） ---
+static func read_client_creature(r: Reader) -> Dictionary:
+	var c := {}
+	c["pet_type"] = r.read_u8()
+	c["icon"] = r.read_i32()
+	c["custom_name"] = r.read_string()
+	c["fullness"] = r.read_i32()
+	c["slot_index"] = r.read_i32()
+	c["expire"] = r.read_i64()
+	c["blackstone_time"] = r.read_i64()
+	c["pet_mode"] = r.read_u8()
+	# IntelligentCreatureRules: 8 字段
+	c["rules"] = {
+		"minimal_fullness": r.read_i32(),
+		"mouse_pickup_enabled": r.read_bool(),
+		"mouse_pickup_range": r.read_i32(),
+		"auto_pickup_enabled": r.read_bool(),
+		"auto_pickup_range": r.read_i32(),
+		"semi_auto_pickup_enabled": r.read_bool(),
+		"semi_auto_pickup_range": r.read_i32(),
+		"can_produce_black_stone": r.read_bool(),
+	}
+	# IntelligentCreatureItemFilter: 9 bool
+	c["filter"] = {
+		"pickup_all": r.read_bool(),
+		"pickup_gold": r.read_bool(),
+		"pickup_weapons": r.read_bool(),
+		"pickup_armours": r.read_bool(),
+		"pickup_helmets": r.read_bool(),
+		"pickup_boots": r.read_bool(),
+		"pickup_belts": r.read_bool(),
+		"pickup_accessories": r.read_bool(),
+		"pickup_others": r.read_bool(),
+	}
+	c["pickup_grade"] = r.read_u8()
+	c["maintain_food_time"] = r.read_i64()
+	return c
+
+static func write_client_creature(w: Writer, c: Dictionary) -> void:
+	w.write_u8(c.get("pet_type", 99))
+	w.write_i32(c.get("icon", 0))
+	w.write_string(c.get("custom_name", ""))
+	w.write_i32(c.get("fullness", 0))
+	w.write_i32(c.get("slot_index", 0))
+	w.write_i64(c.get("expire", 0))
+	w.write_i64(c.get("blackstone_time", 0))
+	w.write_u8(c.get("pet_mode", 0))
+	var rules: Dictionary = c.get("rules", {})
+	w.write_i32(rules.get("minimal_fullness", 1))
+	w.write_bool(rules.get("mouse_pickup_enabled", false))
+	w.write_i32(rules.get("mouse_pickup_range", 0))
+	w.write_bool(rules.get("auto_pickup_enabled", false))
+	w.write_i32(rules.get("auto_pickup_range", 0))
+	w.write_bool(rules.get("semi_auto_pickup_enabled", false))
+	w.write_i32(rules.get("semi_auto_pickup_range", 0))
+	w.write_bool(rules.get("can_produce_black_stone", false))
+	var filter: Dictionary = c.get("filter", {})
+	w.write_bool(filter.get("pickup_all", true))
+	w.write_bool(filter.get("pickup_gold", false))
+	w.write_bool(filter.get("pickup_weapons", false))
+	w.write_bool(filter.get("pickup_armours", false))
+	w.write_bool(filter.get("pickup_helmets", false))
+	w.write_bool(filter.get("pickup_boots", false))
+	w.write_bool(filter.get("pickup_belts", false))
+	w.write_bool(filter.get("pickup_accessories", false))
+	w.write_bool(filter.get("pickup_others", false))
+	w.write_u8(c.get("pickup_grade", 0))
+	w.write_i64(c.get("maintain_food_time", 0))
+
+# --- 客户端→服务器 包 ---
 
 static func c_client_version(hash: PackedByteArray) -> CrystalBinary.Packet:
 	var p := CrystalBinary.Packet.new()
@@ -529,8 +596,7 @@ static func decode_server_packet(id: int, payload: PackedByteArray) -> Dictionar
 			var creatures := []
 			var ccount := r.read_i32()
 			for i in range(ccount):
-				# 简化: 跳过未知长度字段需完整定义; 垂直切片服务端发 0 个
-				break
+				creatures.append(read_client_creature(r))
 			ui["intelligent_creatures"] = creatures
 			ui["summoned_creature_type"] = r.read_u8()
 			ui["creature_summoned"] = r.read_bool()
