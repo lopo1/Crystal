@@ -18,10 +18,12 @@
 
 | 任务 | 状态 | 说明 |
 |---|---|---|
-| 全部 432 个数据包 → Rust (`crates/protocol`) | ⬜ | 按 PROTOCOL.md 规则分批移植 |
-| 内嵌数据类型: UserItem / ClientMapInfo / QuestInfo / UserInfo… | ⬜ | Shared/Data 移植 |
-| 回环序列化测试覆盖全部数据包 | ⬜ | 与 C# 定义逐字段核对 |
-| 协议移植到 Godot (GDScript 编解码) | ⬜ | 与 Rust 侧等价 |
+| 全部 432 个数据包 → Rust (`crates/protocol`) | ✅ | 客户端 153/153、服务器 279/279（DellMember/ObjectNpc/WorldMapSetup 为命名差异，均已实现） |
+| 内嵌数据类型: UserItem / ClientMapInfo / QuestInfo / UserInfo… | ✅ | ItemInfo/ClientQuestInfo/ClientMail/ClientMonsterInfo/RankCharacterInfo 等全部移植 |
+| 回环序列化测试覆盖全部数据包 | ✅ | 151 项测试全通过（含 gzip、嵌套 UserItem、可空分支） |
+| 协议移植到 Godot (GDScript 编解码) | 🟨 | binary/packets/client 三层已完成，包的完整编解码待与 Rust 侧对齐（主要包已覆盖） |
+
+> 关键修复: UserInformation/UserSlotsRefresh 的槽布尔方向（C# 实际是 true=有物品）。
 
 ## 阶段 2 — 服务器核心玩法垂直切片
 
