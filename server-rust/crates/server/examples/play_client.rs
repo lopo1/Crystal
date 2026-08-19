@@ -4,7 +4,8 @@
 //! `cargo run -p crystal-server --example play_client`
 //!
 //! 流程: 连接 → ClientVersion → Login(demo) → StartGame → 朝前方怪物攻击直到击杀
-//! → 拾取掉落 → 确认获得物品/经验 → 访问 NPC 商人 → 买入金创药。
+//! → 魔法攻击(火球术) → 拾取掉落 → 确认获得物品/经验 → 访问 NPC 商人 → 买入金创药
+//! → 使用金创药回血 → 装备木剑 → 丢弃金创药 → 重连验证金币/经验/等级持久化。
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -189,6 +190,50 @@ async fn main() -> anyhow::Result<()> {
     assert!(gained_xp, "未获得经验");
     println!("✓ 击杀耗时 {attacks} 次攻击，经验已获得");
 
+    // 魔法攻击（火球术 spell=1）：朝 8 个方向试着施放，直到命中射程内的怪物
+    println!("== 魔法攻击（火球术） ==");
+    // 先取一个当前 MP 作为基准
+    let mut mp_before: Option<i32> = None;
+    for _ in 0..6 {
+        let Some((id, payload)) = recv_timed(&mut buf, &mut stream, 300).await else { break };
+        if let ServerPacket::HealthChanged(h) = ServerPacket::decode(id, &payload)? {
+            mp_before = Some(h.mp);
+        }
+    }
+    let mut spell_hit = false;
+    let mut saw_damage = false;
+    let mut mp_after: Option<i32> = None;
+    'dirs: for dir in [0u8, 2, 4, 6, 1, 3, 5, 7] {
+        // 清空缓冲，干净地观察本次施放结果
+        while recv_timed(&mut buf, &mut stream, 30).await.is_some() {}
+        send_packet(&mut stream, &c::Attack { direction: dir, spell: 1 }).await;
+        for _ in 0..8 {
+            let Some((id, payload)) = recv_timed(&mut buf, &mut stream, 500).await else { continue 'dirs };
+            match ServerPacket::decode(id, &payload)? {
+                ServerPacket::ObjectMagic(m) if m.spell == 1 => {
+                    println!("✓ 火球术命中目标#{} 目标位置{:?}", m.target_id, m.target);
+                    spell_hit = true;
+                }
+                ServerPacket::DamageIndicator(_) => saw_damage = true,
+                ServerPacket::HealthChanged(h) => mp_after = Some(h.mp),
+                _ => {}
+            }
+        }
+        if spell_hit {
+            break 'dirs;
+        }
+    }
+    assert!(spell_hit, "火球术未命中任何怪物");
+    assert!(saw_damage, "火球术命中但未产生伤害指示");
+    assert!(mp_after.is_some(), "施放后未收到 MP 更新");
+    if let Some(before) = mp_before {
+        if let (Some(dbg), Some(after)) = (Some(before), mp_after) {
+            println!("✓ MP {dbg} -> {after}");
+            assert!(after < dbg, "施放火球术未消耗 MP");
+        }
+    }
+    println!("✓ 火球术施放成功，消耗 MP 且造成伤害");
+
     // 拾取（掉落物就在怪物死亡位置旁）
     println!("== 拾取 ==");
     send_packet(&mut stream, &c::PickUp).await;
@@ -362,7 +407,7 @@ async fn main() -> anyhow::Result<()> {
     assert!(re_level >= first_level, "重连后等级倒退");
     println!("✓ 击杀所得经验已升级、金币收支已写回 DB（重连可读）");
 
-    println!("\n✅ 玩法闭环全部验证通过（战斗→击杀→经验→拾取→商店→道具→装备→丢弃→重连持久化）");
+    println!("\n✅ 玩法闭环全部验证通过（战斗→击杀→经验→魔法→拾取→商店→道具→装备→丢弃→重连持久化）");
     Ok(())
 }
 

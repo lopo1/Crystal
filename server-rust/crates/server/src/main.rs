@@ -6,6 +6,7 @@
 
 mod db;
 mod items;
+mod magics;
 mod net;
 mod web3;
 mod world;

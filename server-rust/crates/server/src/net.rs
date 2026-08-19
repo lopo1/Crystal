@@ -17,8 +17,9 @@ use crate::db::Database;
 use crate::items;
 use crate::web3::Web3Auth;
 use crate::world::{
-    drop_ground_item, equipment_slots, gain_gold, npc_shop, persist_player, player_attack, pick_up,
-    recompute_stats, remove_gold, try_move, use_consumable, Player, World, MAP_HEIGHT, MAP_WIDTH,
+    drop_ground_item, equipment_slots, gain_gold, npc_shop, persist_player, player_attack,
+    player_magic_attack, pick_up, recompute_stats, remove_gold, try_move, use_consumable, Player,
+    World, MAP_HEIGHT, MAP_WIDTH,
 };
 
 /// 连接所处的游戏阶段（对应 C# `GameStage`）
@@ -357,7 +358,14 @@ async fn handle_client_packet(
         }
         ClientPacket::Attack(atk) => {
             if let Some(oid) = *object_id {
-                player_attack(world, oid, MirDirection::from_u8(atk.direction)).await;
+                let dir = MirDirection::from_u8(atk.direction);
+                if atk.spell != 0 {
+                    // 魔法攻击（远程范围指向）
+                    player_magic_attack(world, oid, dir, atk.spell).await;
+                } else {
+                    // 基础近战平A
+                    player_attack(world, oid, dir).await;
+                }
             }
         }
         ClientPacket::PickUp(_) => {
@@ -504,6 +512,8 @@ async fn enter_world(
     // 加载背包（固定 40 槽）+ 装备（固定 14 槽）
     let inventory = db.inventory_slots(ch.index)?;
     let equipment_slots = equipment_slots(&player);
+    // 学会的法术（垂直切片：按职业发放基础法术）
+    let magics = crate::magics::player_magics(player.class);
 
     tx.send(encode_packet(&s::UserInformation {
         object_id,
@@ -535,7 +545,7 @@ async fn enter_world(
         require_storage_password: false,
         storage_password_last_set: 0,
         expanded_storage_expiry_time: 0,
-        magics: vec![],
+        magics,
         intelligent_creatures: vec![],
         summoned_creature_type: 0,
         creature_summoned: false,

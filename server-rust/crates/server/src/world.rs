@@ -566,6 +566,101 @@ pub async fn player_attack(world: &World, player_id: u32, direction: MirDirectio
     true
 }
 
+/// 玩家魔法攻击（范围指向）：消耗 MP，对朝向射线上的首个怪物打出一发法术。
+/// 返回是否施放成功（射程内有目标且有足额 MP）。
+pub async fn player_magic_attack(
+    world: &World,
+    player_id: u32,
+    direction: MirDirection,
+    spell: u8,
+) -> bool {
+    let Some(player) = world.get_player(player_id).await else {
+        return false;
+    };
+    let Some(tmpl) = crate::magics::find(spell) else {
+        return false;
+    };
+    if player.mp < tmpl.base_cost as i32 {
+        return false; // MP 不足
+    }
+
+    // 选取目标：首选朝向射线上（射程内）的怪物；否则退化为朝向半平面内的最近怪物
+    let (dx, dy) = direction_offset(direction, 1);
+    let mut target_monster: Option<(u32, Point)> = None;
+    {
+        let mons = world.monsters.lock().await;
+        'line: for step in 1..=tmpl.range as i32 {
+            let pos = Point::new(player.location.x + dx * step, player.location.y + dy * step);
+            for m in mons.values().filter(|m| !m.dead && m.location == pos) {
+                target_monster = Some((m.object_id, m.location));
+                break 'line;
+            }
+        }
+    }
+    if target_monster.is_none() {
+        // 半平面兜底：朝向方向分量对齐、且在射程内的最近怪物
+        let mut best: Option<(u32, Point, i32)> = None;
+        let mons = world.monsters.lock().await;
+        for m in mons.values().filter(|m| !m.dead) {
+            let ox = m.location.x - player.location.x;
+            let oy = m.location.y - player.location.y;
+            // 朝向分量需同向：前方方向的分量 > 0
+            let aligned = (dx != 0 && ox.signum() == dx) || (dy != 0 && oy.signum() == dy);
+            let dist = manhattan(player.location, m.location);
+            if aligned && dist <= tmpl.range as i32 {
+                if best.map(|(_, _, bd)| dist < bd).unwrap_or(true) {
+                    best = Some((m.object_id, m.location, dist));
+                }
+            }
+        }
+        target_monster = best.map(|(id, loc, _)| (id, loc));
+    }
+    let Some((target_id, target_pos)) = target_monster else {
+        return false; // 射程内无目标
+    };
+
+    // 扣除 MP
+    {
+        let mut players = world.players.lock().await;
+        if let Some(p) = players.get_mut(&player_id) {
+            p.mp = (p.mp - tmpl.base_cost as i32).max(0);
+        }
+    }
+    let p = world.get_player(player_id).await;
+    if let Some(p) = p {
+        world
+            .send_to(
+                player_id,
+                encode_packet(&s::HealthChanged { hp: p.hp, mp: p.mp }),
+            )
+            .await;
+    }
+
+    // 施法动画（前台广播 ObjectMagic）
+    world.broadcast(encode_packet(&s::ObjectMagic {
+        object_id: player_id,
+        location: player.location,
+        direction,
+        spell,
+        target_id,
+        target: target_pos,
+        cast: true,
+        level: 1,
+        self_broadcast: true,
+        secondary_target_ids: vec![],
+    }));
+
+    // 命中结算（复用物理近战的击杀/掉落/经验逻辑）
+    let dmg = (tmpl.damage + player.attack / 2 - monster_defence(world, target_id).await.max(0)).max(1);
+    player_hit_monster(world, player_id, target_id, dmg).await;
+    true
+}
+
+async fn monster_defence(world: &World, monster_id: u32) -> i32 {
+    let mons = world.monsters.lock().await;
+    mons.get(&monster_id).map(|m| m.defence).unwrap_or(0)
+}
+
 pub async fn player_hit_monster(world: &World, player_id: u32, monster_id: u32, dmg: i32) {
     let mut died = false;
     {
