@@ -81,6 +81,8 @@ async fn main() -> anyhow::Result<()> {
     send_packet(&mut stream, &c::StartGame { character_index: chars[0].index }).await;
     let mut my_oid = 0u32;
     let mut monster_pos: Option<(i32, i32)> = None;
+    let mut merchant_id: Option<u32> = None;
+    let mut shop_pos: Option<(i32, i32)> = None;
     for _ in 0..120 {
         let Some((id, payload)) = recv_timed(&mut buf, &mut stream, 800).await else { break };
         match ServerPacket::decode(id, &payload)? {
@@ -88,10 +90,15 @@ async fn main() -> anyhow::Result<()> {
                 println!("✓ 看到怪物: {} @({},{})", m.name, m.location.x, m.location.y);
                 monster_pos = Some((m.location.x, m.location.y));
             }
+            ServerPacket::ObjectPlayer(p) if p.name == "铁匠铺" => {
+                merchant_id = Some(p.object_id);
+                shop_pos = Some((p.location.x, p.location.y));
+            }
             ServerPacket::UserInformation(ui) => my_oid = ui.object_id,
             _ => {}
         }
     }
+    let _ = my_oid;
     let (tx, ty) = monster_pos.expect("未在场上看到怪物");
 
     // 从出生点朝怪物方向一步步走过去（直到相邻）
@@ -163,7 +170,7 @@ async fn main() -> anyhow::Result<()> {
     assert!(gained_xp, "未获得经验");
     println!("✓ 击杀耗时 {attacks} 次攻击，经验已获得");
 
-    // 拾取
+    // 拾取（掉落物就在怪物死亡位置旁）
     println!("== 拾取 ==");
     send_packet(&mut stream, &c::PickUp).await;
     let mut picked = false;
@@ -173,9 +180,65 @@ async fn main() -> anyhow::Result<()> {
             picked = true;
         }
     }
-    let _ = picked;
+    assert!(picked, "未拾取到掉落物");
+    println!("✓ 拾取成功");
 
-    println!("\n✅ 玩法闭环验证通过（战斗→击杀→掉落→经验）");
+    // 走向 NPC 商人买药
+    println!("== NPC 商人 ==");
+    let merchant_id = merchant_id.expect("未找到商人");
+    let (sx, sy) = shop_pos.expect("商人位置缺失");
+    for _ in 0..200 {
+        if manhattan(px, py, sx, sy) <= 2 {
+            break;
+        }
+        let dir = if px < sx {
+            2
+        } else if px > sx {
+            6
+        } else if py < sy {
+            4
+        } else {
+            0
+        };
+        send_packet(&mut stream, &c::Walk { direction: MirDirection::from_u8(dir) }).await;
+        match dir {
+            2 => px += 1,
+            6 => px -= 1,
+            4 => py += 1,
+            _ => py -= 1,
+        }
+        let _ = recv_timed(&mut buf, &mut stream, 300).await;
+    }
+    println!("✓ 到达商人 ({px},{py})");
+    send_packet(
+        &mut stream,
+        &c::CallNPC { object_id: merchant_id, key: String::new() },
+    )
+    .await;
+    let mut saw_goods = false;
+    for _ in 0..8 {
+        let Some((id, payload)) = recv_timed(&mut buf, &mut stream, 600).await else { break };
+        if let ServerPacket::NPCGoods(g) = ServerPacket::decode(id, &payload)? {
+            println!("✓ 商店在售 {} 件商品", g.list.len());
+            saw_goods = true;
+            break;
+        }
+    }
+    assert!(saw_goods, "未收到商店列表 NPCGoods");
+    // 买金创药(index=3)，用 LoseGold 判定扣款成功
+    send_packet(&mut stream, &c::BuyItem { item_index: 3, count: 1, r#type: 0 }).await;
+    let mut saw_lose_gold = false;
+    for _ in 0..8 {
+        let Some((id, payload)) = recv_timed(&mut buf, &mut stream, 600).await else { break };
+        if let ServerPacket::LoseGold(_) = ServerPacket::decode(id, &payload)? {
+            saw_lose_gold = true;
+            break;
+        }
+    }
+    assert!(saw_lose_gold, "购买未扣款(LoseGold)");
+    println!("✓ 购买金创药成功，金币已扣除");
+
+    println!("\n✅ 玩法闭环全部验证通过（战斗→击杀→经验→拾取→商店购买）");
     Ok(())
 }
 
