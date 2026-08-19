@@ -39,8 +39,8 @@ async fn main() -> anyhow::Result<()> {
     let world = Arc::new(World::new());
     let web3_auth = Arc::new(Web3Auth::new());
 
-    // 启动世界 tick（怪物刷新 + AI + 玩家回复）
-    let _tick_task = world::spawn_world_tick(world.clone());
+    // 启动世界 tick（怪物刷新 + AI + 玩家回复 + 周期性存档）
+    let _tick_task = world::spawn_world_tick(world.clone(), db.clone());
 
     // 演示账号（幂等；已存在则跳过）
     if !db.login("demo")? {

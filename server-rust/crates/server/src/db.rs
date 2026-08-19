@@ -259,6 +259,7 @@ impl Database {
     }
 
     /// 保存角色位置等状态
+    /// 保存角色状态（位置/血量 + 金币/经验/等级），掉线与定期备份都会调用。
     pub fn save_character_state(
         &self,
         character_index: i32,
@@ -267,11 +268,15 @@ impl Database {
         direction: i32,
         hp: i32,
         mp: i32,
+        gold: i64,
+        experience: i64,
+        level: i64,
     ) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE characters SET x=?1,y=?2,direction=?3,hp=?4,mp=?5 WHERE character_index=?6",
-            params![x, y, direction, hp, mp, character_index],
+            "UPDATE characters SET x=?1,y=?2,direction=?3,hp=?4,mp=?5,gold=?6,experience=?7,level=?8
+             WHERE character_index=?9",
+            params![x, y, direction, hp, mp, gold, experience, level, character_index],
         )?;
         Ok(())
     }
@@ -460,6 +465,34 @@ impl Database {
             conn.execute(
                 "DELETE FROM inventory WHERE character_index=?1 AND unique_id=?2",
                 params![character_index, unique_id as i64],
+            )?;
+        }
+        Ok(Some((slot, item)))
+    }
+
+    /// 从背包移除指定数量 `count` 的某物品（丢弃用）。返回被丢弃物品的原始 (槽位, UserItem)。
+    /// 若 `count` >= 仓库数量，则移除整格；否则数量减去 count。
+    pub fn remove_item_count(
+        &self,
+        character_index: i32,
+        unique_id: u64,
+        count: u16,
+    ) -> anyhow::Result<Option<(i32, UserItem)>> {
+        let Some((slot, item)) = self.find_inventory_item(character_index, unique_id)? else {
+            return Ok(None);
+        };
+        let conn = self.conn.lock().unwrap();
+        let remove = count.max(1);
+        if remove >= item.count {
+            conn.execute(
+                "DELETE FROM inventory WHERE character_index=?1 AND unique_id=?2",
+                params![character_index, unique_id as i64],
+            )?;
+        } else {
+            conn.execute(
+                "UPDATE inventory SET count=count-?1
+                 WHERE character_index=?2 AND unique_id=?3",
+                params![remove, character_index, unique_id as i64],
             )?;
         }
         Ok(Some((slot, item)))
@@ -746,5 +779,44 @@ mod tests {
             .iter()
             .any(|s| s.as_ref().map(|i| i.item_index) == Some(1));
         assert!(weapon_back);
+    }
+
+    #[test]
+    fn remove_item_count_partial_and_full() {
+        let (db, _p) = temp_db();
+        db.register("tester").unwrap();
+        let info = db
+            .add_character("tester", "测试", crystal_protocol::types::MirClass::Warrior, crystal_protocol::types::MirGender::Male)
+            .unwrap()
+            .unwrap();
+        // 金创药 uid = char*1000+1，数量 5
+        let uid = (info.index as u64) * 1000 + 1;
+        // 丢弃 2 个 -> 剩 3
+        let (_s, dropped) = db.remove_item_count(info.index, uid, 2).unwrap().unwrap();
+        assert_eq!(dropped.count, 5);
+        assert_eq!(db.find_inventory_item(info.index, uid).unwrap().unwrap().1.count, 3);
+        // 再丢 3 个（>= 现有）-> 整格删除
+        db.remove_item_count(info.index, uid, 3).unwrap();
+        assert!(db.find_inventory_item(info.index, uid).unwrap().is_none());
+    }
+
+    #[test]
+    fn save_character_state_persists_gold_exp_level() {
+        let (db, _p) = temp_db();
+        db.register("tester").unwrap();
+        let info = db
+            .add_character("tester", "测试", crystal_protocol::types::MirClass::Warrior, crystal_protocol::types::MirGender::Male)
+            .unwrap()
+            .unwrap();
+        db.save_character_state(info.index, 401, 402, 0, 55, 30, 1234, 567, 3)
+            .unwrap();
+        let ch = db.get_character("tester", info.index).unwrap().unwrap();
+        assert_eq!(ch.x, 401);
+        assert_eq!(ch.y, 402);
+        assert_eq!(ch.hp, 55);
+        assert_eq!(ch.mp, 30);
+        assert_eq!(ch.gold, 1234);
+        assert_eq!(ch.experience, 567);
+        assert_eq!(ch.level, 3);
     }
 }

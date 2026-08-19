@@ -347,14 +347,14 @@ impl World {
 // 后台世界 tick
 // ---------------------------------------------------------------------------
 
-pub fn spawn_world_tick(world: Arc<World>) -> tokio::task::JoinHandle<()> {
+pub fn spawn_world_tick(world: Arc<World>, db: Arc<crate::db::Database>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         seed_world(&world).await;
         let mut tick: u32 = 0;
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(400)).await;
             tick = tick.wrapping_add(1);
-            world_tick(&world, tick).await;
+            world_tick(&world, &db, tick).await;
         }
     })
 }
@@ -444,10 +444,14 @@ async fn seed_world(world: &World) {
     }
 }
 
-async fn world_tick(world: &World, _tick: u32) {
+async fn world_tick(world: &World, db: &crate::db::Database, tick: u32) {
     respawn_monsters(world).await;
     monster_ai(world).await;
     regen_players(world).await;
+    // 每 25 tick（约 10 秒）周期性持久化玩家状态，降低掉线/宕机丢失进度风险
+    if tick % 25 == 0 {
+        persist_all_players(world, db).await;
+    }
 }
 
 /// 死亡怪物计数复活（约 30 tick ≈ 12 秒）
@@ -959,6 +963,50 @@ pub async fn pick_up(world: &World, player_id: u32, db: &crate::db::Database) {
     };
     world.send_to(player_id, encode_packet(&s::GainedItem { item })).await;
     // 背包变化需刷新（简化：用 UserSlotsRefresh 提示，此处先发 GainedItem 即可）
+}
+
+/// 丢弃：把背包物品丢到玩家脚下（生成地面掉落物）。成功后返回 true。
+/// `item` 为被丢弃物品的原始信息（由调用方先做 DB 扣减）。
+pub async fn drop_ground_item(world: &World, player_id: u32, item: UserItem) -> bool {
+    let Some(player) = world.get_player(player_id).await else {
+        return false;
+    };
+    world
+        .add_ground_item(GroundItem {
+            object_id: world.next_object_id(),
+            item_index: item.item_index,
+            count: item.count,
+            location: player.location,
+            unique_id: item.unique_id,
+        })
+        .await;
+    true
+}
+
+/// 把玩家当前状态（位置/血量/金币/经验/等级）写回 DB。掉线与定期备份共用。
+pub async fn persist_player(world: &World, db: &crate::db::Database, player_id: u32) {
+    let Some(p) = world.get_player(player_id).await else { return };
+    let _ = db.save_character_state(
+        p.character_index,
+        p.location.x,
+        p.location.y,
+        p.direction as i32,
+        p.hp,
+        p.mp,
+        p.gold as i64,
+        p.experience as i64,
+        p.level as i64,
+    );
+}
+
+/// 把场上所有在线玩家状态写回 DB（世界 tick 定期备份 + 服务器停机前调用）。
+pub async fn persist_all_players(world: &World, db: &crate::db::Database) {
+    let players = world.players.lock().await.clone();
+    let ids: Vec<u32> = players.keys().copied().collect();
+    drop(players);
+    for oid in ids {
+        persist_player(world, db, oid).await;
+    }
 }
 
 // ---------------------------------------------------------------------------

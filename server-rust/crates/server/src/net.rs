@@ -17,8 +17,8 @@ use crate::db::Database;
 use crate::items;
 use crate::web3::Web3Auth;
 use crate::world::{
-    equipment_slots, gain_gold, npc_shop, player_attack, pick_up, recompute_stats, remove_gold,
-    try_move, use_consumable, Player, World, MAP_HEIGHT, MAP_WIDTH,
+    drop_ground_item, equipment_slots, gain_gold, npc_shop, persist_player, player_attack, pick_up,
+    recompute_stats, remove_gold, try_move, use_consumable, Player, World, MAP_HEIGHT, MAP_WIDTH,
 };
 
 /// 连接所处的游戏阶段（对应 C# `GameStage`）
@@ -115,8 +115,9 @@ pub async fn handle_connection(
         }
     }
 
-    // 断线清理
+    // 断线清理：先持久化进度（金币/经验/等级/位置/血量），再移除在线实体
     if let Some(oid) = object_id {
+        persist_player(&world, &db, oid).await;
         world.remove_player(oid).await;
     }
     fwd_task.abort();
@@ -322,6 +323,8 @@ async fn handle_client_packet(
         }
         ClientPacket::LogOut(_) => {
             if let Some(oid) = object_id.take() {
+                // 主动登出也需持久化进度
+                persist_player(&world, db, oid).await;
                 world.remove_player(oid).await;
             }
             *stage = Stage::Select;
@@ -415,6 +418,9 @@ async fn handle_client_packet(
         }
         ClientPacket::EquipItem(e) => {
             handle_equip_item(world, db, object_id, e, tx).await?;
+        }
+        ClientPacket::DropItem(d) => {
+            handle_drop_item(world, db, object_id, d, tx).await?;
         }
         ClientPacket::Disconnect(_) => {}
         _ => {
@@ -672,6 +678,33 @@ async fn handle_use_item(
 
     // 刷新背包槽位（消耗后数量/格位变化）
     send_slots_refresh(world, db, oid, player.character_index, tx).await;
+    Ok(())
+}
+
+/// 丢弃背包物品到脚下（生成地面掉落物，供他人拾取）。
+async fn handle_drop_item(
+    world: &World,
+    db: &Database,
+    object_id: &mut Option<u32>,
+    d: &c::DropItem,
+    tx: &mpsc::Sender<Vec<u8>>,
+) -> anyhow::Result<()> {
+    let Some(oid) = *object_id else { return Ok(()) };
+    let Some(player) = world.get_player(oid).await else {
+        return Ok(());
+    };
+    // 先扣减背包，再生成地面物
+    let Some((_slot, dropped)) =
+        db.remove_item_count(player.character_index, d.unique_id, d.count)?
+    else {
+        return Ok(());
+    };
+    // 实际丢弃数量 = min(请求数, 原持有数)
+    let mut ground = dropped.clone();
+    ground.count = d.count.min(dropped.count);
+    if drop_ground_item(world, oid, ground).await {
+        send_slots_refresh(world, db, oid, player.character_index, tx).await;
+    }
     Ok(())
 }
 
