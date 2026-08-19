@@ -471,6 +471,25 @@ static func c_chat(message: String) -> CrystalBinary.Packet:
 		w.write_i32(0) # linked items
 	return p
 
+# --- Web3 钱包登录扩展（自定义 ID 200+，与 Rust client/web3.rs 一致） ---
+
+static func c_web3_challenge_request(address: String) -> CrystalBinary.Packet:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = 200
+	p.write_fn = func(w: Writer) -> void:
+		w.write_string(address)
+	return p
+
+static func c_web3_login(address: String, challenge: String, signature: PackedByteArray) -> CrystalBinary.Packet:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = 201
+	p.write_fn = func(w: Writer) -> void:
+		w.write_string(address)
+		w.write_string(challenge)
+		w.write_i32(signature.size())
+		w.data.append_array(signature)
+	return p
+
 # ---------------------------------------------------------------------------
 # 服务器 → 客户端 包解码（按 ID 分发）
 # ---------------------------------------------------------------------------
@@ -501,6 +520,9 @@ const S_OBJECT_RUN := 29
 const S_CHAT := 30
 const S_OBJECT_CHAT := 31
 const S_TIME_OF_DAY := 61
+# Web3 钱包登录扩展（自定义 ID 300+，与 Rust server/web3.rs 一致）
+const S_WEB3_CHALLENGE := 300
+const S_WEB3_LOGIN_RESULT := 301
 
 
 ## 解码服务器包: 返回 { "id": int, "data": Dictionary }；未知包返回 { "id": id, "data": {} }
@@ -624,6 +646,23 @@ static func decode_server_packet(id: int, payload: PackedByteArray) -> Dictionar
 			return {"id": id, "data": {"object_id": r.read_u32(), "text": r.read_string(), "type": r.read_u8()}}
 		S_TIME_OF_DAY:
 			return {"id": id, "data": {"lights": r.read_u8()}}
+		S_WEB3_CHALLENGE:
+			return {
+				"id": id,
+				"data": {
+					"address": r.read_string(),
+					"message": r.read_string(),
+					"expires_in": r.read_i64(),
+				},
+			}
+		S_WEB3_LOGIN_RESULT:
+			# 布局与 Rust server/web3.rs 一致: result(u8) + int32 角色数 + SelectInfo*
+			var wres := r.read_u8()
+			var wcc := r.read_i32()
+			var wchars := []
+			for i in range(wcc):
+				wchars.append(read_select_info(r))
+			return {"id": id, "data": {"result": wres, "characters": wchars}}
 		_:
 			return {"id": id, "data": {}}
 

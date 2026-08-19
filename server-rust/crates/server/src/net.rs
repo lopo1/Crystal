@@ -4,14 +4,22 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc};
 
+use std::sync::Arc;
+
+use crystal_protocol::binary::Point;
 use crystal_protocol::client as c;
 use crystal_protocol::frame::encode_packet;
 use crystal_protocol::server as s;
-use crystal_protocol::types::{MirClass, MirDirection, MirGender};
+use crystal_protocol::types::{MirClass, MirDirection, MirGender, UserItem};
 use crystal_protocol::ClientPacket;
 
-use crate::account::AccountStore;
-use crate::world::{try_move, Player, World, MAP_HEIGHT, MAP_WIDTH, SPAWN};
+use crate::db::Database;
+use crate::items;
+use crate::web3::Web3Auth;
+use crate::world::{
+    gain_gold, npc_shop, player_attack, pick_up, remove_gold, try_move, Player, World, MAP_HEIGHT,
+    MAP_WIDTH,
+};
 
 /// 连接所处的游戏阶段（对应 C# `GameStage`）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,8 +34,9 @@ const MAX_FRAME: usize = 64 * 1024 * 1024; // 防超大帧
 
 pub async fn handle_connection(
     stream: TcpStream,
-    accounts: AccountStore,
+    db: Arc<Database>,
     world: World,
+    web3_auth: Arc<Web3Auth>,
 ) -> anyhow::Result<()> {
     let (mut reader_half, mut writer_half) = stream.into_split();
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(256);
@@ -87,9 +96,10 @@ pub async fn handle_connection(
                         &mut account_id,
                         &mut object_id,
                         &mut char_info,
-                        &accounts,
+                        &db,
                         &world,
                         &tx,
+                        &web3_auth,
                     )
                     .await
                     {
@@ -139,9 +149,10 @@ async fn handle_client_packet(
     account_id: &mut Option<String>,
     object_id: &mut Option<u32>,
     char_info: &mut Option<(MirClass, MirGender, String)>,
-    accounts: &AccountStore,
+    db: &Database,
     world: &World,
     tx: &mpsc::Sender<Vec<u8>>,
+    web3_auth: &Web3Auth,
 ) -> anyhow::Result<()> {
     match packet {
         ClientPacket::ClientVersion(c::ClientVersion { .. }) => {
@@ -160,7 +171,7 @@ async fn handle_client_packet(
                 1
             } else if na.password.len() < 3 {
                 2
-            } else if !accounts.register(&na.account_id) {
+            } else if !db.register(&na.account_id)? {
                 7
             } else {
                 8
@@ -168,7 +179,7 @@ async fn handle_client_packet(
             tx.send(encode_packet(&s::NewAccount { result })).await.ok();
         }
         ClientPacket::Login(login) => {
-            let result = if !accounts.login(&login.account_id) {
+            let result = if !db.login(&login.account_id)? {
                 3 // 账号不存在
             } else {
                 *account_id = Some(login.account_id.clone());
@@ -176,7 +187,7 @@ async fn handle_client_packet(
                 0
             };
             if result == 0 {
-                let characters = accounts.select_infos(account_id.as_ref().unwrap());
+                let characters = db.select_infos(account_id.as_ref().unwrap())?;
                 tx.send(encode_packet(&s::LoginSuccess { characters }))
                     .await
                     .ok();
@@ -184,19 +195,74 @@ async fn handle_client_packet(
                 tx.send(encode_packet(&s::Login { result })).await.ok();
             }
         }
+        ClientPacket::Web3ChallengeRequest(req) => {
+            // 规范化地址；非法则回 result=1
+            match Web3Auth::normalize_address(&req.address) {
+                Ok((addr, _)) => {
+                    let ch = web3_auth.issue_challenge(&addr);
+                    tx.send(encode_packet(&s::Web3Challenge {
+                        address: ch.address,
+                        message: ch.message,
+                        expires_in: ch.expires_in,
+                    }))
+                    .await
+                    .ok();
+                }
+                Err(_) => {
+                    tx.send(encode_packet(&s::Web3LoginResult {
+                        result: 1,
+                        characters: vec![],
+                    }))
+                    .await
+                    .ok();
+                }
+            }
+        }
+        ClientPacket::Web3Login(wl) => {
+            // 校验签名并消耗挑战
+            let outcome = web3_auth.verify_and_consume(&wl.address, &wl.challenge, &wl.signature);
+            match outcome {
+                Ok((addr, _)) => {
+                    // 地址即账号：首次自动注册，随后取角色列表
+                    *account_id = Some(addr.clone());
+                    *stage = Stage::Select;
+                    let characters = db.web3_login(&addr)?;
+                    tx.send(encode_packet(&s::Web3LoginResult {
+                        result: 0,
+                        characters,
+                    }))
+                    .await
+                    .ok();
+                }
+                Err(crate::web3::Web3Error::ChallengeExpired) => {
+                    tx.send(encode_packet(&s::Web3LoginResult {
+                        result: 2,
+                        characters: vec![],
+                    }))
+                    .await
+                    .ok();
+                }
+                Err(_) => {
+                    tx.send(encode_packet(&s::Web3LoginResult {
+                        result: 3,
+                        characters: vec![],
+                    }))
+                    .await
+                    .ok();
+                }
+            }
+        }
         ClientPacket::NewCharacter(nc) => {
             let result = match (account_id.as_ref(), char_name_valid(&nc.name)) {
-                (Some(aid), true) => {
-                    match accounts.add_character(aid, &nc.name, nc.class, nc.gender) {
-                        Ok(info) => {
-                            tx.send(encode_packet(&s::NewCharacterSuccess { char_info: info }))
-                                .await
-                                .ok();
-                            return Ok(());
-                        }
-                        Err(code) => code,
+                (Some(aid), true) => match db.add_character(aid, &nc.name, nc.class, nc.gender)? {
+                    Ok(info) => {
+                        tx.send(encode_packet(&s::NewCharacterSuccess { char_info: info }))
+                            .await
+                            .ok();
+                        return Ok(());
                     }
-                }
+                    Err(code) => code,
+                },
                 (Some(_), false) => 1,
                 (None, _) => 3,
             };
@@ -207,7 +273,8 @@ async fn handle_client_packet(
         ClientPacket::DeleteCharacter(dc) => {
             let deleted = account_id
                 .as_ref()
-                .map(|aid| accounts.delete_character(aid, dc.character_index))
+                .map(|aid| db.delete_character(aid, dc.character_index))
+                .transpose()?
                 .unwrap_or(false);
             if deleted {
                 tx.send(encode_packet(&s::DeleteCharacterSuccess {
@@ -231,7 +298,7 @@ async fn handle_client_packet(
                 .ok();
                 return Ok(());
             };
-            let Some(ch) = accounts.get_character(aid, sg.character_index) else {
+            let Some(ch) = db.get_character(aid, sg.character_index)? else {
                 tx.send(encode_packet(&s::StartGame {
                     result: 2,
                     resolution: 0,
@@ -248,9 +315,9 @@ async fn handle_client_packet(
             .await
             .ok();
 
-            let oid = enter_world(world, tx, aid, &ch.name, ch.class, ch.gender, ch.level).await;
+            let oid = enter_world(db, world, tx, aid, &ch, ch.level as u16).await?;
             *object_id = Some(oid);
-            *char_info = Some((ch.class, ch.gender, ch.name.clone()));
+            *char_info = Some((num_class(ch.class), num_gender(ch.gender), ch.name.clone()));
             *stage = Stage::Game;
         }
         ClientPacket::LogOut(_) => {
@@ -259,7 +326,7 @@ async fn handle_client_packet(
             }
             *stage = Stage::Select;
             if let Some(aid) = account_id.as_ref() {
-                let characters = accounts.select_infos(aid);
+                let characters = db.select_infos(aid)?;
                 tx.send(encode_packet(&s::LoginSuccess { characters }))
                     .await
                     .ok();
@@ -281,8 +348,66 @@ async fn handle_client_packet(
                     text: chat.message.clone(),
                     r#type: 0,
                 });
-                world.broadcast_except(frame.clone(), oid);
+                world.broadcast_except(frame.clone(), oid).await;
                 let _ = tx.send(frame).await; // 自己也收到
+            }
+        }
+        ClientPacket::Attack(atk) => {
+            if let Some(oid) = *object_id {
+                player_attack(world, oid, MirDirection::from_u8(atk.direction)).await;
+            }
+        }
+        ClientPacket::PickUp(_) => {
+            if let Some(oid) = *object_id {
+                pick_up(world, oid, db).await;
+            }
+        }
+        ClientPacket::CallNPC(c) => {
+            // 商人 -> 发送 NPCGoods 商店列表
+            if let Some(shop) = npc_shop(world, c.object_id).await {
+                let list: Vec<UserItem> = shop
+                    .iter()
+                    .map(|&idx| UserItem {
+                        item_index: idx,
+                        count: 1,
+                        ..Default::default()
+                    })
+                    .collect();
+                tx.send(encode_packet(&s::NPCGoods {
+                    list,
+                    rate: 1.0,
+                    r#type: 0,
+                    hide_added_stats: false,
+                }))
+                .await
+                .ok();
+            }
+        }
+        ClientPacket::BuyItem(b) => {
+            if let Some(oid) = *object_id {
+                let idx = b.item_index as i32;
+                if let Some(tmpl) = items::find(idx) {
+                    let cost = tmpl.price.saturating_mul(b.count as u32);
+                    if remove_gold(world, oid, cost).await {
+                        if let Some(p) = world.get_player(oid).await {
+                            let _ = db.add_item_to_inventory(p.character_index, idx, b.count);
+                        }
+                    }
+                }
+            }
+        }
+        ClientPacket::SellItem(si) => {
+            if let Some(oid) = *object_id {
+                if let Some(p) = world.get_player(oid).await {
+                    if let Some(tmpl_idx) =
+                        db.remove_from_inventory(p.character_index, si.unique_id)?
+                    {
+                        if let Some(tmpl) = items::find(tmpl_idx) {
+                            let gain = tmpl.price.saturating_mul(si.count as u32) / 2;
+                            gain_gold(world, oid, gain).await;
+                        }
+                    }
+                }
             }
         }
         ClientPacket::Disconnect(_) => {}
@@ -293,16 +418,15 @@ async fn handle_client_packet(
     Ok(())
 }
 
-/// 进入世界: 发送地图信息/自身信息/位置，广播 ObjectPlayer，返回 object_id
+/// 进入世界: 发送地图信息/自身信息(含背包)/位置，广播 ObjectPlayer，返回 object_id
 async fn enter_world(
+    db: &Database,
     world: &World,
     tx: &mpsc::Sender<Vec<u8>>,
     account_id: &str,
-    name: &str,
-    class: MirClass,
-    gender: MirGender,
+    ch: &crate::db::CharacterRow,
     level: u16,
-) -> u32 {
+) -> anyhow::Result<u32> {
     // 地图信息
     tx.send(encode_packet(&s::MapInformation {
         map_index: 0,
@@ -335,18 +459,38 @@ async fn enter_world(
     .ok();
 
     let object_id = world.next_object_id();
+    // 职业/等级决定基础属性
+    let (base_hp, base_attack) = base_stats(class_from_db(ch.class), level);
     let player = Player {
         object_id,
         account_id: account_id.to_string(),
-        name: name.to_string(),
-        class,
-        gender,
+        name: ch.name.clone(),
+        class: class_from_db(ch.class),
+        gender: num_gender(ch.gender),
         level,
-        location: SPAWN,
-        direction: MirDirection::Up,
-        hp: 100,
-        mp: 100,
+        location: Point::new(ch.x, ch.y),
+        direction: MirDirection::from_u8(ch.direction as u8),
+        max_hp: base_hp,
+        hp: if ch.hp > 0 { ch.hp } else { base_hp },
+        max_mp: 20 + level as i32 * 5,
+        mp: ch.mp,
+        attack: base_attack,
+        defence: level as i32 / 2,
+        experience: 0,
+        gold: ch.gold as u32,
+        weapon: 0,
+        armour: 0,
+        character_index: ch.index,
+        sender: tx.clone(),
+        hp_changed: false,
     };
+
+    // 加载背包
+    let inventory = db
+        .load_inventory(ch.index)?
+        .into_iter()
+        .map(|(_, item)| Some(item))
+        .collect::<Vec<_>>();
 
     tx.send(encode_packet(&s::UserInformation {
         object_id,
@@ -363,15 +507,15 @@ async fn enter_world(
         hair: 0,
         hp: player.hp,
         mp: player.mp,
-        experience: 0,
+        experience: ch.experience as i64,
         max_experience: 100,
         level_effects: crystal_protocol::types::LevelEffects(0),
         has_hero: false,
         hero_behaviour: 0,
-        inventory: None,
+        inventory: Some(inventory),
         equipment: None,
         quest_inventory: None,
-        gold: 1000,
+        gold: ch.gold as u32,
         credit: 0,
         has_expanded_storage: false,
         has_storage_password: false,
@@ -399,43 +543,8 @@ async fn enter_world(
         .await
         .ok();
 
-    // 告知其他玩家: 新人进入
-    let enter_frame = encode_packet(&s::ObjectPlayer {
-        object_id,
-        name: player.name.clone(),
-        guild_name: String::new(),
-        guild_rank_name: String::new(),
-        name_colour: crystal_protocol::binary::Argb(0),
-        class: player.class,
-        gender: player.gender,
-        level: player.level,
-        location: player.location,
-        direction: player.direction,
-        hair: 0,
-        light: 0,
-        weapon: 0,
-        weapon_effect: 0,
-        armour: 0,
-        poison: 0,
-        dead: false,
-        hidden: false,
-        effect: 0,
-        wing_effect: 0,
-        extra: false,
-        mount_type: 0,
-        riding_mount: false,
-        fishing: false,
-        transform_type: 0,
-        element_orb_effect: 0,
-        element_orb_lvl: 0,
-        element_orb_max: 0,
-        buffs: vec![],
-        level_effects: crystal_protocol::types::LevelEffects(0),
-    });
-    world.broadcast_except(enter_frame, object_id);
-
     world.add_player(player).await;
-    object_id
+    Ok(object_id)
 }
 
 /// 移动/转身: 校验边界、更新世界、给自己发 UserLocation、广播给他人 Object*
@@ -491,7 +600,7 @@ async fn move_player(
             direction,
         })
     };
-    world.broadcast_except(frame, oid);
+    world.broadcast_except(frame, oid).await;
 }
 
 fn valid_account_id(id: &str) -> bool {
@@ -500,4 +609,33 @@ fn valid_account_id(id: &str) -> bool {
 
 fn char_name_valid(name: &str) -> bool {
     !name.is_empty() && name.len() <= 16
+}
+
+fn num_class(v: u8) -> MirClass {
+    match v {
+        0 => MirClass::Warrior,
+        1 => MirClass::Wizard,
+        2 => MirClass::Taoist,
+        3 => MirClass::Assassin,
+        _ => MirClass::Archer,
+    }
+}
+
+fn num_gender(v: u8) -> MirGender {
+    match v {
+        0 => MirGender::Male,
+        _ => MirGender::Female,
+    }
+}
+
+/// 与 `num_class` 一致，供 enter_world 复用
+fn class_from_db(v: u8) -> MirClass {
+    num_class(v)
+}
+
+/// 职业/等级决定基础 HP 与攻击力（程序化属性）
+fn base_stats(_class: MirClass, level: u16) -> (i32, i32) {
+    let hp = 40 + level as i32 * 8;
+    let attack = 1 + level as i32 / 2;
+    (hp, attack)
 }

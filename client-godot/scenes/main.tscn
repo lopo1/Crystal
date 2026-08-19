@@ -70,6 +70,24 @@ offset_right = 560.0
 offset_bottom = 230.0
 text = "注册新账号"
 
+[node name="WalletLoginButton" type="Button" parent="LoginPanel"]
+layout_mode = 1
+anchors_preset = 0
+offset_left = 570.0
+offset_top = 200.0
+offset_right = 700.0
+offset_bottom = 230.0
+text = "钱包登录 (Web3)"
+
+[node name="WalletStatus" type="Label" parent="LoginPanel"]
+layout_mode = 1
+anchors_preset = 0
+offset_left = 710.0
+offset_top = 200.0
+offset_right = 980.0
+offset_bottom = 230.0
+text = "（未连接钱包）"
+
 [node name="CharList" type="ItemList" parent="LoginPanel"]
 layout_mode = 1
 anchors_preset = 0

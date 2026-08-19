@@ -9,6 +9,10 @@ signal login_result(result: int)
 signal characters_loaded(characters: Array) ## Array[Dictionary] SelectInfo
 signal entered_world(user_info: Dictionary)
 signal chat_line(object_id: int, text: String)
+## Web3: 收到待签名挑战 {"address","message","expires_in"}
+signal web3_challenge_received(challenge: Dictionary)
+## Web3: 登录结果 {"result": int, "characters": Array}
+signal web3_login_result(result: Dictionary)
 
 const Packets := preload("res://scripts/net/crystal_packets.gd")
 const CrystalBinary := preload("res://scripts/net/crystal_binary.gd")
@@ -74,6 +78,15 @@ func login(account: String, password: String) -> void:
 
 func new_account(account: String, password: String, email: String, name: String) -> void:
 	send(Packets.c_new_account(account, password, email, name))
+
+func web3_request_challenge(address: String) -> void:
+	## 第一步：请求服务器为指定钱包地址签发登录挑战
+	send(Packets.c_web3_challenge_request(address))
+
+func web3_login(address: String, challenge: String, signature: PackedByteArray) -> void:
+	## 第二步：用钱包对挑战签名后提交（signature 为 65 字节 r||s||v，EIP-191）
+	_stage = "login"
+	send(Packets.c_web3_login(address, challenge, signature))
 
 func new_character(char_name: String, gender: int, class_id: int) -> void:
 	send(Packets.c_new_character(char_name, gender, class_id))
@@ -144,6 +157,13 @@ func _dispatch(id: int, payload: PackedByteArray) -> void:
 		Packets.S_LOGIN_SUCCESS:
 			_stage = "select"
 			characters_loaded.emit(data.get("characters", []))
+		Packets.S_WEB3_CHALLENGE:
+			web3_challenge_received.emit(data)
+		Packets.S_WEB3_LOGIN_RESULT:
+			if data.get("result", 1) == 0:
+				_stage = "select"
+				characters_loaded.emit(data.get("characters", []))
+			web3_login_result.emit(data)
 		Packets.S_NEW_CHARACTER:
 			login_result.emit(-data.get("result", 0)) # 负数表示建角色失败
 		Packets.S_NEW_CHARACTER_SUCCESS:

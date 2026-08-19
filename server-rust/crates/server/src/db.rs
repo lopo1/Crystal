@@ -1,0 +1,443 @@
+//! SQLite 数据库（阶段 2）: 账户/角色/物品 持久化。
+//!
+//! 原 Crystal 用本地文件存档，这里用 SQLite 提供可靠且零运维的持久化。
+//! 后续（阶段 3 Web3）将扩展钱包地址绑定。
+#![allow(dead_code)]
+
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use rusqlite::{params, Connection, OptionalExtension};
+use sha2::{Digest, Sha256};
+
+use crystal_protocol::types::{SelectInfo, UserItem};
+
+/// 背包容量（与 world.rs 对齐）
+pub const INVENTORY_SIZE: usize = 40;
+
+pub struct Database {
+    conn: Mutex<Connection>,
+    /// 物品静态数据库（由 items 表加载，供进入世界时填充背包）
+    pub items: Arc<std::sync::RwLock<Vec<(i32, String)>>>,
+}
+
+impl Database {
+    pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Arc<Self>> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let conn = Connection::open(path)?;
+        let db = Arc::new(Database {
+            conn: Mutex::new(conn),
+            items: Arc::new(std::sync::RwLock::new(Vec::new())),
+        });
+        db.init_schema()?;
+        db.seed_demo_items()?;
+        Ok(db)
+    }
+
+    fn init_schema(&self) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS accounts (
+                account_id TEXT PRIMARY KEY,
+                pass_hash  TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS characters (
+                character_index INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id    TEXT NOT NULL,
+                name          TEXT NOT NULL UNIQUE,
+                class         INTEGER NOT NULL,
+                gender        INTEGER NOT NULL,
+                level         INTEGER NOT NULL DEFAULT 1,
+                x             INTEGER NOT NULL DEFAULT 400,
+                y             INTEGER NOT NULL DEFAULT 400,
+                direction     INTEGER NOT NULL DEFAULT 0,
+                hp            INTEGER NOT NULL DEFAULT 100,
+                mp            INTEGER NOT NULL DEFAULT 100,
+                gold          INTEGER NOT NULL DEFAULT 1000,
+                experience    INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS items (
+                item_index INTEGER PRIMARY KEY,
+                name       TEXT NOT NULL,
+                item_type  INTEGER NOT NULL DEFAULT 0,
+                image      INTEGER NOT NULL DEFAULT 0,
+                durability INTEGER NOT NULL DEFAULT 0,
+                stack_size INTEGER NOT NULL DEFAULT 1,
+                weight     INTEGER NOT NULL DEFAULT 0,
+                price      INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS inventory (
+                character_index INTEGER NOT NULL,
+                slot            INTEGER NOT NULL,
+                unique_id       INTEGER NOT NULL,
+                item_index      INTEGER NOT NULL,
+                count           INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (character_index, slot)
+            );
+            "#,
+        )?;
+        drop(conn);
+        Ok(())
+    }
+
+    /// 种子物品库（垂直切片演示用）
+    fn seed_demo_items(&self) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM items", [], |r| r.get(0))?;
+        if count == 0 {
+            // 木剑(1) / 布衣(2) / 金创药(3) / 回城卷(4) / 铜币袋(5)
+            let demo: [(i32, &str, i32, i32, i32, i32, i32, i64); 5] = [
+                (1, "木剑", 1, 100, 20, 1, 3, 50),
+                (2, "布衣", 1, 101, 25, 1, 4, 80),
+                (3, "金创药", 2, 120, 0, 5, 1, 20),
+                (4, "回城卷", 2, 121, 0, 5, 1, 60),
+                (5, "铜币袋", 0, 130, 0, 20, 1, 100),
+            ];
+            for (idx, name, ty, img, dur, stack, w, price) in demo {
+                conn.execute(
+                    "INSERT INTO items (item_index,name,item_type,image,durability,stack_size,weight,price)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                    params![idx, name, ty, img, dur, stack, w, price],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    // ------------------------- 账户 -------------------------
+
+    /// 返回是否注册成功（false=已存在）
+    pub fn register(&self, account_id: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let exists: i64 =
+            conn.query_row("SELECT COUNT(*) FROM accounts WHERE account_id=?1", [account_id], |r| r.get(0))?;
+        if exists > 0 {
+            return Ok(false);
+        }
+        conn.execute(
+            "INSERT INTO accounts (account_id, pass_hash) VALUES (?1, ?2)",
+            params![account_id, hash_password(account_id)],
+        )?;
+        Ok(true)
+    }
+
+    /// 登录校验（阶段2 简化：账号存在即通过；阶段3 接钱包签名）
+    pub fn login(&self, account_id: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let exists: i64 =
+            conn.query_row("SELECT COUNT(*) FROM accounts WHERE account_id=?1", [account_id], |r| r.get(0))?;
+        Ok(exists > 0)
+    }
+
+    /// Web3 钱包登录：地址即账号。账户不存在则自动注册（首次签名即注册）。
+    /// 返回角色列表（供进入选择界面）。
+    pub fn web3_login(&self, wallet_address: &str) -> anyhow::Result<Vec<SelectInfo>> {
+        if !self.login(wallet_address)? {
+            self.register(wallet_address)?;
+        }
+        self.select_infos(wallet_address)
+    }
+
+    // ------------------------- 角色 -------------------------
+
+    pub fn select_infos(&self, account_id: &str) -> anyhow::Result<Vec<SelectInfo>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT character_index, name, level, class, gender FROM characters WHERE account_id=?1",
+        )?;
+        let rows = stmt.query_map([account_id], |r| {
+            Ok((r.get::<_, i32>(0)?, r.get::<_, String>(1)?, r.get::<_, u16>(2)?,
+                r.get::<_, u8>(3)?, r.get::<_, u8>(4)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (index, name, level, class, gender) = row?;
+            out.push(SelectInfo {
+                index,
+                name,
+                level,
+                class: num_to_class(class),
+                gender: num_to_gender(gender),
+                last_access: 0,
+            });
+        }
+        Ok(out)
+    }
+
+    /// 返回 Some(info) 成功 / Err(code) 失败（2=性别错,3=职业错,4=角色满,5=重名）
+    pub fn add_character(
+        &self,
+        account_id: &str,
+        name: &str,
+        class: crystal_protocol::types::MirClass,
+        gender: crystal_protocol::types::MirGender,
+    ) -> anyhow::Result<Result<SelectInfo, u8>> {
+        let index;
+        {
+            let conn = self.conn.lock().unwrap();
+            // 同名检查
+            let dup: i64 = conn
+                .query_row("SELECT COUNT(*) FROM characters WHERE name=?1", [name], |r| r.get(0))?;
+            if dup > 0 {
+                return Ok(Err(5));
+            }
+            // 角色数上限（C# 默认 4）
+            let cnt: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM characters WHERE account_id=?1",
+                [account_id],
+                |r| r.get(0),
+            )?;
+            if cnt >= 4 {
+                return Ok(Err(4));
+            }
+            conn.execute(
+                "INSERT INTO characters (account_id,name,class,gender) VALUES (?1,?2,?3,?4)",
+                params![account_id, name, class as u8, gender as u8],
+            )?;
+            index = conn.last_insert_rowid() as i32;
+        } // 释放锁
+        // 自动发初始背包（之后锁）
+        self.grant_starter_items(index)?;
+        Ok(Ok(SelectInfo {
+            index,
+            name: name.to_string(),
+            level: 1,
+            class,
+            gender,
+            last_access: 0,
+        }))
+    }
+
+    pub fn delete_character(&self, account_id: &str, character_index: i32) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "DELETE FROM characters WHERE character_index=?1 AND account_id=?2",
+            params![character_index, account_id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// 返回 (角色行, 新账号时分配的 object_id 由上层处理)
+    pub fn get_character(
+        &self,
+        account_id: &str,
+        character_index: i32,
+    ) -> anyhow::Result<Option<CharacterRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT character_index,name,class,gender,level,x,y,direction,hp,mp,gold,experience
+             FROM characters WHERE character_index=?1 AND account_id=?2",
+        )?;
+        let mut rows = stmt.query_map(params![character_index, account_id], |r| {
+            Ok(CharacterRow {
+                index: r.get(0)?,
+                name: r.get(1)?,
+                class: r.get(2)?,
+                gender: r.get(3)?,
+                level: r.get(4)?,
+                x: r.get(5)?,
+                y: r.get(6)?,
+                direction: r.get(7)?,
+                hp: r.get(8)?,
+                mp: r.get(9)?,
+                gold: r.get(10)?,
+                experience: r.get(11)?,
+            })
+        })?;
+        Ok(rows.next().transpose()?)
+    }
+
+    /// 保存角色位置等状态
+    pub fn save_character_state(
+        &self,
+        character_index: i32,
+        x: i32,
+        y: i32,
+        direction: i32,
+        hp: i32,
+        mp: i32,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE characters SET x=?1,y=?2,direction=?3,hp=?4,mp=?5 WHERE character_index=?6",
+            params![x, y, direction, hp, mp, character_index],
+        )?;
+        Ok(())
+    }
+
+    // ------------------------- 物品 -------------------------
+
+    /// 加载某角色的背包：[(slot, UserItem)]
+    pub fn load_inventory(&self, character_index: i32) -> anyhow::Result<Vec<(i32, UserItem)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT slot,unique_id,item_index,count FROM inventory WHERE character_index=?1 ORDER BY slot")?;
+        let rows = stmt.query_map([character_index], |r| {
+            Ok((r.get::<_, i32>(0)?, r.get::<_, i64>(1)?, r.get::<_, i32>(2)?, r.get::<_, u16>(3)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (slot, uid, item_index, count) = row?;
+            out.push((
+                slot,
+                UserItem {
+                    unique_id: uid as u64,
+                    item_index,
+                    count,
+                    ..Default::default()
+                },
+            ));
+        }
+        Ok(out)
+    }
+
+    /// 新角色自动发初始背包（木剑 + 金创药x5）
+    pub fn grant_starter_items(&self, character_index: i32) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO inventory (character_index,slot,unique_id,item_index,count) VALUES (?1,0,?2,1,1)",
+            params![character_index, make_unique(character_index, 0)],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO inventory (character_index,slot,unique_id,item_index,count) VALUES (?1,1,?2,3,5)",
+            params![character_index, make_unique(character_index, 1)],
+        )?;
+        Ok(())
+    }
+
+    /// 把物品加入背包首个空槽；满则返回 false。
+    pub fn add_item_to_inventory(
+        &self,
+        character_index: i32,
+        item_index: i32,
+        count: u16,
+    ) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        // 找空槽（0..INVENTORY_SIZE）
+        let occupied: Vec<i32> = {
+            let mut stmt = conn.prepare(
+                "SELECT slot FROM inventory WHERE character_index=?1 ORDER BY slot",
+            )?;
+            let rows = stmt.query_map([character_index], |r| r.get(0))?;
+            rows.collect::<Result<Vec<i32>, _>>()?
+        };
+        for slot in 0..INVENTORY_SIZE as i32 {
+            if !occupied.contains(&slot) {
+                conn.execute(
+                    "INSERT INTO inventory (character_index,slot,unique_id,item_index,count) VALUES (?1,?2,?3,?4,?5)",
+                    params![
+                        character_index,
+                        slot,
+                        make_unique(character_index, slot),
+                        item_index,
+                        count
+                    ],
+                )?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// 按 unique_id 查找背包物品的模板索引；无则 None。
+    pub fn inventory_item_index(
+        &self,
+        character_index: i32,
+        unique_id: u64,
+    ) -> anyhow::Result<Option<i32>> {
+        let conn = self.conn.lock().unwrap();
+        let item_index = conn
+            .query_row(
+                "SELECT item_index FROM inventory WHERE character_index=?1 AND unique_id=?2",
+                params![character_index, unique_id as i64],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(item_index)
+    }
+
+    /// 从背包删除指定 unique_id 的物品（出售用），并返回其模板索引。
+    pub fn remove_from_inventory(
+        &self,
+        character_index: i32,
+        unique_id: u64,
+    ) -> anyhow::Result<Option<i32>> {
+        let conn = self.conn.lock().unwrap();
+        let idx: Option<i32> = conn
+            .query_row(
+                "SELECT item_index FROM inventory WHERE character_index=?1 AND unique_id=?2",
+                params![character_index, unique_id as i64],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if idx.is_some() {
+            conn.execute(
+                "DELETE FROM inventory WHERE character_index=?1 AND unique_id=?2",
+                params![character_index, unique_id as i64],
+            )?;
+        }
+        Ok(idx)
+    }
+
+    pub fn item_name(&self, item_index: i32) -> anyhow::Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        match conn.query_row("SELECT name FROM items WHERE item_index=?1", [item_index], |r| r.get(0)) {
+            Ok(name) => Ok(Some(name)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CharacterRow {
+    pub index: i32,
+    pub name: String,
+    pub class: u8,
+    pub gender: u8,
+    pub level: i64,
+    pub x: i32,
+    pub y: i32,
+    pub direction: i32,
+    pub hp: i32,
+    pub mp: i32,
+    pub gold: i64,
+    pub experience: i64,
+}
+
+fn hash_password(s: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(s.as_bytes());
+    format!("{:x}", h.finalize())
+}
+
+fn num_to_class(v: u8) -> crystal_protocol::types::MirClass {
+    match v {
+        0 => crystal_protocol::types::MirClass::Warrior,
+        1 => crystal_protocol::types::MirClass::Wizard,
+        2 => crystal_protocol::types::MirClass::Taoist,
+        3 => crystal_protocol::types::MirClass::Assassin,
+        _ => crystal_protocol::types::MirClass::Archer,
+    }
+}
+
+fn num_to_gender(v: u8) -> crystal_protocol::types::MirGender {
+    match v {
+        0 => crystal_protocol::types::MirGender::Male,
+        _ => crystal_protocol::types::MirGender::Female,
+    }
+}
+
+fn make_unique(char_index: i32, slot: i32) -> i64 {
+    // 简单唯一ID: 角色*100 + 槽位
+    (char_index as i64) * 1000 + slot as i64
+}
+
+/// 供 main 使用（路径默认 data/crystal.db）
+pub fn default_db_path() -> PathBuf {
+    Path::new("data").join("crystal.db")
+}

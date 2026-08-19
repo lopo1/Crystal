@@ -320,12 +320,14 @@ pub mod batch_2;
 pub mod batch_3;
 pub mod batch_4;
 pub mod batch_7;
+pub mod web3;
 
 pub use batch_1::*;
 pub use batch_2::*;
 pub use batch_3::*;
 pub use batch_4::*;
 pub use batch_7::*;
+pub use web3::*;
 
 /// 客户端数据包分发宏: 由 (变体名 => 类型) 列表生成枚举与按 ID 解码。
 /// 每移植一批，在 `client_packet_dispatch!` 调用中追加条目。
@@ -504,4 +506,7 @@ client_packet_dispatch! {
     RemoveStoragePassword => RemoveStoragePassword,
     GuildStorageGoldChange => GuildStorageGoldChange,
     GuildStorageItemChange => GuildStorageItemChange,
+    // ---- Web3 钱包登录扩展（自定义 ID 200+）----
+    Web3ChallengeRequest => Web3ChallengeRequest,
+    Web3Login => Web3Login,
 }

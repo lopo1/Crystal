@@ -4,10 +4,14 @@ extends Node
 
 const GameClient := preload("res://scripts/net/game_client.gd")
 const Packets := preload("res://scripts/net/crystal_packets.gd")
+const Web3Wallet := preload("res://scripts/net/web3_wallet.gd")
 
 const TILE := 32 # 每个格子像素（垂直切片用色块代替贴图）
 
 var client: GameClient
+var wallet := Web3Wallet.new() # 默认 JS (MetaMask)；开发模式可切 RPC
+var _wallet_address := ""
+var _pending_challenge := ""
 
 # 游戏内状态
 var my_pos := Vector2i(400, 400)
@@ -31,10 +35,12 @@ func _ready() -> void:
 	client.chat_line.connect(_on_chat_line)
 	client.disconnected.connect(func(reason): status_label.text = "断开: " + reason)
 	client.server_packet.connect(_on_server_packet)
+	client.web3_challenge_received.connect(_on_web3_challenge)
 	$LoginPanel/ConnectButton.pressed.connect(_on_connect_pressed)
 	$LoginPanel/NewAccountButton.pressed.connect(_on_new_account_pressed)
 	$LoginPanel/StartGameButton.pressed.connect(_on_start_game_pressed)
 	$LoginPanel/CreateButton.pressed.connect(_on_create_pressed)
+	$LoginPanel/WalletLoginButton.pressed.connect(_on_wallet_login_pressed)
 	chat_input.text_submitted.connect(_on_chat_submitted)
 	game_view.hide()
 
@@ -61,6 +67,44 @@ func _on_connect_pressed() -> void:
 func _on_connected() -> void:
 	status_label.text = "已连接，上报版本..."
 	client.send_client_version(PackedByteArray())
+	# 若是钱包登录流程，连接后就继续取地址→请求挑战
+	if _wallet_login_pending:
+		_wallet_login_pending = false
+		_begin_wallet_login()
+
+var _wallet_login_pending := false
+
+func _on_wallet_login_pressed() -> void:
+	status_label.text = "连接钱包..."
+	wallet.get_address(func(addr: String) -> void:
+		if addr == "":
+			status_label.text = "未获取到钱包地址（请安装 MetaMask 或改用 RPC 签名服务）"
+			return
+		_wallet_address = addr
+		$LoginPanel/WalletStatus.text = "钱包: " + addr.substr(0, 10) + "..."
+		if client.is_connected():
+			_begin_wallet_login()
+		else:
+			_wallet_login_pending = true
+			client.connect_to_server($LoginPanel/ServerLineEdit.text, int($LoginPanel/PortLineEdit.text))
+	)
+
+func _begin_wallet_login() -> void:
+	## 第一步：请求服务器为钱包地址签发挑战
+	status_label.text = "请求登录挑战..."
+	client.web3_request_challenge(_wallet_address)
+
+func _on_web3_challenge(ch: Dictionary) -> void:
+	## 第二步：让钱包对挑战 personal_sign，再提交
+	_pending_challenge = ch.get("message", "")
+	status_label.text = "请在钱包中确认签名..."
+	wallet.personal_sign(_pending_challenge, func(sig: PackedByteArray, _addr: String) -> void:
+		if sig.is_empty():
+			status_label.text = "签名失败或已取消"
+			return
+		status_label.text = "提交签名..."
+		client.web3_login(_wallet_address, _pending_challenge, sig)
+	)
 
 func _on_login_result(result: int) -> void:
 	if result == 0:

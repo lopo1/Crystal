@@ -50,6 +50,32 @@ async fn main() -> anyhow::Result<()> {
             buf.extend_from_slice(&chunk[..n]);
         }
     }
+    // 带超时的收包：约定时间内无新包返回 None（用于排空世界状态，避免无限阻塞）
+    async fn recv_packet_timed(
+        buf: &mut Vec<u8>,
+        stream: &mut TcpStream,
+        timeout_ms: u64,
+    ) -> Option<(i16, Vec<u8>)> {
+        loop {
+            if buf.len() >= 4 {
+                let len = u16::from_le_bytes([buf[0], buf[1]]) as usize;
+                if len >= 4 && buf.len() >= len {
+                    let id = i16::from_le_bytes([buf[2], buf[3]]);
+                    let payload = buf[4..len].to_vec();
+                    buf.drain(..len);
+                    return Some((id, payload));
+                }
+            }
+            let mut chunk = [0u8; 8192];
+            match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), stream.read(&mut chunk))
+                .await
+            {
+                Ok(Ok(n)) if n > 0 => buf.extend_from_slice(&chunk[..n]),
+                Ok(Ok(_)) => return None, // 连接关闭
+                _ => return None,          // 超时
+            }
+        }
+    }
 
     println!("== 连接 {addr} ==");
     let (id, payload) = recv_packet(&mut buf, &mut stream).await;
@@ -103,14 +129,16 @@ async fn main() -> anyhow::Result<()> {
         },
     )
     .await;
-    // StartGame 后服务器连发 6 个包: StartGame, MapInformation, NewMapInfo,
-    // UserInformation, UserLocation, TimeOfDay
+    // StartGame 后服务器连发入口包 + 场上怪物/NPC 世界状态。用带超时的收包排空，
+    // 确认入口包齐备后即可继续（超时即认为世界状态派发完毕）。
     let mut got_start = false;
     let mut got_map = false;
     let mut got_user = false;
     let mut got_loc = false;
-    for _ in 0..6 {
-        let (id, payload) = recv_packet(&mut buf, &mut stream).await;
+    for _ in 0..120 {
+        let Some((id, payload)) = recv_packet_timed(&mut buf, &mut stream, 800).await else {
+            break; // 无更多世界状态包
+        };
         match ServerPacket::decode(id, &payload)? {
             ServerPacket::StartGame(sg) => {
                 assert_eq!(sg.result, 0);
@@ -133,7 +161,7 @@ async fn main() -> anyhow::Result<()> {
                 println!("✓ 出生点: ({}, {})", ul.location.x, ul.location.y);
             }
             ServerPacket::TimeOfDay(t) => println!("✓ 时辰 lights={}", t.lights),
-            other => println!("  (其他包) {other:?}"),
+            _ => {} // 怪物/NPC/掉落等世界状态包，继续排空
         }
     }
     assert!(

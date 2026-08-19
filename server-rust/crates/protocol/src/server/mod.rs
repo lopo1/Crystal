@@ -1132,6 +1132,7 @@ pub mod batch_4;
 pub mod batch_5;
 pub mod batch_6;
 pub mod batch_7;
+pub mod web3;
 
 pub use batch_1::*;
 pub use batch_2::*;
@@ -1140,6 +1141,7 @@ pub use batch_4::*;
 pub use batch_5::*;
 pub use batch_6::*;
 pub use batch_7::*;
+pub use web3::*;
 
 /// 服务器数据包分发宏: 由类型列表生成枚举与按 ID 解码。
 /// 每移植一批，在 `server_packet_dispatch!` 调用中追加类型名。
@@ -1444,4 +1446,7 @@ server_packet_dispatch! {
     ObjectDash => ObjectDash,
     UserDashFail => UserDashFail,
     ObjectDashFail => ObjectDashFail,
+    // ---- Web3 钱包登录扩展（自定义 ID 300+）----
+    Web3Challenge => Web3Challenge,
+    Web3LoginResult => Web3LoginResult,
 }
