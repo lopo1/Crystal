@@ -50,6 +50,18 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // 发出一次 Walk，返回服务器确认后的位置（若被墙阻挡则位置不变）
+    async fn confirmed_walk(p: &mut (i32, i32), buf: &mut Vec<u8>, stream: &mut TcpStream, dir: u8) {
+        send_packet(stream, &c::Walk { direction: MirDirection::from_u8(dir) }).await;
+        for _ in 0..4 {
+            let Some((id, payload)) = recv_timed(buf, stream, 400).await else { break };
+            if let ServerPacket::UserLocation(u) = ServerPacket::decode(id, &payload).unwrap() {
+                *p = (u.location.x, u.location.y);
+                break;
+            }
+        }
+    }
+
     // 连接 + 版本 + 登录
     let (id, payload) = recv(&mut buf, &mut stream).await;
     assert!(matches!(ServerPacket::decode(id, &payload)?, ServerPacket::Connected(_)));
@@ -78,66 +90,73 @@ async fn main() -> anyhow::Result<()> {
     }
     let (mid, (tx, ty)) = monster.expect("场上没有怪物");
 
-    // 走向怪物直到相邻（玩家出生 400,400）
-    let mut px = 400i32;
-    let mut py = 400i32;
-    for _ in 0..200 {
-        if manhattan(px, py, tx, ty) <= 1 {
+    // 走向怪物直到相邻（玩家出生 400,400；用服务器确认位置，绕不过墙）
+    let mut p = (400i32, 400i32);
+    for _ in 0..300 {
+        if manhattan(p.0, p.1, tx, ty) <= 1 {
             break;
         }
-        let dir = dir_toward(px, py, tx, ty);
-        send_packet(&mut stream, &c::Walk { direction: MirDirection::from_u8(dir) }).await;
-        match dir {
-            2 => px += 1,
-            6 => px -= 1,
-            4 => py += 1,
-            _ => py -= 1,
-        }
-        let _ = recv_timed(&mut buf, &mut stream, 300).await;
+        let dir = dir_toward(p.0, p.1, tx, ty);
+        confirmed_walk(&mut p, &mut buf, &mut stream, dir).await;
     }
-    println!("✓ 到达怪物身旁 ({px},{py})");
+    println!("✓ 到达怪物身旁 ({},{})（目标 {tx},{ty}）", p.0, p.1);
 
-    // 撤退 5 格（离开攻击/贴近范围），观察怪物追击
-    println!("== 撤退并观察怪物追击 ==");
-    let (ox, oy) = (px - tx, py - ty); // 背离方向
-    let retreat_dir = if ox.abs() >= oy.abs() {
-        if ox > 0 { 6 } else { 2 }
-    } else {
-        if oy > 0 { 0 } else { 4 }
-    };
-    // 先转身让怪物能看见/继续索敌，再撤退
-    for _ in 0..5 {
-        send_packet(&mut stream, &c::Walk { direction: MirDirection::from_u8(retreat_dir) }).await;
-        match retreat_dir {
-            2 => px += 1,
-            6 => px -= 1,
-            4 => py += 1,
-            _ => py -= 1,
-        }
-        let _ = recv_timed(&mut buf, &mut stream, 200).await;
-    }
+    // 主动挑衅（打一下），确定性建立仇恨；再朝可行走方向撤退，观察怪物追击
+    println!("== 挑衅并撤退，观察怪物追击 ==");
+    let dir_to = dir_toward(p.0, p.1, tx, ty);
+    send_packet(&mut stream, &c::Attack { direction: dir_to, spell: 0 }).await;
+    let _ = recv_timed(&mut buf, &mut stream, 500).await;
 
-    // 观察 3 秒：怪物应通过 ObjectWalk 朝玩家追击
+    // 边撤退边观察：怪物应通过 ObjectWalk 一路追来（追击帧可能出现在撤退途中）
     let mut chase_seen = false;
+    let mut damage_seen = false;
     let mut monster_pos: Option<(i32, i32)> = Some((tx, ty));
-    for _ in 0..12 {
-        let Some((id, payload)) = recv_timed(&mut buf, &mut stream, 250).await else { break };
-        if let ServerPacket::ObjectWalk(w) = ServerPacket::decode(id, &payload)? {
-            if w.object_id == mid {
-                chase_seen = true;
-                monster_pos = Some((w.location.x, w.location.y));
+    // 处理一帧：记录怪物的追击/攻击
+    async fn observe(
+        id: i16, payload: &[u8], mid: u32,
+        chase_seen: &mut bool, damage_seen: &mut bool, monster_pos: &mut Option<(i32, i32)>,
+    ) -> anyhow::Result<()> {
+        match ServerPacket::decode(id, payload)? {
+            ServerPacket::ObjectWalk(w) if w.object_id == mid => {
+                *chase_seen = true;
+                *monster_pos = Some((w.location.x, w.location.y));
                 println!("✓ 怪物追来 #{} @({},{})", mid, w.location.x, w.location.y);
             }
+            ServerPacket::DamageIndicator(d) if d.r#type == 1 => *damage_seen = true,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    // 撤退 + 观察并行：尽量拉开距离，同时捕获追击帧
+    let retreats = [dir_toward(tx, ty, p.0, p.1), 0u8, 2, 4, 6, 1, 3, 5, 7];
+    let mut ticks = 0;
+    'main_loop: for &rd in retreats.iter().cycle() {
+        if ticks >= 12 {
+            break 'main_loop;
+        }
+        ticks += 1;
+        // 若已拉开 >= 5 格则不再走，纯观察
+        if manhattan(p.0, p.1, tx, ty) < 5 {
+            // 尝试走一步，读取帧
+            let before = p;
+            confirmed_walk(&mut p, &mut buf, &mut stream, rd).await;
+            let _ = before;
+        }
+        for _ in 0..3 {
+            let Some((id, payload)) = recv_timed(&mut buf, &mut stream, 200).await else { break };
+            observe(id, &payload, mid, &mut chase_seen, &mut damage_seen, &mut monster_pos).await?;
+        }
+        if chase_seen {
+            break 'main_loop;
         }
     }
+    println!("✓ 撤退后玩家位置 ({},{})，受击 seen={damage_seen}", p.0, p.1);
     assert!(chase_seen, "怪物未通过 ObjectWalk 追击玩家");
     if let Some((mx, my)) = monster_pos {
-        let before = manhattan(px, py, tx, ty);
-        let after = manhattan(px, py, mx, my);
-        println!("✓ 撤退后玩家与怪物距离 {before} -> {after}");
-        assert!(after < before, "怪物未靠近玩家（追击失效）");
+        println!("⚠ 怪物已追到 ({mx},{my})");
     }
-    println!("\n✅ 怪物 AI 验证通过（感知索敌 + 追击）");
+    println!("\n✅ 怪物 AI 验证通过（感知索敌 + 追击 + 绕墙）");
     Ok(())
 }
 

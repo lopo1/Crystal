@@ -7,6 +7,7 @@
 mod db;
 mod items;
 mod magics;
+mod maps;
 mod net;
 mod web3;
 mod world;
@@ -35,9 +36,17 @@ async fn main() -> anyhow::Result<()> {
 
     let addr = std::env::var("CRYSTAL_BIND").unwrap_or_else(|_| "127.0.0.1:7000".to_string());
     let db_path = std::env::var("CRYSTAL_DB").unwrap_or_else(|_| "data/crystal.db".to_string());
+    // 地图数据目录（存放 Crystal.Database 的 .map 文件）
+    let map_dir = std::env::var("CRYSTAL_MAPS").unwrap_or_else(|_| "data/maps".to_string());
 
     let db = Database::open(&db_path)?;
-    let world = Arc::new(World::new());
+    // 加载默认地图（0 = 新手村；缺图时退回程序化空地图以便无头运行）
+    let map = maps::load_map_file(0, std::path::Path::new(&map_dir).join("0.map"))
+        .unwrap_or_else(|e| {
+            tracing::warn!("未加载到 0.map（{e}），使用默认空地图");
+            world::default_map()
+        });
+    let world = Arc::new(World::with_map(map));
     let web3_auth = Arc::new(Web3Auth::new());
 
     // 启动世界 tick（怪物刷新 + AI + 玩家回复 + 周期性存档）

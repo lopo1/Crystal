@@ -59,6 +59,14 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
+    // 排空缓冲区若干帧（忽略内容），避免旧帧干扰后续响应判定
+    async fn drain(buf: &mut Vec<u8>, stream: &mut TcpStream, n: usize) {
+        for _ in 0..n {
+            if recv_timed(buf, stream, 60).await.is_none() {
+                break;
+            }
+        }
+    }
 
     // 连接 + 版本
     let (id, payload) = recv(&mut buf, &mut stream).await;
@@ -302,14 +310,15 @@ async fn main() -> anyhow::Result<()> {
         let _ = recv_timed(&mut buf, &mut stream, 300).await;
     }
     println!("✓ 到达商人 ({px},{py})");
+    drain(&mut buf, &mut stream, 40).await; // 排空旧帧
     send_packet(
         &mut stream,
         &c::CallNPC { object_id: merchant_id, key: String::new() },
     )
     .await;
     let mut saw_goods = false;
-    for _ in 0..8 {
-        let Some((id, payload)) = recv_timed(&mut buf, &mut stream, 600).await else { break };
+    for _ in 0..40 {
+        let Some((id, payload)) = recv_timed(&mut buf, &mut stream, 400).await else { break };
         if let ServerPacket::NPCGoods(g) = ServerPacket::decode(id, &payload)? {
             println!("✓ 商店在售 {} 件商品", g.list.len());
             saw_goods = true;
@@ -318,10 +327,11 @@ async fn main() -> anyhow::Result<()> {
     }
     assert!(saw_goods, "未收到商店列表 NPCGoods");
     // 买金创药(index=3)，用 LoseGold 判定扣款成功
+    drain(&mut buf, &mut stream, 40).await;
     send_packet(&mut stream, &c::BuyItem { item_index: 3, count: 1, r#type: 0 }).await;
     let mut saw_lose_gold = false;
-    for _ in 0..8 {
-        let Some((id, payload)) = recv_timed(&mut buf, &mut stream, 600).await else { break };
+    for _ in 0..40 {
+        let Some((id, payload)) = recv_timed(&mut buf, &mut stream, 400).await else { break };
         if let ServerPacket::LoseGold(_) = ServerPacket::decode(id, &payload)? {
             saw_lose_gold = true;
             break;
@@ -340,11 +350,12 @@ async fn main() -> anyhow::Result<()> {
             cur_hp = Some(h.hp);
         }
     }
+    drain(&mut buf, &mut stream, 40).await; // 排空旧帧
     send_packet(&mut stream, &c::UseItem { unique_id: potion_uid, grid: 1 }).await;
     let mut used = false;
     let mut hp_after: Option<i32> = None;
-    for _ in 0..8 {
-        let Some((id, payload)) = recv_timed(&mut buf, &mut stream, 600).await else { break };
+    for _ in 0..40 {
+        let Some((id, payload)) = recv_timed(&mut buf, &mut stream, 400).await else { break };
         match ServerPacket::decode(id, &payload)? {
             ServerPacket::UseItem(u) => {
                 assert!(u.success, "use item 返回失败");
@@ -368,10 +379,11 @@ async fn main() -> anyhow::Result<()> {
     // 装备木剑（装备槽 0 = Weapon）
     println!("== 装备木剑 ==");
     let weapon_uid = weapon_uid.expect("背包里没有木剑");
+    drain(&mut buf, &mut stream, 30).await; // 排空旧帧，避免响应被挤掉
     send_packet(&mut stream, &c::EquipItem { grid: 1, unique_id: weapon_uid, to: 0 }).await;
     let mut equipped = false;
     let mut saw_own_weapon = false;
-    for _ in 0..8 {
+    for _ in 0..16 {
         let Some((id, payload)) = recv_timed(&mut buf, &mut stream, 600).await else { break };
         match ServerPacket::decode(id, &payload)? {
             ServerPacket::EquipItem(e) => {
@@ -391,9 +403,10 @@ async fn main() -> anyhow::Result<()> {
 
     // 丢弃一个金创药（背包金创药数量>1，丢 1 个，地面出现掉落物）
     println!("== 丢弃金创药 ==");
+    drain(&mut buf, &mut stream, 40).await; // 排空旧帧
     send_packet(&mut stream, &c::DropItem { unique_id: potion_uid, count: 1, hero_inventory: false }).await;
     let mut saw_drop_obj = false;
-    for _ in 0..8 {
+    for _ in 0..40 {
         let Some((id, payload)) = recv_timed(&mut buf, &mut stream, 600).await else { break };
         if let ServerPacket::ObjectItem(oi) = ServerPacket::decode(id, &payload)? {
             // 地面物体无独立 item_index，ObjectItem 以 image 表示道具（世界侧用 item_index 作为 image）

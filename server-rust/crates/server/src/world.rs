@@ -110,10 +110,36 @@ pub struct World {
     broadcast_tx: broadcast::Sender<Vec<u8>>,
     next_object_id: Arc<std::sync::atomic::AtomicU32>,
     next_item_unique: Arc<std::sync::atomic::AtomicU64>,
+    /// 当前地图（含碰撞网格）
+    pub map: Arc<crate::maps::GameMap>,
+}
+
+/// 无真实地图时的程序化空地图（保持原有 800x800 全通行为，供无头/缺图运行）
+pub fn default_map() -> crate::maps::GameMap {
+    crate::maps::load_map_bytes(
+        0,
+        &{
+            // 构造 800x800 全通 V100 字节
+            let w = 800u16;
+            let h = 800u16;
+            let mut b = vec![0u8; 8 + (w as usize) * (h as usize) * 26];
+            b[0] = 1;
+            b[2] = 0x43;
+            b[3] = 0x23;
+            b[4..6].copy_from_slice(&w.to_le_bytes());
+            b[6..8].copy_from_slice(&h.to_le_bytes());
+            b
+        },
+    )
+    .expect("程序化空地图构造失败")
 }
 
 impl World {
     pub fn new() -> Self {
+        Self::with_map(default_map())
+    }
+
+    pub fn with_map(map: crate::maps::GameMap) -> Self {
         let (broadcast_tx, _) = broadcast::channel(512);
         World {
             players: Arc::new(Mutex::new(HashMap::new())),
@@ -123,7 +149,31 @@ impl World {
             broadcast_tx,
             next_object_id: Arc::new(std::sync::atomic::AtomicU32::new(1)),
             next_item_unique: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            map: Arc::new(map),
         }
+    }
+
+    /// 该坐标是否可通行（地图内且非墙）
+    pub fn is_walkable(&self, x: i32, y: i32) -> bool {
+        self.map.is_walkable(x, y)
+    }
+
+    /// 找一个可通行的坐标（供出生/刷新用；从给定点向外搜索）
+    pub fn nearest_walkable(&self, x: i32, y: i32) -> (i32, i32) {
+        for r in 0i32..40 {
+            for dy in -r..=r {
+                for dx in -r..=r {
+                    if dx.abs().max(dy.abs()) != r {
+                        continue;
+                    }
+                    if self.map.is_walkable(x + dx, y + dy) {
+                        return (x + dx, y + dy);
+                    }
+                }
+            }
+        }
+        // 兜底：地图中心
+        (self.map.width as i32 / 2, self.map.height as i32 / 2)
     }
 
     pub fn next_object_id(&self) -> u32 {
@@ -371,16 +421,24 @@ async fn seed_world(world: &World) {
         (4, "蜘蛛", 4, 26, 5, 2, 20, 12),
     ];
     let mut oid = world.next_object_id();
+    // 在新手村出生点附近的连续开阔地（地图 0 的 400,400 附近）紧凑布怪，
+    // 保证玩家直线可达（确认位置行走测试用），并吸附到可行走格。
+    let cluster: [(i32, i32); 20] = [
+        (400, 400), (403, 402), (406, 400), (401, 405), (405, 405),
+        (398, 403), (407, 403), (403, 399), (399, 407), (406, 407),
+        (402, 402), (404, 398), (397, 401), (408, 405), (401, 399),
+        (407, 401), (404, 408), (399, 404), (406, 405), (402, 406),
+    ];
     for i in 0..20 {
         let (image, name, level, hp, attack, defence, exp, gold) = defs[i % 3];
-        let x = 380 + (i % 10) * 10;
-        let y = 350 + (i / 10) * 10;
+        let (cx, cy) = cluster[i];
+        let (wx, wy) = world.nearest_walkable(cx, cy);
         world
             .add_monster(Monster {
                 object_id: oid,
                 name: name.to_string(),
                 image,
-                location: Point::new(x as i32, y as i32),
+                location: Point::new(wx, wy),
                 direction: MirDirection::Up,
                 level,
                 max_hp: hp,
@@ -400,11 +458,12 @@ async fn seed_world(world: &World) {
     }
     // 商人 NPC：卖 木剑(1)/布衣(2)/金创药(3)/回城卷(4)/铜钱袋(5)
     if world.npcs.lock().await.is_empty() {
+        let (wx, wy) = world.nearest_walkable(404, 400);
         let npc = Npc {
             object_id: world.next_object_id(),
             name: "铁匠铺".to_string(),
             image: 0,
-            location: Point::new(400, 430),
+            location: Point::new(wx, wy),
             shop_items: vec![1, 2, 3, 4, 5],
         };
         world
@@ -541,10 +600,9 @@ async fn monster_ai(world: &World) {
                     .max(1);
                 attacks.push((m.object_id, tid, dmg));
             } else {
-                // 不相邻 -> 朝目标方向贪心走一步
-                let (dx, dy) = chase_step(m.location, tloc);
-                if let Some(new_loc) = try_move(m.location, dir_from_delta(dx, dy), 1) {
-                    moves.push((m.object_id, new_loc, dir_from_delta(dx, dy)));
+                // 不相邻 -> 选择最佳可行走邻格逼近目标（可绕开简单障碍）
+                if let Some((new_loc, dir)) = world.chase_step(m.location, tloc) {
+                    moves.push((m.object_id, new_loc, dir));
                 }
             }
         }
@@ -886,25 +944,30 @@ async fn monster_hit_player(world: &World, monster_id: u32, player_id: u32, dmg:
 
 /// 玩家死亡：回城复活
 pub async fn player_died(world: &World, player_id: u32) {
+    // 回城：传送到可通行的出生点（在地图上找到可走的格子）
+    let spawn = {
+        let s = world.nearest_walkable(SPAWN.x, SPAWN.y);
+        Point::new(s.0, s.1)
+    };
     world
         .send_to(
             player_id,
             encode_packet(&s::Death {
-                location: SPAWN,
+                location: spawn,
                 direction: MirDirection::Up,
             }),
         )
         .await;
     world.broadcast(encode_packet(&s::ObjectDied {
         object_id: player_id,
-        location: SPAWN,
+        location: spawn,
         direction: MirDirection::Up,
         r#type: 0,
     }));
     {
         let mut players = world.players.lock().await;
         if let Some(p) = players.get_mut(&player_id) {
-            p.location = SPAWN;
+            p.location = spawn;
             p.hp = p.max_hp / 2;
             p.mp = p.max_mp;
         }
@@ -913,7 +976,7 @@ pub async fn player_died(world: &World, player_id: u32) {
         .send_to(
             player_id,
             encode_packet(&s::UserLocation {
-                location: SPAWN,
+                location: spawn,
                 direction: MirDirection::Up,
             }),
         )
@@ -1225,15 +1288,57 @@ pub fn direction_offset(dir: MirDirection, steps: i32) -> (i32, i32) {
     }
 }
 
-/// 地图边界校验 + 返回新位置
-pub fn try_move(location: Point, dir: MirDirection, steps: i32) -> Option<Point> {
-    let (dx, dy) = direction_offset(dir, steps);
-    let nx = location.x + dx;
-    let ny = location.y + dy;
-    if nx < 0 || ny < 0 || nx >= MAP_WIDTH || ny >= MAP_HEIGHT {
-        return None;
+/// 地图边界与碰撞校验：返回新位置；若越界或被墙阻挡则 None。
+impl World {
+    pub fn try_move(&self, location: Point, dir: MirDirection, steps: i32) -> Option<Point> {
+        let (dx, dy) = direction_offset(dir, steps);
+        let nx = location.x + dx;
+        let ny = location.y + dy;
+        if !self.map.is_walkable(nx, ny) {
+            return None;
+        }
+        Some(Point::new(nx, ny))
     }
-    Some(Point::new(nx, ny))
+
+    /// 是否可从 from 一步移动到 to（用于怪物追击校验）
+    pub fn walkable_line(&self, from: Point, to: Point) -> bool {
+        let (dx, dy) = (to.x - from.x, to.y - from.y);
+        if dx.abs() > 1 || dy.abs() > 1 {
+            return false;
+        }
+        self.map.is_walkable(to.x, to.y)
+    }
+
+    /// 怪物追击一步：在 8 个邻格中选距离目标最近的可行走格（可绕开简单障碍）。
+    /// 返回 (新位置, 方向)；无可行走邻格则 None。
+    pub fn chase_step(&self, from: Point, to: Point) -> Option<(Point, MirDirection)> {
+        let all = [
+            MirDirection::Up,
+            MirDirection::UpRight,
+            MirDirection::Right,
+            MirDirection::DownRight,
+            MirDirection::Down,
+            MirDirection::DownLeft,
+            MirDirection::Left,
+            MirDirection::UpLeft,
+        ];
+        let (tx, ty) = (to.x, to.y);
+        let mut best: Option<(Point, MirDirection, i32, i32)> = None; // (loc, dir, dist, tiebreak)
+        for dir in all {
+            let Some(cand) = self.try_move(from, dir, 1) else { continue };
+            let d = manhattan(cand, to);
+            // 平局偏好：先朝轴对齐方向走（更接近直线）
+            let on_axis = (cand.x == tx) as i32 + (cand.y == ty) as i32;
+            let better = match best {
+                None => true,
+                Some((_, _, bd, bt)) => d < bd || (d == bd && on_axis > bt),
+            };
+            if better {
+                best = Some((cand, dir, d, on_axis));
+            }
+        }
+        best.map(|(loc, dir, _, _)| (loc, dir))
+    }
 }
 
 #[cfg(test)]
@@ -1263,12 +1368,37 @@ mod tests {
     }
 
     #[test]
-    fn try_move_bounds() {
-        assert_eq!(try_move(Point::new(0, 0), MirDirection::Up, 1), None);
-        assert_eq!(try_move(Point::new(0, 0), MirDirection::Right, 1), Some(Point::new(1, 0)));
+    fn try_move_bounds_and_walls() {
+        let world = World::new(); // 默认空地图 800x800 全通
+        assert_eq!(world.try_move(Point::new(0, 0), MirDirection::Up, 1), None);
+        assert_eq!(world.try_move(Point::new(0, 0), MirDirection::Right, 1), Some(Point::new(1, 0)));
+        // 越界（地图右上角向右）
         assert_eq!(
-            try_move(Point::new(MAP_WIDTH - 1, 0), MirDirection::Right, 1),
+            world.try_move(Point::new(799, 0), MirDirection::Right, 1),
             None
         );
+    }
+
+    #[test]
+    fn try_move_respects_wall() {
+        // 构造 3x3 地图，中心 (1,1) 设为墙
+        let mut b = vec![0u8; 8 + 3 * 3 * 26];
+        b[0] = 1;
+        b[2] = 0x43;
+        b[3] = 0x23;
+        b[4..6].copy_from_slice(&3u16.to_le_bytes());
+        b[6..8].copy_from_slice(&3u16.to_le_bytes());
+        // 中心格子 (1,1) index = 1*3+1 = 4, cell offset = 8 + 4*26
+        let cell = 8 + 4 * 26;
+        let hi = cell + 2;
+        let orig = u32::from_le_bytes([b[hi], b[hi + 1], b[hi + 2], b[hi + 3]]);
+        let v = orig | 0x2000_0000;
+        b[hi..hi + 4].copy_from_slice(&v.to_le_bytes());
+        let m = crate::maps::load_map_bytes(0, &b).unwrap();
+        let world = World::with_map(m);
+        // 从 (1,0) 向下进中心墙 -> 被挡
+        assert_eq!(world.try_move(Point::new(1, 0), MirDirection::Down, 1), None);
+        // 从 (1,0) 向左到 (0,0) 可通行
+        assert_eq!(world.try_move(Point::new(1, 0), MirDirection::Left, 1), Some(Point::new(0, 0)));
     }
 }

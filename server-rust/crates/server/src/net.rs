@@ -18,8 +18,7 @@ use crate::items;
 use crate::web3::Web3Auth;
 use crate::world::{
     drop_ground_item, equipment_slots, gain_gold, npc_shop, persist_player, player_attack,
-    player_magic_attack, pick_up, recompute_stats, remove_gold, try_move, use_consumable, Player,
-    World, MAP_HEIGHT, MAP_WIDTH,
+    player_magic_attack, pick_up, recompute_stats, remove_gold, use_consumable, Player, World,
 };
 
 /// 连接所处的游戏阶段（对应 C# `GameStage`）
@@ -468,8 +467,8 @@ async fn enter_world(
         map_index: 0,
         info: crystal_protocol::types::ClientMapInfo {
             title: "新手村".to_string(),
-            width: MAP_WIDTH,
-            height: MAP_HEIGHT,
+            width: world.map.width as i32,
+            height: world.map.height as i32,
             big_map: 0,
             movements: vec![],
             npcs: vec![],
@@ -482,6 +481,8 @@ async fn enter_world(
     // 职业/等级决定基础属性
     let (base_hp, base_attack) = base_stats(class_from_db(ch.class), level);
     let equipment = db.load_equipment(ch.index)?;
+    // 出生点：吸附到最近可行走格子（地图有障碍，存档位置可能落在墙上）
+    let (sx, sy) = world.nearest_walkable(ch.x, ch.y);
     let mut player = Player {
         object_id,
         account_id: account_id.to_string(),
@@ -489,7 +490,7 @@ async fn enter_world(
         class: class_from_db(ch.class),
         gender: num_gender(ch.gender),
         level,
-        location: Point::new(ch.x, ch.y),
+        location: Point::new(sx, sy),
         direction: MirDirection::from_u8(ch.direction as u8),
         max_hp: base_hp,
         hp: if ch.hp > 0 { ch.hp } else { base_hp },
@@ -583,7 +584,7 @@ async fn move_player(
         return;
     };
 
-    let Some(new_loc) = try_move(player.location, direction, steps) else {
+    let Some(new_loc) = world.try_move(player.location, direction, steps) else {
         return;
     };
 

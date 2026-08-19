@@ -34,9 +34,14 @@ scripts/gen_ids.sh            从 Shared/Enums.cs 重新生成包 ID
 ## 快速开始
 
 ```bash
+# 0. 获取地图数据（真实碰撞网格，来自 Suprcode/Crystal.Database 的 Jev/Maps/*.map）
+#    会自动克隆仓库并复制 0.map 到 server-rust/data/maps/；也可 MAP_SRC=本地仓库路径 复用
+./scripts/get_maps.sh
+
 # 1. 启动 Rust 服务器
 cd server-rust && cargo run -p crystal-server
 # 监听 127.0.0.1:7000，内置测试账号 demo（密码不校验）
+# 启动日志会显示"地图 0 加载成功 ...x... 可通行 ..."，加载真实地图碰撞
 
 # 2. 端到端自测（无需客户端）
 cargo run -p crystal-server --example demo_client
