@@ -478,26 +478,124 @@ async fn respawn_monsters(world: &World) {
     }
 }
 
-/// 怪物 AI：有仇恨且相邻则攻击玩家
+/// 怪物 AI：索敌（感知范围）→ 追击（贪心靠近）→ 相邻攻击；目标消失则放弃仇恨。
+///
+/// - 感知半径 `MONSTER_PERCEPTION`：进入的玩家会被设为仇恨目标（主动索敌）。
+/// - `MONSTER_LEASH`：追击超过此距离则脱战，清空仇恨。
 async fn monster_ai(world: &World) {
+    const PERCEPTION: i32 = 5;
+    const LEASH: i32 = 12;
+
     let mut attacks: Vec<(u32, u32, i32)> = Vec::new();
+    let mut moves: Vec<(u32, Point, MirDirection)> = Vec::new();
     {
-        let mons = world.monsters.lock().await;
+        let mut mons = world.monsters.lock().await;
         let players = world.players.lock().await;
-        for m in mons.values() {
-            if m.dead || m.cooldown > 0 {
+        for m in mons.values_mut() {
+            // 冷却递减（攻击/移动的节奏控制）
+            if m.cooldown > 0 {
+                m.cooldown -= 1;
                 continue;
             }
-            let Some(target_oid) = m.target else { continue };
-            let Some(p) = players.get(&target_oid) else { continue };
-            if manhattan(m.location, p.location) <= 1 {
-                let dmg = (m.attack.max(1) - p.defence / 2).max(1);
-                attacks.push((m.object_id, target_oid, dmg));
+            if m.dead {
+                continue;
+            }
+            // 主动索敌：无目标时，感知范围内的最近玩家成为目标
+            let mut target_oid = m.target;
+            let mut target_loc: Option<Point> = None;
+            if target_oid.is_some() {
+                if let Some(p) = players.get(&target_oid.unwrap()) {
+                    target_loc = Some(p.location);
+                } else {
+                    target_oid = None; // 目标已消失，脱战
+                }
+            }
+            if target_oid.is_none() {
+                let mut nearest: Option<(u32, i32)> = None;
+                for p in players.values() {
+                    let d = manhattan(m.location, p.location);
+                    if d <= PERCEPTION && nearest.map(|(_, nd)| d < nd).unwrap_or(true) {
+                        nearest = Some((p.object_id, d));
+                    }
+                }
+                if let Some((oid, _)) = nearest {
+                    target_oid = Some(oid);
+                }
+            }
+            m.target = target_oid; // 回写仇恨目标（含脱战清空）
+
+            let Some(tid) = target_oid else { continue };
+            let Some(tloc) = target_loc.or_else(|| players.get(&tid).map(|p| p.location)) else {
+                continue;
+            };
+
+            // 超过脱战距离则放弃
+            if manhattan(m.location, tloc) > LEASH {
+                continue;
+            }
+
+            let dist = manhattan(m.location, tloc);
+            if dist <= 1 {
+                // 相邻 -> 攻击
+                let dmg = (m.attack.max(1) - players.get(&tid).map(|p| p.defence / 2).unwrap_or(0))
+                    .max(1);
+                attacks.push((m.object_id, tid, dmg));
+            } else {
+                // 不相邻 -> 朝目标方向贪心走一步
+                let (dx, dy) = chase_step(m.location, tloc);
+                if let Some(new_loc) = try_move(m.location, dir_from_delta(dx, dy), 1) {
+                    moves.push((m.object_id, new_loc, dir_from_delta(dx, dy)));
+                }
             }
         }
     }
+    // 应用移动（更新位置 + 广播）
+    for (mid, new_loc, dir) in moves {
+        {
+            let mut mons = world.monsters.lock().await;
+            if let Some(m) = mons.get_mut(&mid) {
+                m.location = new_loc;
+                m.direction = dir;
+                m.cooldown = 1; // 限制移动频率
+            }
+        }
+        world.broadcast(encode_packet(&s::ObjectWalk {
+            object_id: mid,
+            location: new_loc,
+            direction: dir,
+        }));
+    }
     for (mid, pid, dmg) in attacks {
         monster_hit_player(world, mid, pid, dmg).await;
+    }
+}
+
+/// 计算朝目标走一步的 (dx, dy)，优先沿距离更大的轴逼近。
+fn chase_step(from: Point, to: Point) -> (i32, i32) {
+    let dx = to.x - from.x;
+    let dy = to.y - from.y;
+    let (ax, ay) = (dx.abs(), dy.abs());
+    if ax >= ay && dx != 0 {
+        (dx.signum(), 0)
+    } else if dy != 0 {
+        (0, dy.signum())
+    } else {
+        (dx.signum(), 0)
+    }
+}
+
+/// dx/dy -> MirDirection
+fn dir_from_delta(dx: i32, dy: i32) -> MirDirection {
+    match (dx, dy) {
+        (0, -1) => MirDirection::Up,
+        (1, -1) => MirDirection::UpRight,
+        (1, 0) => MirDirection::Right,
+        (1, 1) => MirDirection::DownRight,
+        (0, 1) => MirDirection::Down,
+        (-1, 1) => MirDirection::DownLeft,
+        (-1, 0) => MirDirection::Left,
+        (-1, -1) => MirDirection::UpLeft,
+        _ => MirDirection::Up,
     }
 }
 
@@ -1136,4 +1234,41 @@ pub fn try_move(location: Point, dir: MirDirection, steps: i32) -> Option<Point>
         return None;
     }
     Some(Point::new(nx, ny))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chase_step_prioritizes_larger_axis() {
+        // 目标在东偏北，东向差距更大 -> 先往东
+        let from = Point::new(0, 0);
+        assert_eq!(chase_step(from, Point::new(5, 2)), (1, 0));
+        // 目标在北偏东，北向差距更大 -> 先往北
+        assert_eq!(chase_step(from, Point::new(2, 5)), (0, 1));
+        // 南北方向
+        assert_eq!(chase_step(from, Point::new(0, 3)), (0, 1));
+        // 东西方向
+        assert_eq!(chase_step(from, Point::new(-3, 0)), (-1, 0));
+    }
+
+    #[test]
+    fn dir_from_delta_cardinals_and_diagonals() {
+        assert_eq!(dir_from_delta(0, -1), MirDirection::Up);
+        assert_eq!(dir_from_delta(1, 0), MirDirection::Right);
+        assert_eq!(dir_from_delta(1, 1), MirDirection::DownRight);
+        assert_eq!(dir_from_delta(-1, -1), MirDirection::UpLeft);
+        assert_eq!(dir_from_delta(0, 0), MirDirection::Up);
+    }
+
+    #[test]
+    fn try_move_bounds() {
+        assert_eq!(try_move(Point::new(0, 0), MirDirection::Up, 1), None);
+        assert_eq!(try_move(Point::new(0, 0), MirDirection::Right, 1), Some(Point::new(1, 0)));
+        assert_eq!(
+            try_move(Point::new(MAP_WIDTH - 1, 0), MirDirection::Right, 1),
+            None
+        );
+    }
 }

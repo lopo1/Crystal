@@ -3,6 +3,9 @@
 //! 用法: 先启动服务器 (`cargo run -p crystal-server`)，再:
 //! `cargo run -p crystal-server --example play_client`
 //!
+//! 注意: 请在**全新数据库**（删除 data/crystal.db）冷启动的服务器上运行，
+//! 以保证世界/角色为初始状态（怪物 AI 会移动/追击，重复运行会因共享世界状态而不稳定）。
+//!
 //! 流程: 连接 → ClientVersion → Login(demo) → StartGame → 朝前方怪物攻击直到击杀
 //! → 魔法攻击(火球术) → 拾取掉落 → 确认获得物品/经验 → 访问 NPC 商人 → 买入金创药
 //! → 使用金创药回血 → 装备木剑 → 丢弃金创药 → 重连验证金币/经验/等级持久化。
@@ -82,6 +85,7 @@ async fn main() -> anyhow::Result<()> {
     send_packet(&mut stream, &c::StartGame { character_index: chars[0].index }).await;
     let mut my_oid = 0u32;
     let mut monster_pos: Option<(i32, i32)> = None;
+    let mut monster_id: Option<u32> = None;
     let mut merchant_id: Option<u32> = None;
     let mut shop_pos: Option<(i32, i32)> = None;
     let mut potion_uid: Option<u64> = None; // 金创药 unique_id
@@ -91,8 +95,9 @@ async fn main() -> anyhow::Result<()> {
         let Some((id, payload)) = recv_timed(&mut buf, &mut stream, 800).await else { break };
         match ServerPacket::decode(id, &payload)? {
             ServerPacket::ObjectMonster(m) if monster_pos.is_none() => {
-                println!("✓ 看到怪物: {} @({},{})", m.name, m.location.x, m.location.y);
+                println!("✓ 看到怪物: {} #{} @({},{})", m.name, m.object_id, m.location.x, m.location.y);
                 monster_pos = Some((m.location.x, m.location.y));
+                monster_id = Some(m.object_id);
             }
             ServerPacket::ObjectPlayer(p) if p.name == "铁匠铺" => {
                 merchant_id = Some(p.object_id);
@@ -150,27 +155,50 @@ async fn main() -> anyhow::Result<()> {
     }
     println!("✓ 到达怪物附近 ({px},{py})");
 
-    // 攻击直到击杀
+    // 攻击直到击杀（怪物会追击/移动，实时跟踪其当前位置；不相邻则先靠近）
     println!("== 攻击怪物直到击杀 ==");
+    let mid = monster_id.expect("未记录怪物 id");
+    let mut mnow: (i32, i32) = (tx, ty);
     let mut gained_xp = false;
     let mut attacks = 0;
     loop {
-        let dir = if px < tx {
+        let dist = (mnow.0 - px).abs() + (mnow.1 - py).abs();
+        let dir = if px < mnow.0 {
             2
-        } else if px > tx {
+        } else if px > mnow.0 {
             6
-        } else if py < ty {
+        } else if py < mnow.1 {
             4
         } else {
             0
         };
-        send_packet(&mut stream, &c::Attack { direction: dir, spell: 0 }).await;
-        attacks += 1;
+        if dist <= 1 {
+            // 相邻：攻击
+            send_packet(&mut stream, &c::Attack { direction: dir, spell: 0 }).await;
+            attacks += 1;
+        } else {
+            // 不相邻：朝怪物走一步
+            send_packet(&mut stream, &c::Walk { direction: MirDirection::from_u8(dir) }).await;
+            match dir {
+                2 => px += 1,
+                6 => px -= 1,
+                4 => py += 1,
+                _ => py -= 1,
+            }
+        }
         let mut killed = false;
         for _ in 0..8 {
             let Some((id, payload)) = recv_timed(&mut buf, &mut stream, 600).await else { break };
             match ServerPacket::decode(id, &payload)? {
                 ServerPacket::GainedGold(_) => println!("✓ 获得金币"),
+                ServerPacket::ObjectWalk(w) if w.object_id == mid => {
+                    // 怪物在追击/移动，更新其位置
+                    let od = (w.location.x - px).abs() + (w.location.y - py).abs();
+                    let nd = dist;
+                    if od < nd {
+                        mnow = (w.location.x, w.location.y);
+                    }
+                }
                 ServerPacket::ObjectDied(_) => {
                     println!("✓ 怪物死亡!");
                     killed = true;
@@ -183,7 +211,7 @@ async fn main() -> anyhow::Result<()> {
                 _ => {}
             }
         }
-        if killed || attacks > 40 {
+        if killed || attacks > 60 {
             break;
         }
     }
