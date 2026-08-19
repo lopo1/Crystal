@@ -40,13 +40,21 @@ async fn main() -> anyhow::Result<()> {
     let map_dir = std::env::var("CRYSTAL_MAPS").unwrap_or_else(|_| "data/maps".to_string());
 
     let db = Database::open(&db_path)?;
+    let map_dir_p = |n: &str| std::path::Path::new(&map_dir).join(format!("{n}.map"));
     // 加载默认地图（0 = 新手村；缺图时退回程序化空地图以便无头运行）
-    let map = maps::load_map_file(0, std::path::Path::new(&map_dir).join("0.map"))
-        .unwrap_or_else(|e| {
-            tracing::warn!("未加载到 0.map（{e}），使用默认空地图");
-            world::default_map()
-        });
+    let map = maps::load_map_file(0, map_dir_p("0")).unwrap_or_else(|e| {
+        tracing::warn!("未加载到 0.map（{e}），使用默认空地图");
+        world::default_map()
+    });
     let world = Arc::new(World::with_map(map));
+    // 注册更多真实地图（供 /map 传送）；缺失则跳过
+    for idx in ["0100", "0101"] {
+        let mi = u32::from_str_radix(idx, 10).unwrap();
+        match maps::load_map_file(mi, map_dir_p(idx)) {
+            Ok(m) => world.register_map(m),
+            Err(e) => tracing::warn!("注册地图 {idx}({mi}) 失败: {e}"),
+        }
+    }
     let web3_auth = Arc::new(Web3Auth::new());
 
     // 启动世界 tick（怪物刷新 + AI + 玩家回复 + 周期性存档）

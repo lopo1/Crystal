@@ -51,6 +51,8 @@ pub struct Player {
     pub hp_changed: bool,
     /// 已穿戴装备：EquipmentSlot -> UserItem（用于生成 UserSlotsRefresh）
     pub equipment: std::collections::BTreeMap<i32, UserItem>,
+    /// 当前所在地图编号（默认 0）
+    pub map_index: u32,
 }
 
 /// 地面掉落物
@@ -110,8 +112,10 @@ pub struct World {
     broadcast_tx: broadcast::Sender<Vec<u8>>,
     next_object_id: Arc<std::sync::atomic::AtomicU32>,
     next_item_unique: Arc<std::sync::atomic::AtomicU64>,
-    /// 当前地图（含碰撞网格）
+    /// 当前地图（含碰撞网格，默认主地图 0）
     pub map: Arc<crate::maps::GameMap>,
+    /// 地图注册表：map_index -> GameMap（支持多地图传送）
+    pub maps: Arc<std::sync::RwLock<std::collections::HashMap<u32, Arc<crate::maps::GameMap>>>>,
 }
 
 /// 无真实地图时的程序化空地图（保持原有 800x800 全通行为，供无头/缺图运行）
@@ -141,6 +145,8 @@ impl World {
 
     pub fn with_map(map: crate::maps::GameMap) -> Self {
         let (broadcast_tx, _) = broadcast::channel(512);
+        let mut maps = std::collections::HashMap::new();
+        maps.insert(map.index, Arc::new(map.clone()));
         World {
             players: Arc::new(Mutex::new(HashMap::new())),
             monsters: Arc::new(Mutex::new(HashMap::new())),
@@ -150,7 +156,23 @@ impl World {
             next_object_id: Arc::new(std::sync::atomic::AtomicU32::new(1)),
             next_item_unique: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             map: Arc::new(map),
+            maps: Arc::new(std::sync::RwLock::new(maps)),
         }
+    }
+
+    /// 注册一张地图到注册表（多地图支持）
+    pub fn register_map(&self, map: crate::maps::GameMap) {
+        self.maps.write().unwrap().insert(map.index, Arc::new(map));
+    }
+
+    /// 取指定地图句柄；不存在回退主地图 map
+    pub fn get_map(&self, map_index: u32) -> Arc<crate::maps::GameMap> {
+        self.maps
+            .read()
+            .unwrap()
+            .get(&map_index)
+            .cloned()
+            .unwrap_or_else(|| self.map.clone())
     }
 
     /// 该坐标是否可通行（地图内且非墙）
@@ -160,20 +182,87 @@ impl World {
 
     /// 找一个可通行的坐标（供出生/刷新用；从给定点向外搜索）
     pub fn nearest_walkable(&self, x: i32, y: i32) -> (i32, i32) {
+        self.nearest_walkable_on(self.map.index, x, y)
+    }
+
+    /// 在指定地图上查找可通行坐标
+    pub fn nearest_walkable_on(&self, map_index: u32, x: i32, y: i32) -> (i32, i32) {
+        let map = self.get_map(map_index);
         for r in 0i32..40 {
             for dy in -r..=r {
                 for dx in -r..=r {
                     if dx.abs().max(dy.abs()) != r {
                         continue;
                     }
-                    if self.map.is_walkable(x + dx, y + dy) {
+                    if map.is_walkable(x + dx, y + dy) {
                         return (x + dx, y + dy);
                     }
                 }
             }
         }
         // 兜底：地图中心
-        (self.map.width as i32 / 2, self.map.height as i32 / 2)
+        (map.width as i32 / 2, map.height as i32 / 2)
+    }
+
+    /// 在指定地图上判断某个坐标是否可通行
+    pub fn is_walkable_on(&self, map_index: u32, x: i32, y: i32) -> bool {
+        self.get_map(map_index).is_walkable(x, y)
+    }
+
+    /// 在指定地图作一步移动（碰撞校验）
+    pub fn try_move_on(&self, map_index: u32, location: Point, dir: MirDirection, steps: i32) -> Option<Point> {
+        let map = self.get_map(map_index);
+        let (dx, dy) = direction_offset(dir, steps);
+        let nx = location.x + dx;
+        let ny = location.y + dy;
+        if !map.is_walkable(nx, ny) {
+            return None;
+        }
+        Some(Point::new(nx, ny))
+    }
+
+    /// 传送玩家到指定地图的 (x,y)（自动吸附可行走格），并下发地图信息给客户端。
+    pub async fn teleport_player(&self, player_id: u32, map_index: u32, x: i32, y: i32) -> bool {
+        let (wx, wy) = self.nearest_walkable_on(map_index, x, y);
+        {
+            let mut players = self.players.lock().await;
+            if let Some(p) = players.get_mut(&player_id) {
+                p.map_index = map_index;
+                p.location = Point::new(wx, wy);
+            } else {
+                return false;
+            }
+        }
+        let map = self.get_map(map_index);
+        self.send_to(player_id, encode_packet(&s::MapInformation {
+            map_index: map_index as i32,
+            file_name: map_index.to_string(),
+            title: format!("地图 {map_index}"),
+            mini_map: 0,
+            big_map: 0,
+            lights: 0,
+            lightning: false,
+            fire: false,
+            map_dark_light: 0,
+            music: 0,
+            weather_particles: 0,
+        })).await;
+        self.send_to(player_id, encode_packet(&s::NewMapInfo {
+            map_index: map_index as i32,
+            info: crystal_protocol::types::ClientMapInfo {
+                title: format!("地图 {map_index}"),
+                width: map.width as i32,
+                height: map.height as i32,
+                big_map: 0,
+                movements: vec![],
+                npcs: vec![],
+            },
+        })).await;
+        self.send_to(player_id, encode_packet(&s::UserLocation {
+            location: Point::new(wx, wy),
+            direction: MirDirection::Up,
+        })).await;
+        true
     }
 
     pub fn next_object_id(&self) -> u32 {
@@ -705,11 +794,23 @@ pub async fn player_attack(world: &World, player_id: u32, direction: MirDirectio
     let (dx, dy) = direction_offset(direction, 1);
     let target_pos = Point::new(player.location.x + dx, player.location.y + dy);
 
+    // 首选正前方邻格；若怪物贴侧/斜角，则回退到任意相邻死亡与否的怪物
     let target_monster = {
         let mons = world.monsters.lock().await;
-        mons.values()
+        let front = mons
+            .values()
             .find(|m| !m.dead && m.location == target_pos)
-            .map(|m| m.object_id)
+            .map(|m| m.object_id);
+        front.or_else(|| {
+            [
+                (-1, -1), (0, -1), (1, -1),
+                (-1, 0), (1, 0),
+                (-1, 1), (0, 1), (1, 1),
+            ]
+            .iter()
+            .map(|(ox, oy)| Point::new(player.location.x + ox, player.location.y + oy))
+            .find_map(|cand| mons.values().find(|m| !m.dead && m.location == cand).map(|m| m.object_id))
+        })
     };
     let Some(monster_id) = target_monster else { return false };
 

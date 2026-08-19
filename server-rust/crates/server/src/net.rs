@@ -346,13 +346,20 @@ async fn handle_client_packet(
         }
         ClientPacket::Chat(chat) => {
             if let Some(oid) = *object_id {
-                let frame = encode_packet(&s::ObjectChat {
-                    object_id: oid,
-                    text: chat.message.clone(),
-                    r#type: 0,
-                });
-                world.broadcast_except(frame.clone(), oid).await;
-                let _ = tx.send(frame).await; // 自己也收到
+                // 调试/演示命令：/map <index> 传送，/spawn 回新手村
+                let msg = chat.message.trim();
+                let cmd: Vec<&str> = msg.split_whitespace().collect();
+                if !cmd.is_empty() && cmd[0].starts_with('/') {
+                    handle_chat_command(world, tx, oid, &msg, cmd).await;
+                } else {
+                    let frame = encode_packet(&s::ObjectChat {
+                        object_id: oid,
+                        text: chat.message.clone(),
+                        r#type: 0,
+                    });
+                    world.broadcast_except(frame.clone(), oid).await;
+                    let _ = tx.send(frame).await; // 自己也收到
+                }
             }
         }
         ClientPacket::Attack(atk) => {
@@ -506,6 +513,7 @@ async fn enter_world(
         sender: tx.clone(),
         hp_changed: false,
         equipment: equipment.clone(),
+        map_index: 0,
     };
     // 穿戴装备后重算攻击/防御
     recompute_stats(&mut player);
@@ -584,7 +592,7 @@ async fn move_player(
         return;
     };
 
-    let Some(new_loc) = world.try_move(player.location, direction, steps) else {
+    let Some(new_loc) = world.try_move_on(player.map_index, player.location, direction, steps) else {
         return;
     };
 
@@ -640,6 +648,48 @@ const GRID_INVENTORY: u8 = 1;
 const GRID_EQUIPMENT: u8 = 2;
 
 /// 使用物品（金创药等消耗品）：回复 HP 并消耗一格。
+/// 聊天命令处理（调试/演示）：/map <index> 传送到指定地图，/spawn 回新手村。
+async fn handle_chat_command(
+    world: &World,
+    tx: &mpsc::Sender<Vec<u8>>,
+    oid: u32,
+    full: &str,
+    cmd: Vec<&str>,
+) {
+    let sys = |text: &str| {
+        encode_packet(&s::ObjectChat {
+            object_id: oid,
+            text: text.to_string(),
+            r#type: 1, // 系统提示
+        })
+    };
+    match cmd[0] {
+        "/map" => {
+            if let Some(idx) = cmd.get(1).and_then(|s| s.parse::<u32>().ok()) {
+                // 目标地图中心作为目的地
+                let map = world.get_map(idx);
+                let (cx, cy) = (map.width as i32 / 2, map.height as i32 / 2);
+                let ok = world.teleport_player(oid, idx, cx, cy).await;
+                let _ = tx
+                    .send(sys(&format!("{}= 传送到地图 {idx}", if ok { "✓" } else { "✗" })))
+                    .await;
+            } else {
+                let _ = tx.send(sys("用法: /map <index>  (0/0100/0101...)")).await;
+            }
+        }
+        "/spawn" => {
+            let ok = world.teleport_player(oid, 0, 400, 400).await;
+            let _ = tx.send(sys(&format!("{}回新手村", if ok { "✓" } else { "✗" }))).await;
+        }
+        "/help" | "/?" => {
+            let _ = tx.send(sys("命令: /map <index> /spawn")).await;
+        }
+        _ => {
+            let _ = tx.send(sys(&format!("未知命令 {full}"))).await;
+        }
+    }
+}
+
 async fn handle_use_item(
     world: &World,
     db: &Database,

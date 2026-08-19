@@ -67,6 +67,17 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
+    // 走一步并返回服务器确认后的位置（被墙阻挡则位置不变）
+    async fn confirmed_walk(p: &mut (i32, i32), buf: &mut Vec<u8>, stream: &mut TcpStream, dir: u8) {
+        send_packet(stream, &c::Walk { direction: MirDirection::from_u8(dir) }).await;
+        for _ in 0..6 {
+            let Some((id, payload)) = recv_timed(buf, stream, 400).await else { break };
+            if let ServerPacket::UserLocation(u) = ServerPacket::decode(id, &payload).unwrap() {
+                *p = (u.location.x, u.location.y);
+                break;
+            }
+        }
+    }
 
     // 连接 + 版本
     let (id, payload) = recv(&mut buf, &mut stream).await;
@@ -134,48 +145,39 @@ async fn main() -> anyhow::Result<()> {
     let _ = my_oid;
     let (tx, ty) = monster_pos.expect("未在场上看到怪物");
 
-    // 从出生点朝怪物方向一步步走过去（直到相邻）
+    // 从出生点朝怪物方向一步步走过去（直到确认相邻；用服务器确认位置）
     println!("== 走向怪物 ({tx},{ty}) ==");
-    let mut px = 400;
-    let mut py = 400;
-    for _ in 0..200 {
-        if manhattan(px, py, tx, ty) <= 1 {
+    let mut p = (400i32, 400i32);
+    for _ in 0..300 {
+        if manhattan(p.0, p.1, tx, ty) <= 1 {
             break;
         }
-        let dir = if px < tx {
-            2 // Right
-        } else if px > tx {
-            6 // Left
-        } else if py < ty {
-            4 // Down
+        let dir = if p.0 < tx {
+            2
+        } else if p.0 > tx {
+            6
+        } else if p.1 < ty {
+            4
         } else {
-            0 // Up
+            0
         };
-        send_packet(&mut stream, &c::Walk { direction: MirDirection::from_u8(dir) }).await;
-        match dir {
-            2 => px += 1,
-            6 => px -= 1,
-            4 => py += 1,
-            _ => py -= 1,
-        }
-        // 读移动确认
-        let _ = recv_timed(&mut buf, &mut stream, 500).await;
+        confirmed_walk(&mut p, &mut buf, &mut stream, dir).await;
     }
-    println!("✓ 到达怪物附近 ({px},{py})");
+    println!("✓ 到达怪物附近 ({},{})", p.0, p.1);
 
-    // 攻击直到击杀（怪物会追击/移动，实时跟踪其当前位置；不相邻则先靠近）
+    // 攻击直到击杀（怪物会追击/移动，实时跟踪其位置；用确认位置，相邻才攻击）
     println!("== 攻击怪物直到击杀 ==");
     let mid = monster_id.expect("未记录怪物 id");
     let mut mnow: (i32, i32) = (tx, ty);
     let mut gained_xp = false;
     let mut attacks = 0;
     loop {
-        let dist = (mnow.0 - px).abs() + (mnow.1 - py).abs();
-        let dir = if px < mnow.0 {
+        let dist = (mnow.0 - p.0).abs() + (mnow.1 - p.1).abs();
+        let dir = if p.0 < mnow.0 {
             2
-        } else if px > mnow.0 {
+        } else if p.0 > mnow.0 {
             6
-        } else if py < mnow.1 {
+        } else if p.1 < mnow.1 {
             4
         } else {
             0
@@ -185,25 +187,18 @@ async fn main() -> anyhow::Result<()> {
             send_packet(&mut stream, &c::Attack { direction: dir, spell: 0 }).await;
             attacks += 1;
         } else {
-            // 不相邻：朝怪物走一步
-            send_packet(&mut stream, &c::Walk { direction: MirDirection::from_u8(dir) }).await;
-            match dir {
-                2 => px += 1,
-                6 => px -= 1,
-                4 => py += 1,
-                _ => py -= 1,
-            }
+            // 不相邻：朝怪物走一步（确认位置）
+            confirmed_walk(&mut p, &mut buf, &mut stream, dir).await;
         }
         let mut killed = false;
         for _ in 0..8 {
-            let Some((id, payload)) = recv_timed(&mut buf, &mut stream, 600).await else { break };
+            let Some((id, payload)) = recv_timed(&mut buf, &mut stream, 500).await else { break };
             match ServerPacket::decode(id, &payload)? {
                 ServerPacket::GainedGold(_) => println!("✓ 获得金币"),
                 ServerPacket::ObjectWalk(w) if w.object_id == mid => {
-                    // 怪物在追击/移动，更新其位置
-                    let od = (w.location.x - px).abs() + (w.location.y - py).abs();
-                    let nd = dist;
-                    if od < nd {
+                    // 怪物在移动，更新其位置
+                    let od = (w.location.x - p.0).abs() + (w.location.y - p.1).abs();
+                    if od < dist {
                         mnow = (w.location.x, w.location.y);
                     }
                 }
@@ -225,6 +220,20 @@ async fn main() -> anyhow::Result<()> {
     }
     assert!(gained_xp, "未获得经验");
     println!("✓ 击杀耗时 {attacks} 次攻击，经验已获得");
+
+    // 拾取（掉落物就在怪物死亡位置旁，紧接击杀后玩家贴合）
+    println!("== 拾取 ==");
+    drain(&mut buf, &mut stream, 40).await; // 排空旧帧
+    send_packet(&mut stream, &c::PickUp).await;
+    let mut picked = false;
+    for _ in 0..40 {
+        let Some((id, payload)) = recv_timed(&mut buf, &mut stream, 400).await else { break };
+        if let ServerPacket::GainedItem(_) = ServerPacket::decode(id, &payload)? {
+            picked = true;
+        }
+    }
+    assert!(picked, "未拾取到掉落物");
+    println!("✓ 拾取成功");
 
     // 魔法攻击（火球术 spell=1）：朝 8 个方向试着施放，直到命中射程内的怪物
     println!("== 魔法攻击（火球术） ==");
@@ -270,46 +279,26 @@ async fn main() -> anyhow::Result<()> {
     }
     println!("✓ 火球术施放成功，消耗 MP 且造成伤害");
 
-    // 拾取（掉落物就在怪物死亡位置旁）
-    println!("== 拾取 ==");
-    send_packet(&mut stream, &c::PickUp).await;
-    let mut picked = false;
-    for _ in 0..8 {
-        let Some((id, payload)) = recv_timed(&mut buf, &mut stream, 600).await else { break };
-        if let ServerPacket::GainedItem(_) = ServerPacket::decode(id, &payload)? {
-            picked = true;
-        }
-    }
-    assert!(picked, "未拾取到掉落物");
-    println!("✓ 拾取成功");
-
     // 走向 NPC 商人买药
     println!("== NPC 商人 ==");
     let merchant_id = merchant_id.expect("未找到商人");
     let (sx, sy) = shop_pos.expect("商人位置缺失");
-    for _ in 0..200 {
-        if manhattan(px, py, sx, sy) <= 2 {
+    for _ in 0..300 {
+        if manhattan(p.0, p.1, sx, sy) <= 2 {
             break;
         }
-        let dir = if px < sx {
+        let dir = if p.0 < sx {
             2
-        } else if px > sx {
+        } else if p.0 > sx {
             6
-        } else if py < sy {
+        } else if p.1 < sy {
             4
         } else {
             0
         };
-        send_packet(&mut stream, &c::Walk { direction: MirDirection::from_u8(dir) }).await;
-        match dir {
-            2 => px += 1,
-            6 => px -= 1,
-            4 => py += 1,
-            _ => py -= 1,
-        }
-        let _ = recv_timed(&mut buf, &mut stream, 300).await;
+        confirmed_walk(&mut p, &mut buf, &mut stream, dir).await;
     }
-    println!("✓ 到达商人 ({px},{py})");
+    println!("✓ 到达商人 ({},{})", p.0, p.1);
     drain(&mut buf, &mut stream, 40).await; // 排空旧帧
     send_packet(
         &mut stream,
