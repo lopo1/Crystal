@@ -78,6 +78,13 @@ impl Database {
                 count           INTEGER NOT NULL DEFAULT 1,
                 PRIMARY KEY (character_index, slot)
             );
+            CREATE TABLE IF NOT EXISTS equipment (
+                character_index INTEGER NOT NULL,
+                slot            INTEGER NOT NULL,
+                unique_id       INTEGER NOT NULL,
+                item_index      INTEGER NOT NULL,
+                PRIMARY KEY (character_index, slot)
+            );
             "#,
         )?;
         drop(conn);
@@ -383,6 +390,215 @@ impl Database {
         Ok(idx)
     }
 
+    /// 加载背包为固定 `INVENTORY_SIZE` 槽位向量（槽位索引即下标，空槽为 None），
+    /// 与 C# `UserInformation.Inventory` / `UserSlotsRefresh` 的槽位语义一致。
+    pub fn inventory_slots(&self, character_index: i32) -> anyhow::Result<Vec<Option<UserItem>>> {
+        let rows = self.load_inventory(character_index)?;
+        let mut slots: Vec<Option<UserItem>> =
+            (0..INVENTORY_SIZE).map(|_| None).collect();
+        for (slot, item) in rows {
+            if let Some(slot) = usize::try_from(slot).ok() {
+                if let Some(s) = slots.get_mut(slot) {
+                    *s = Some(item);
+                }
+            }
+        }
+        Ok(slots)
+    }
+
+    /// 按 unique_id 查找背包物品，返回 (槽位, UserItem)。
+    pub fn find_inventory_item(
+        &self,
+        character_index: i32,
+        unique_id: u64,
+    ) -> anyhow::Result<Option<(i32, UserItem)>> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT slot,item_index,count FROM inventory
+                 WHERE character_index=?1 AND unique_id=?2",
+                params![character_index, unique_id as i64],
+                |r| {
+                    Ok((
+                        r.get::<_, i32>(0)?,
+                        r.get::<_, i32>(1)?,
+                        r.get::<_, u16>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(row.map(|(slot, item_index, count)| {
+            (
+                slot,
+                UserItem {
+                    unique_id,
+                    item_index,
+                    count,
+                    ..Default::default()
+                },
+            )
+        }))
+    }
+
+    /// 消耗背包一个物品（数量>1 减 1，否则删除整格），返回被消耗物品的 (槽位, UserItem)。
+    pub fn consume_inventory_item(
+        &self,
+        character_index: i32,
+        unique_id: u64,
+    ) -> anyhow::Result<Option<(i32, UserItem)>> {
+        let Some((slot, item)) = self.find_inventory_item(character_index, unique_id)? else {
+            return Ok(None);
+        };
+        let conn = self.conn.lock().unwrap();
+        if item.count > 1 {
+            conn.execute(
+                "UPDATE inventory SET count=count-1
+                 WHERE character_index=?1 AND unique_id=?2",
+                params![character_index, unique_id as i64],
+            )?;
+        } else {
+            conn.execute(
+                "DELETE FROM inventory WHERE character_index=?1 AND unique_id=?2",
+                params![character_index, unique_id as i64],
+            )?;
+        }
+        Ok(Some((slot, item)))
+    }
+
+    /// 加载装备：BTreeMap<slot, UserItem>（slot 见 `EquipmentSlot`）。
+    pub fn load_equipment(
+        &self,
+        character_index: i32,
+    ) -> anyhow::Result<std::collections::BTreeMap<i32, UserItem>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT slot,unique_id,item_index FROM equipment WHERE character_index=?1 ORDER BY slot",
+        )?;
+        let rows = stmt.query_map([character_index], |r| {
+            Ok((r.get::<_, i32>(0)?, r.get::<_, i64>(1)?, r.get::<_, i32>(2)?))
+        })?;
+        let mut out = std::collections::BTreeMap::new();
+        for row in rows {
+            let (slot, uid, item_index) = row?;
+            out.insert(
+                slot,
+                UserItem {
+                    unique_id: uid as u64,
+                    item_index,
+                    count: 1,
+                    ..Default::default()
+                },
+            );
+        }
+        Ok(out)
+    }
+
+    /// 把背包中的物品穿戴到装备槽 `equip_slot`。
+    /// 若目标槽已有装备，先将其放回背包首空槽。
+    pub fn equip_item(
+        &self,
+        character_index: i32,
+        unique_id: u64,
+        item_index: i32,
+        equip_slot: i32,
+    ) -> anyhow::Result<EquipOutcome> {
+        let conn = self.conn.lock().unwrap();
+
+        // 背包首空槽
+        let occupied: Vec<i32> = {
+            let mut stmt = conn.prepare(
+                "SELECT slot FROM inventory WHERE character_index=?1 ORDER BY slot",
+            )?;
+            let rows = stmt.query_map([character_index], |r| r.get(0))?;
+            rows.collect::<Result<Vec<i32>, _>>()?
+        };
+        let free = (0..INVENTORY_SIZE as i32).find(|s| !occupied.contains(s));
+
+        // 若目标装备槽已占用，先把它放回背包首空槽
+        let existing: Option<(i64, i32)> = conn
+            .query_row(
+                "SELECT unique_id,item_index FROM equipment
+                 WHERE character_index=?1 AND slot=?2",
+                params![character_index, equip_slot],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if let Some((euid, eidx)) = existing {
+            let Some(free) = free else {
+                // 背包满，无法换下旧装备
+                return Ok(EquipOutcome {
+                    returned_to_inventory: false,
+                });
+            };
+            conn.execute(
+                "INSERT INTO inventory (character_index,slot,unique_id,item_index,count)
+                 VALUES (?1,?2,?3,?4,1)",
+                params![character_index, free, euid, eidx],
+            )?;
+            conn.execute(
+                "DELETE FROM equipment WHERE character_index=?1 AND slot=?2",
+                params![character_index, equip_slot],
+            )?;
+        }
+
+        // 删除原背包格（正在穿戴的物品）
+        conn.execute(
+            "DELETE FROM inventory WHERE character_index=?1 AND unique_id=?2",
+            params![character_index, unique_id as i64],
+        )?;
+
+        // 写入装备槽
+        conn.execute(
+            "INSERT INTO equipment (character_index,slot,unique_id,item_index)
+             VALUES (?1,?2,?3,?4)",
+            params![character_index, equip_slot, unique_id as i64, item_index],
+        )?;
+        Ok(EquipOutcome {
+            returned_to_inventory: true,
+        })
+    }
+
+    /// 卸下装备到背包首空槽；背包满则返回 false。
+    pub fn unequip_item(
+        &self,
+        character_index: i32,
+        equip_slot: i32,
+    ) -> anyhow::Result<Option<(u64, i32)>> {
+        let conn = self.conn.lock().unwrap();
+        let existing: Option<(i64, i32)> = conn
+            .query_row(
+                "SELECT unique_id,item_index FROM equipment
+                 WHERE character_index=?1 AND slot=?2",
+                params![character_index, equip_slot],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((euid, eidx)) = existing else {
+            return Ok(None);
+        };
+        let occupied: Vec<i32> = {
+            let mut stmt = conn.prepare(
+                "SELECT slot FROM inventory WHERE character_index=?1 ORDER BY slot",
+            )?;
+            let rows = stmt.query_map([character_index], |r| r.get(0))?;
+            rows.collect::<Result<Vec<i32>, _>>()?
+        };
+        let free = (0..INVENTORY_SIZE as i32).find(|s| !occupied.contains(s));
+        let Some(free) = free else {
+            return Ok(None); // 背包满
+        };
+        conn.execute(
+            "INSERT INTO inventory (character_index,slot,unique_id,item_index,count)
+             VALUES (?1,?2,?3,?4,1)",
+            params![character_index, free, euid, eidx],
+        )?;
+        conn.execute(
+            "DELETE FROM equipment WHERE character_index=?1 AND slot=?2",
+            params![character_index, equip_slot],
+        )?;
+        Ok(Some((euid as u64, eidx)))
+    }
+
     pub fn item_name(&self, item_index: i32) -> anyhow::Result<Option<String>> {
         let conn = self.conn.lock().unwrap();
         match conn.query_row("SELECT name FROM items WHERE item_index=?1", [item_index], |r| r.get(0)) {
@@ -391,6 +607,12 @@ impl Database {
             Err(e) => Err(e.into()),
         }
     }
+}
+
+/// 装备操作结果：`returned_to_inventory` 表示旧装备是否成功放回背包（false=背包满，操作失败）。
+#[derive(Debug, Clone, Copy)]
+pub struct EquipOutcome {
+    pub returned_to_inventory: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -440,4 +662,89 @@ fn make_unique(char_index: i32, slot: i32) -> i64 {
 /// 供 main 使用（路径默认 data/crystal.db）
 pub fn default_db_path() -> PathBuf {
     Path::new("data").join("crystal.db")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_CTR: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_db() -> (Arc<Database>, PathBuf) {
+        let mut p = std::env::temp_dir();
+        let n = TEST_CTR.fetch_add(1, Ordering::SeqCst);
+        p.push(format!("crystal_db_test_{}_{}.db", std::process::id(), n));
+        let _ = std::fs::remove_file(&p);
+        (Database::open(&p).unwrap(), p)
+    }
+
+    #[test]
+    fn starter_inventory_and_slots() {
+        let (db, _p) = temp_db();
+        db.register("tester").unwrap();
+        let info = db
+            .add_character("tester", "测试", crystal_protocol::types::MirClass::Warrior, crystal_protocol::types::MirGender::Male)
+            .unwrap()
+            .unwrap();
+        // 初始背包：木剑(槽0) + 金创药x5(槽1)
+        let slots = db.inventory_slots(info.index).unwrap();
+        assert_eq!(slots.len(), INVENTORY_SIZE);
+        assert_eq!(slots[0].as_ref().map(|i| i.item_index), Some(1));
+        assert_eq!(slots[1].as_ref().map(|i| i.item_index), Some(3));
+        assert_eq!(slots[1].as_ref().map(|i| i.count), Some(5));
+        assert!(slots[2].is_none());
+    }
+
+    #[test]
+    fn consume_item_decrements_and_removes() {
+        let (db, _p) = temp_db();
+        db.register("tester").unwrap();
+        let info = db
+            .add_character("tester", "测试", crystal_protocol::types::MirClass::Warrior, crystal_protocol::types::MirGender::Male)
+            .unwrap()
+            .unwrap();
+        // 金创药 uid = char*1000+1
+        let uid = (info.index as u64) * 1000 + 1;
+        let (slot, item) = db.find_inventory_item(info.index, uid).unwrap().unwrap();
+        assert_eq!(slot, 1);
+        assert_eq!(item.count, 5);
+        // 消耗一次 -> 剩 4
+        let (_s, consumed) = db.consume_inventory_item(info.index, uid).unwrap().unwrap();
+        assert_eq!(consumed.count, 5);
+        assert_eq!(db.inventory_slots(info.index).unwrap()[1].as_ref().map(|i| i.count), Some(4));
+        // 消耗其余 4 次 -> 整格被删
+        for _ in 0..4 {
+            db.consume_inventory_item(info.index, uid).unwrap();
+        }
+        assert!(db.inventory_slots(info.index).unwrap()[1].is_none());
+    }
+
+    #[test]
+    fn equip_moves_item_and_returns_old() {
+        let (db, _p) = temp_db();
+        db.register("tester").unwrap();
+        let info = db
+            .add_character("tester", "测试", crystal_protocol::types::MirClass::Warrior, crystal_protocol::types::MirGender::Male)
+            .unwrap()
+            .unwrap();
+        let weapon_uid = (info.index as u64) * 1000 + 0;
+        // 穿戴木剑到武器槽(0)
+        let outcome = db.equip_item(info.index, weapon_uid, 1, 0).unwrap();
+        assert!(outcome.returned_to_inventory);
+        // 背包不再有木剑，装备槽 0 有木剑
+        assert!(db.find_inventory_item(info.index, weapon_uid).unwrap().is_none());
+        let equip = db.load_equipment(info.index).unwrap();
+        assert_eq!(equip.get(&0).map(|i| i.item_index), Some(1));
+        // 卸下装备 -> 回背包首空槽
+        let unequipped = db.unequip_item(info.index, 0).unwrap();
+        assert_eq!(unequipped.map(|(_, idx)| idx), Some(1));
+        assert_eq!(db.load_equipment(info.index).unwrap().get(&0).map(|i| i.item_index), None);
+        let weapon_back = db
+            .inventory_slots(info.index)
+            .unwrap()
+            .iter()
+            .any(|s| s.as_ref().map(|i| i.item_index) == Some(1));
+        assert!(weapon_back);
+    }
 }

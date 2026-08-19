@@ -17,8 +17,8 @@ use crate::db::Database;
 use crate::items;
 use crate::web3::Web3Auth;
 use crate::world::{
-    gain_gold, npc_shop, player_attack, pick_up, remove_gold, try_move, Player, World, MAP_HEIGHT,
-    MAP_WIDTH,
+    equipment_slots, gain_gold, npc_shop, player_attack, pick_up, recompute_stats, remove_gold,
+    try_move, use_consumable, Player, World, MAP_HEIGHT, MAP_WIDTH,
 };
 
 /// 连接所处的游戏阶段（对应 C# `GameStage`）
@@ -410,6 +410,12 @@ async fn handle_client_packet(
                 }
             }
         }
+        ClientPacket::UseItem(u) => {
+            handle_use_item(world, db, object_id, u, tx).await?;
+        }
+        ClientPacket::EquipItem(e) => {
+            handle_equip_item(world, db, object_id, e, tx).await?;
+        }
         ClientPacket::Disconnect(_) => {}
         _ => {
             tracing::warn!("未处理的客户端包: {:?}", std::mem::discriminant(packet));
@@ -461,7 +467,8 @@ async fn enter_world(
     let object_id = world.next_object_id();
     // 职业/等级决定基础属性
     let (base_hp, base_attack) = base_stats(class_from_db(ch.class), level);
-    let player = Player {
+    let equipment = db.load_equipment(ch.index)?;
+    let mut player = Player {
         object_id,
         account_id: account_id.to_string(),
         name: ch.name.clone(),
@@ -483,14 +490,14 @@ async fn enter_world(
         character_index: ch.index,
         sender: tx.clone(),
         hp_changed: false,
+        equipment: equipment.clone(),
     };
+    // 穿戴装备后重算攻击/防御
+    recompute_stats(&mut player);
 
-    // 加载背包
-    let inventory = db
-        .load_inventory(ch.index)?
-        .into_iter()
-        .map(|(_, item)| Some(item))
-        .collect::<Vec<_>>();
+    // 加载背包（固定 40 槽）+ 装备（固定 14 槽）
+    let inventory = db.inventory_slots(ch.index)?;
+    let equipment_slots = equipment_slots(&player);
 
     tx.send(encode_packet(&s::UserInformation {
         object_id,
@@ -513,7 +520,7 @@ async fn enter_world(
         has_hero: false,
         hero_behaviour: 0,
         inventory: Some(inventory),
-        equipment: None,
+        equipment: Some(equipment_slots),
         quest_inventory: None,
         gold: ch.gold as u32,
         credit: 0,
@@ -609,6 +616,219 @@ fn valid_account_id(id: &str) -> bool {
 
 fn char_name_valid(name: &str) -> bool {
     !name.is_empty() && name.len() <= 16
+}
+
+// MirGridType（见 Shared/Enums.cs）
+const GRID_INVENTORY: u8 = 1;
+const GRID_EQUIPMENT: u8 = 2;
+
+/// 使用物品（金创药等消耗品）：回复 HP 并消耗一格。
+async fn handle_use_item(
+    world: &World,
+    db: &Database,
+    object_id: &mut Option<u32>,
+    u: &c::UseItem,
+    tx: &mpsc::Sender<Vec<u8>>,
+) -> anyhow::Result<()> {
+    let Some(oid) = *object_id else { return Ok(()) };
+    let Some(player) = world.get_player(oid).await else {
+        return Ok(());
+    };
+
+    let Some((_slot, item)) = db.find_inventory_item(player.character_index, u.unique_id)? else {
+        // 找不到该物品
+        tx.send(encode_packet(&s::UseItem {
+            unique_id: u.unique_id,
+            success: false,
+            grid: u.grid,
+        }))
+        .await
+        .ok();
+        return Ok(());
+    };
+
+    let used = use_consumable(world, oid, item.clone()).await;
+    if !used {
+        tx.send(encode_packet(&s::UseItem {
+            unique_id: u.unique_id,
+            success: false,
+            grid: u.grid,
+        }))
+        .await
+        .ok();
+        return Ok(());
+    }
+
+    // 消耗成功：扣除一格
+    db.consume_inventory_item(player.character_index, u.unique_id)?;
+
+    tx.send(encode_packet(&s::UseItem {
+        unique_id: u.unique_id,
+        success: true,
+        grid: u.grid,
+    }))
+    .await
+    .ok();
+
+    // 刷新背包槽位（消耗后数量/格位变化）
+    send_slots_refresh(world, db, oid, player.character_index, tx).await;
+    Ok(())
+}
+
+/// 穿戴/卸下装备：grid=Inventory 穿戴到 to 装备槽；grid=Equipment 从 to 槽卸下。
+async fn handle_equip_item(
+    world: &World,
+    db: &Database,
+    object_id: &mut Option<u32>,
+    e: &c::EquipItem,
+    tx: &mpsc::Sender<Vec<u8>>,
+) -> anyhow::Result<()> {
+    let Some(oid) = *object_id else { return Ok(()) };
+    let Some(player) = world.get_player(oid).await else {
+        return Ok(());
+    };
+    let char_index = player.character_index;
+    let success: bool;
+
+    if e.grid == GRID_INVENTORY {
+        // 穿戴：从背包取物品放到装备槽 to
+        let Some((_slot, item)) = db.find_inventory_item(char_index, e.unique_id)? else {
+            send_equip_fail(tx, e).await;
+            return Ok(());
+        };
+        let Some(tmpl) = items::find(item.item_index) else {
+            send_equip_fail(tx, e).await;
+            return Ok(());
+        };
+        // 校验类型与槽位匹配：武器(1)->0，护甲(3)->1
+        let valid_slot = (tmpl.item_type == 1 && e.to == 0) || (tmpl.item_type == 3 && e.to == 1);
+        if !valid_slot {
+            send_equip_fail(tx, e).await;
+            return Ok(());
+        }
+        let outcome = db.equip_item(char_index, e.unique_id, item.item_index, e.to)?;
+        if !outcome.returned_to_inventory {
+            // 背包满，无法换下旧装备
+            send_equip_fail(tx, e).await;
+            return Ok(());
+        }
+        success = true;
+        // 更新玩家内存装备
+        {
+            let mut players = world.players.lock().await;
+            if let Some(p) = players.get_mut(&oid) {
+                p.equipment.insert(e.to, item.clone());
+                recompute_stats(p);
+            }
+        }
+    } else if e.grid == GRID_EQUIPMENT {
+        // 卸下：从装备槽 to 放回背包
+        let Some(_) = db.unequip_item(char_index, e.to)? else {
+            send_equip_fail(tx, e).await;
+            return Ok(());
+        };
+        success = true;
+        {
+            let mut players = world.players.lock().await;
+            if let Some(p) = players.get_mut(&oid) {
+                p.equipment.remove(&e.to);
+                recompute_stats(p);
+            }
+        }
+    } else {
+        send_equip_fail(tx, e).await;
+        return Ok(());
+    }
+
+    tx.send(encode_packet(&s::EquipItem {
+        grid: e.grid,
+        unique_id: e.unique_id,
+        to: e.to,
+        success,
+    }))
+    .await
+    .ok();
+
+    // 装备变化 -> 刷新槽位 + 广播新外观（武器/护甲）
+    send_slots_refresh(world, db, oid, char_index, tx).await;
+    let p = world.get_player(oid).await;
+    if let Some(p) = p {
+        broadcast_player(world, &p).await;
+    }
+    Ok(())
+}
+
+async fn send_equip_fail(tx: &mpsc::Sender<Vec<u8>>, e: &c::EquipItem) {
+    tx.send(encode_packet(&s::EquipItem {
+        grid: e.grid,
+        unique_id: e.unique_id,
+        to: e.to,
+        success: false,
+    }))
+    .await
+    .ok();
+}
+
+/// 向玩家发送 UserSlotsRefresh（背包 40 槽 + 装备 14 槽）。
+async fn send_slots_refresh(
+    world: &World,
+    db: &Database,
+    oid: u32,
+    char_index: i32,
+    tx: &mpsc::Sender<Vec<u8>>,
+) {
+    let Ok(inventory) = db.inventory_slots(char_index) else {
+        return;
+    };
+    let player = world.get_player(oid).await;
+    let equip = player.map(|p| world_equipment_slots(&p)).unwrap_or_default();
+    tx.send(encode_packet(&s::UserSlotsRefresh {
+        inventory: Some(inventory),
+        equipment: Some(equip),
+    }))
+    .await
+    .ok();
+}
+
+fn world_equipment_slots(player: &Player) -> Vec<Option<crystal_protocol::types::UserItem>> {
+    equipment_slots(player)
+}
+
+/// 广播玩家最新外观（穿戴变化后 weapon/armour 字段需要同步给所有人）。
+async fn broadcast_player(world: &World, p: &Player) {
+    let frame = encode_packet(&s::ObjectPlayer {
+        object_id: p.object_id,
+        name: p.name.clone(),
+        guild_name: String::new(),
+        guild_rank_name: String::new(),
+        name_colour: crystal_protocol::binary::Argb(0),
+        class: p.class,
+        gender: p.gender,
+        level: p.level,
+        location: p.location,
+        direction: p.direction,
+        hair: 0,
+        light: 0,
+        weapon: p.weapon,
+        weapon_effect: 0,
+        armour: p.armour,
+        poison: 0,
+        dead: false,
+        hidden: false,
+        effect: 0,
+        wing_effect: 0,
+        extra: false,
+        mount_type: 0,
+        riding_mount: false,
+        fishing: false,
+        transform_type: 0,
+        element_orb_effect: 0,
+        element_orb_lvl: 0,
+        element_orb_max: 0,
+        buffs: vec![],
+        level_effects: crystal_protocol::types::LevelEffects(0),
+    });
+    world.broadcast(frame);
 }
 
 fn num_class(v: u8) -> MirClass {

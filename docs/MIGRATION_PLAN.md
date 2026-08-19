@@ -29,14 +29,14 @@
 
 | 任务 | 状态 | 说明 |
 |---|---|---|
-| 账户/角色/存档 (SQLite) | ⬜ | 替换 C# 文件存档 |
-| 进入世界: MapInformation/UserInformation/ObjectPlayer | ⬜ | |
-| 移动 (Walk/Run/Turn)、广播同步 | ⬜ | |
-| 聊天 (Chat/ObjectChat) | ⬜ | |
-| 物品系统 (背包/装备/拾取/丢弃) | ⬜ | UserItem 内嵌序列化 |
-| 战斗系统 (Attack/Magic/Struck/Damage) | ⬜ | |
-| 怪物 AI + 刷新 (MonsterObject) | ⬜ | |
-| NPC + 商店 + 任务 | ⬜ | |
+| 账户/角色/存档 (SQLite) | 🟨 | accounts/characters/inventory/equipment 表，位置保存（gold/exp/等级持久化待补） |
+| 进入世界: MapInformation/UserInformation/ObjectPlayer | ✅ | 含固定槽位背包/装备下发 |
+| 移动 (Walk/Run/Turn)、广播同步 | ✅ | 边界校验 + ObjectWalk/Run/Turn + UserLocation |
+| 聊天 (Chat/ObjectChat) | ✅ | 广播给全场 |
+| 物品系统 (背包/装备/拾取/丢弃) | 🟨 | 拾取/购买/出售/道具使用(回血)/装备穿戴(武器/护甲→攻击/防御)已打通；丢弃未做 |
+| 战斗系统 (Attack/Magic/Struck/Damage) | 🟨 | 近战平A + 伤害/受击/死亡/经验/升级已打通（魔法未做） |
+| 怪物 AI + 刷新 (MonsterObject) | 🟨 | 刷新/仇恨/邻格攻击/死亡掉落已打通（寻路未做） |
+| NPC + 商店 + 任务 | 🟨 | 商人 CallNPC→NPCGoods→Buy/Sell 已打通（任务未做） |
 | 公会/组队/交易/邮件/市场 | ⬜ | |
 | 地图: 障碍/传送门/刷怪点 (客户端渲染需 Map txt/wil) | ⬜ | |
 

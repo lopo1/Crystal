@@ -49,6 +49,8 @@ pub struct Player {
     pub character_index: i32,
     pub sender: mpsc::Sender<Vec<u8>>,
     pub hp_changed: bool,
+    /// 已穿戴装备：EquipmentSlot -> UserItem（用于生成 UserSlotsRefresh）
+    pub equipment: std::collections::BTreeMap<i32, UserItem>,
 }
 
 /// 地面掉落物
@@ -847,6 +849,80 @@ pub async fn npc_shop(world: &World, npc_object_id: u32) -> Option<Vec<i32>> {
         .into_iter()
         .find(|n| n.object_id == npc_object_id)
         .map(|n| n.shop_items)
+}
+
+// ---------------------------------------------------------------------------
+// 装备 / 道具使用
+// ---------------------------------------------------------------------------
+
+/// 装备槽数量（含未使用槽位，与 C# `EquipmentSlot` 枚举一致）
+pub const EQUIPMENT_SLOTS: usize = 14;
+
+/// 把装备映射为固定 14 槽的 `Vec<Option<UserItem>>`（空槽为 None）。
+pub fn equipment_slots(player: &Player) -> Vec<Option<UserItem>> {
+    let mut slots: Vec<Option<UserItem>> = (0..EQUIPMENT_SLOTS).map(|_| None).collect();
+    for (slot, item) in &player.equipment {
+        if let Some(s) = slots.get_mut(*slot as usize) {
+            *s = Some(item.clone());
+        }
+    }
+    slots
+}
+
+/// 根据已穿戴装备重算玩家的攻击/防御（叠加装备 bonus；基础值由等级决定）。
+pub fn recompute_stats(player: &mut Player) {
+    // 基础攻击/防御来自职业与等级（与 net::base_stats 逻辑一致）
+    let base_attack = 1 + player.level as i32 / 2;
+    let base_defence = player.level as i32 / 2;
+    let mut attack = base_attack;
+    let mut defence = base_defence;
+    player.weapon = 0;
+    player.armour = 0;
+    for (slot, item) in &player.equipment {
+        let Some(tmpl) = crate::items::find(item.item_index) else { continue };
+        match slot {
+            0 => {
+                // 武器槽：加攻击
+                player.weapon = tmpl.index as i16;
+                attack += tmpl.bonus;
+            }
+            1 => {
+                // 护甲槽：加防御
+                player.armour = tmpl.index as i16;
+                defence += tmpl.bonus;
+            }
+            _ => {}
+        }
+    }
+    player.attack = attack;
+    player.defence = defence;
+}
+
+/// 使用物品：金创药等消耗品回复 HP。成功消耗并回复返回 (true, 用后剩余数量)。
+/// `item` 为背包中待使用的物品（由调用方按 unique_id 查得）。
+pub async fn use_consumable(world: &World, player_id: u32, item: UserItem) -> bool {
+    let Some(tmpl) = crate::items::find(item.item_index) else {
+        return false;
+    };
+    if tmpl.heal <= 0 {
+        return false;
+    }
+    {
+        let mut players = world.players.lock().await;
+        if let Some(p) = players.get_mut(&player_id) {
+            p.hp = (p.hp + tmpl.heal).min(p.max_hp);
+        }
+    }
+    let p = world.get_player(player_id).await;
+    if let Some(p) = p {
+        world
+            .send_to(
+                player_id,
+                encode_packet(&s::HealthChanged { hp: p.hp, mp: p.mp }),
+            )
+            .await;
+    }
+    true
 }
 
 // ---------------------------------------------------------------------------

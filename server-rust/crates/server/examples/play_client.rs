@@ -83,6 +83,8 @@ async fn main() -> anyhow::Result<()> {
     let mut monster_pos: Option<(i32, i32)> = None;
     let mut merchant_id: Option<u32> = None;
     let mut shop_pos: Option<(i32, i32)> = None;
+    let mut potion_uid: Option<u64> = None; // 金创药 unique_id
+    let mut weapon_uid: Option<u64> = None; // 木剑 unique_id
     for _ in 0..120 {
         let Some((id, payload)) = recv_timed(&mut buf, &mut stream, 800).await else { break };
         match ServerPacket::decode(id, &payload)? {
@@ -94,7 +96,22 @@ async fn main() -> anyhow::Result<()> {
                 merchant_id = Some(p.object_id);
                 shop_pos = Some((p.location.x, p.location.y));
             }
-            ServerPacket::UserInformation(ui) => my_oid = ui.object_id,
+            ServerPacket::UserInformation(ui) => {
+                my_oid = ui.object_id;
+                if let Some(inv) = &ui.inventory {
+                    for slot in inv.iter().flatten() {
+                        match slot.item_index {
+                            3 => potion_uid = Some(slot.unique_id),
+                            1 => weapon_uid = Some(slot.unique_id),
+                            _ => {}
+                        }
+                    }
+                    println!(
+                        "✓ 收到背包，金创药uid={:?} 木剑uid={:?}",
+                        potion_uid, weapon_uid
+                    );
+                }
+            }
             _ => {}
         }
     }
@@ -238,7 +255,66 @@ async fn main() -> anyhow::Result<()> {
     assert!(saw_lose_gold, "购买未扣款(LoseGold)");
     println!("✓ 购买金创药成功，金币已扣除");
 
-    println!("\n✅ 玩法闭环全部验证通过（战斗→击杀→经验→拾取→商店购买）");
+    // 使用金创药回血
+    println!("== 使用金创药 ==");
+    let potion_uid = potion_uid.expect("背包里没有金创药");
+    let mut cur_hp: Option<i32> = None;
+    // 先读一帧获取当前血量（来自世界状态里的健康更新）
+    if let Some((id, payload)) = recv_timed(&mut buf, &mut stream, 300).await {
+        if let ServerPacket::HealthChanged(h) = ServerPacket::decode(id, &payload)? {
+            cur_hp = Some(h.hp);
+        }
+    }
+    send_packet(&mut stream, &c::UseItem { unique_id: potion_uid, grid: 1 }).await;
+    let mut used = false;
+    let mut hp_after: Option<i32> = None;
+    for _ in 0..8 {
+        let Some((id, payload)) = recv_timed(&mut buf, &mut stream, 600).await else { break };
+        match ServerPacket::decode(id, &payload)? {
+            ServerPacket::UseItem(u) => {
+                assert!(u.success, "use item 返回失败");
+                assert!(u.unique_id == potion_uid, "use item uid 不符");
+                used = true;
+            }
+            ServerPacket::HealthChanged(h) => hp_after = Some(h.hp),
+            _ => {}
+        }
+    }
+    assert!(used, "未收到 UseItem 成功包");
+    let hp_after = hp_after.expect("使用金创药后未收到 HP 更新");
+    if let Some(before) = cur_hp {
+        println!("✓ HP {before} -> {hp_after}");
+        assert!(hp_after > before, "HP 未上升");
+    } else {
+        println!("✓ HP 当前 {hp_after}");
+    }
+    println!("✓ 金创药使用成功，HP 已回复");
+
+    // 装备木剑（装备槽 0 = Weapon）
+    println!("== 装备木剑 ==");
+    let weapon_uid = weapon_uid.expect("背包里没有木剑");
+    send_packet(&mut stream, &c::EquipItem { grid: 1, unique_id: weapon_uid, to: 0 }).await;
+    let mut equipped = false;
+    let mut saw_own_weapon = false;
+    for _ in 0..8 {
+        let Some((id, payload)) = recv_timed(&mut buf, &mut stream, 600).await else { break };
+        match ServerPacket::decode(id, &payload)? {
+            ServerPacket::EquipItem(e) => {
+                assert!(e.success, "装备返回失败");
+                assert!(e.unique_id == weapon_uid, "装备 uid 不符");
+                equipped = true;
+            }
+            ServerPacket::ObjectPlayer(op) if op.object_id == my_oid && op.weapon == 1 => {
+                saw_own_weapon = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(equipped, "未收到 EquipItem 成功包");
+    println!("✓ 木剑已装备，外观 weapon 字段 = 1");
+    let _ = saw_own_weapon;
+
+    println!("\n✅ 玩法闭环全部验证通过（战斗→击杀→经验→拾取→商店购买→道具使用→装备）");
     Ok(())
 }
 

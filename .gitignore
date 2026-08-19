@@ -368,5 +368,7 @@ FodyWeavers.xsd
 # --- Web3 MMORPG 改造新增 ---
 # Rust 服务器
 /server-rust/target/
+# 运行时数据库（SQLite），不纳入版本控制
+/server-rust/data/
 # Godot 客户端
 /client-godot/.godot/
