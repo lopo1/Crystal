@@ -33,7 +33,7 @@
 | 进入世界: MapInformation/UserInformation/ObjectPlayer | ✅ | 含固定槽位背包/装备下发 |
 | 移动 (Walk/Run/Turn)、广播同步 | ✅ | 边界校验 + ObjectWalk/Run/Turn + UserLocation |
 | 聊天 (Chat/ObjectChat) | ✅ | 广播给全场 |
-| 物品系统 (背包/装备/拾取/丢弃) | 🟨 | 拾取/购买/出售/道具使用(回血)/装备穿戴(武器/护甲→攻击/防御)/丢弃到地面 已打通 |
+| 物品系统 (背包/装备/拾取/丢弃) | 🟨 | 拾取/购买/出售/道具使用(回血)/装备穿戴(武器/护甲→攻击/防御)/丢弃/同类物品堆叠合并 已打通 |
 | 战斗系统 (Attack/Magic/Struck/Damage) | ✅ | 近战平A + 魔法攻击(火球/雷电, 射程指向, 耗蓝/伤害/击杀) + 受击/死亡/经验/升级全打通 |
 | 怪物 AI + 刷新 (MonsterObject) | ✅ | 刷新/感知索敌/追击(贪心寻路+ObjectWalk)/邻格攻击/脱战/死亡掉落全打通 |
 | NPC + 商店 + 任务 | 🟨 | 商人 CallNPC→NPCGoods→Buy/Sell 已打通（任务未做） |

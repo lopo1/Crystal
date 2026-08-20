@@ -329,6 +329,21 @@ impl Database {
         count: u16,
     ) -> anyhow::Result<bool> {
         let conn = self.conn.lock().unwrap();
+        // 若背包已有同类物品，则合并堆叠（不占新槽）
+        let existing_uid: Option<i64> = conn
+            .query_row(
+                "SELECT unique_id FROM inventory WHERE character_index=?1 AND item_index=?2 LIMIT 1",
+                params![character_index, item_index],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(uid) = existing_uid {
+            conn.execute(
+                "UPDATE inventory SET count=count+?1 WHERE unique_id=?2",
+                params![count, uid],
+            )?;
+            return Ok(true);
+        }
         // 找空槽（0..INVENTORY_SIZE）
         let occupied: Vec<i32> = {
             let mut stmt = conn.prepare(
@@ -818,5 +833,28 @@ mod tests {
         assert_eq!(ch.gold, 1234);
         assert_eq!(ch.experience, 567);
         assert_eq!(ch.level, 3);
+    }
+
+    #[test]
+    fn add_item_merges_stacks() {
+        let (db, _p) = temp_db();
+        db.register("tester").unwrap();
+        let info = db
+            .add_character("tester", "测试", crystal_protocol::types::MirClass::Warrior, crystal_protocol::types::MirGender::Male)
+            .unwrap()
+            .unwrap();
+        // 初始背包: 槽0=木剑x1, 槽1=金创药x5
+        // 再增加 3 个金创药 -> 应合并到已有的金创药堆(8)，不占新槽
+        db.add_item_to_inventory(info.index, 3, 3).unwrap();
+        let slots = db.inventory_slots(info.index).unwrap();
+        assert_eq!(slots[1].as_ref().map(|i| i.item_index), Some(3));
+        assert_eq!(slots[1].as_ref().map(|i| i.count), Some(8));
+        assert!(slots[2].is_none(), "同物品应合并堆叠，不应占新槽");
+        // 木剑(已在槽0) -> 同样合并进槽0(2把)，而非新槽2
+        db.add_item_to_inventory(info.index, 1, 1).unwrap();
+        let slots = db.inventory_slots(info.index).unwrap();
+        assert_eq!(slots[0].as_ref().map(|i| i.item_index), Some(1));
+        assert_eq!(slots[0].as_ref().map(|i| i.count), Some(2));
+        assert!(slots[2].is_none(), "已有木剑，不应新建槽2");
     }
 }
