@@ -145,6 +145,7 @@ pub struct World {
     /// 组队管理器（跨连接共享）
     pub group: Arc<Mutex<crate::group::GroupManager>>,
     pub trade: Arc<Mutex<crate::trade::TradeManager>>,
+    pub guild: Arc<Mutex<crate::guild::GuildManager>>,
 }
 
 /// 无真实地图时的程序化空地图（保持原有 800x800 全通行为，供无头/缺图运行）
@@ -188,6 +189,7 @@ impl World {
             maps: Arc::new(std::sync::RwLock::new(maps)),
             group: Arc::new(Mutex::new(crate::group::GroupManager::new())),
             trade: Arc::new(Mutex::new(crate::trade::TradeManager::new())),
+            guild: Arc::new(Mutex::new(crate::guild::GuildManager::new())),
         }
     }
 

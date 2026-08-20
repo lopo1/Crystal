@@ -896,8 +896,41 @@ async fn handle_chat_command(
             } else { let _ = tx.send(sys("不在交易中")).await; }
         }
 
+        "/guild" => {
+            let name = world.get_player(oid).await.map(|p| p.name).unwrap_or_default();
+            let g = world.guild.lock().await.guild_of(&name).map(|g| (g.name.clone(), g.owner.clone(), g.members.len()));
+            match g {
+                Some((n, o, c)) => { let _ = tx.send(sys(&format!("公会 {n}（会长 {o}），成员 {c} 人"))).await; }
+                None => { let _ = tx.send(sys("你不在任何公会")).await; }
+            }
+        }
+        "/guild_create" => {
+            let name = world.get_player(oid).await.map(|p| p.name).unwrap_or_default();
+            if let Some(gname) = cmd.get(1) {
+                match world.guild.lock().await.create(gname, &name) {
+                    Ok(_) => { let _ = tx.send(sys(&format!("已创建公会 {gname}"))).await; }
+                    Err(_) => { let _ = tx.send(sys("公会名已存在")).await; }
+                }
+            } else { let _ = tx.send(sys("用法: /guild_create <公会名>")).await; }
+        }
+        "/guild_join" => {
+            let name = world.get_player(oid).await.map(|p| p.name).unwrap_or_default();
+            if let Some(gname) = cmd.get(1) {
+                match world.guild.lock().await.join(gname, &name) {
+                    Ok(_) => { let _ = tx.send(sys(&format!("已加入公会 {gname}"))).await; }
+                    Err(_) => { let _ = tx.send(sys("加入失败（公会不存在或你已在公会）")).await; }
+                }
+            } else { let _ = tx.send(sys("用法: /guild_join <公会名>")).await; }
+        }
+        "/guild_leave" => {
+            let name = world.get_player(oid).await.map(|p| p.name).unwrap_or_default();
+            if world.guild.lock().await.leave(&name) {
+                let _ = tx.send(sys("已离开（会长离开则解散公会）")).await;
+            } else { let _ = tx.send(sys("你不在公会")).await; }
+        }
+
         "/help" | "/?" => {
-            let _ = tx.send(sys("命令: /map <index> /spawn /trade_req <名> /trade_accept /trade_gold <n> /trade_item <槽> /trade_confirm /trade_cancel")).await;
+            let _ = tx.send(sys("命令: /map <index> /spawn /trade_req <名> /trade_accept /trade_gold <n> /trade_item <槽> /trade_confirm /trade_cancel /guild_create <名> /guild_join <名> /guild")).await;
         }
         _ => {
             let _ = tx.send(sys(&format!("未知命令 {full}"))).await;

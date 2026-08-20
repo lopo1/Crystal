@@ -6,6 +6,7 @@
 
 mod db;
 mod group;
+mod guild;
 mod items;
 mod magics;
 mod maps;
