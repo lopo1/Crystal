@@ -32,7 +32,8 @@ static func _read_i32_array(r: Reader) -> Array:
 	return out
 
 static func _read_item_slots(r: Reader, item_reader: Callable) -> Array:
-	## 与 C# 一致: bool 是否存在数组; 若存在 int32 长度 + 逐槽 bool(存在) + 数据
+	## UserInformation / UserSlotsRefresh: 外层 bool = 数组是否存在；
+	## 逐槽 bool = 该槽是否有物品（true=有）。与 UserItem 内部 Slots 方向相反。
 	if not r.read_bool():
 		return []
 	var len := r.read_i32()
@@ -40,9 +41,9 @@ static func _read_item_slots(r: Reader, item_reader: Callable) -> Array:
 	slots.resize(len)
 	for i in range(len):
 		if r.read_bool():
-			slots[i] = null
-		else:
 			slots[i] = item_reader.call(r)
+		else:
+			slots[i] = null
 	return slots
 
 static func _write_item_slots(w: Writer, slots: Array, item_writer: Callable) -> void:
@@ -51,9 +52,9 @@ static func _write_item_slots(w: Writer, slots: Array, item_writer: Callable) ->
 		w.write_i32(slots.size())
 		for s in slots:
 			if s == null:
-				w.write_bool(true)
-			else:
 				w.write_bool(false)
+			else:
+				w.write_bool(true)
 				item_writer.call(w, s)
 
 # ---------------------------------------------------------------------------

@@ -45,9 +45,12 @@ var _shop_rate: float = 1.0
 var _shop_type: int = 0
 var _shop_npc_name: String = ""
 
-@onready var login_panel: PanelContainer = $LoginPanel
-@onready var game_view: Control = $GameView
-@onready var map_root: Node2D = $GameView/MapRoot
+@onready var login_panel: Control = $LoginPanel
+@onready var background: ColorRect = $Background
+@onready var game_view: CanvasLayer = $GameView
+@onready var world: Node2D = $World
+@onready var map_root: Node2D = $World/MapRoot
+@onready var camera: Camera2D = $World/Camera2D
 @onready var chat_log: RichTextLabel = $GameView/ChatLog
 @onready var chat_input: LineEdit = $GameView/ChatInput
 @onready var status_label: Label = $LoginPanel/StatusLabel
@@ -113,19 +116,16 @@ func _ready() -> void:
 	$GameView/ShopPanel/VBox/ItemList.item_activated.connect(_on_shop_buy_pressed)
 	$GameView/InventoryPanel/VBox/ItemList.item_activated.connect(_on_inventory_item_activated)
 	chat_input.text_submitted.connect(_on_chat_submitted)
-	game_view.hide()
+	_show_login()
 
 func _process(delta: float) -> void:
 	_input_cooldown = max(0.0, _input_cooldown - delta)
-	if game_view.visible:
-		_handle_movement_input()
-		# 切换背包面板 (I 键)
-		if Input.is_key_pressed(KEY_I):
-			inventory_panel.visible = not inventory_panel.visible
-	# 相机跟随
-	if my_pos != Vector2i.ZERO:
-		$GameView/Camera2D.position = Vector2(my_pos.x * TILE + TILE / 2.0, my_pos.y * TILE + TILE / 2.0)
-	# 更新 HUD
+	if not game_view.visible:
+		return
+	_handle_movement_input()
+	if Input.is_key_pressed(KEY_I):
+		inventory_panel.visible = not inventory_panel.visible
+	camera.position = Vector2(my_pos.x * TILE + TILE / 2.0, my_pos.y * TILE + TILE / 2.0)
 	_update_hud()
 	_update_skill_bar()
 
@@ -245,12 +245,8 @@ func _on_delete_char_pressed() -> void:
 
 func _on_logout_pressed() -> void:
 	client.logout()
-	game_view.hide()
-	login_panel.show()
+	_show_login()
 	status_label.text = "已登出"
-	inventory_panel.hide()
-	npc_dialog.hide()
-	shop_panel.hide()
 	players.clear()
 	monsters.clear()
 	npcs.clear()
@@ -260,6 +256,25 @@ func _on_logout_pressed() -> void:
 	_my_magics.clear()
 	_shop_goods.clear()
 
+func _show_login() -> void:
+	camera.enabled = false
+	world.hide()
+	game_view.hide()
+	background.show()
+	login_panel.show()
+	inventory_panel.hide()
+	npc_dialog.hide()
+	shop_panel.hide()
+
+
+func _show_game() -> void:
+	background.hide()
+	login_panel.hide()
+	world.show()
+	game_view.show()
+	camera.enabled = true
+
+
 func _class_name(class_id: int) -> String:
 	return ["战士", "法师", "道士", "刺客", "弓手"][class_id] if class_id < 5 else "?"
 
@@ -268,8 +283,7 @@ func _class_name(class_id: int) -> String:
 # ---------------------------------------------------------------------------
 
 func _on_entered_world(ui: Dictionary) -> void:
-	login_panel.hide()
-	game_view.show()
+	_show_game()
 	my_pos = ui.get("location", Vector2i(400, 400))
 	my_dir = ui.get("direction", 0)
 	my_hp = ui.get("hp", 100)
@@ -503,25 +517,17 @@ func _on_player_inspect(info: Dictionary) -> void:
 	_show_inspect_panel(info)
 
 func _on_logout_success(characters: Array) -> void:
-	game_view.hide()
-	login_panel.show()
+	_show_login()
 	_on_characters_loaded(characters)
 	status_label.text = "已登出"
-	inventory_panel.hide()
-	npc_dialog.hide()
-	shop_panel.hide()
 	players.clear()
 	monsters.clear()
 	npcs.clear()
 	ground_items.clear()
 
 func _on_return_to_login() -> void:
-	game_view.hide()
-	login_panel.show()
+	_show_login()
 	status_label.text = "已返回登录界面"
-	inventory_panel.hide()
-	npc_dialog.hide()
-	shop_panel.hide()
 
 func _on_object_magic(data: Dictionary) -> void:
 	var oid: int = data.get("object_id", 0)

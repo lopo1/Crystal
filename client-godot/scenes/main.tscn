@@ -20,13 +20,12 @@ grow_horizontal = 2
 grow_vertical = 2
 color = Color(0.05, 0.05, 0.15, 1)
 
-[node name="LoginPanel" type="PanelContainer" parent="."]
+[node name="LoginPanel" type="Control" parent="."]
 layout_mode = 3
 anchors_preset = 15
 anchor_right = 1.0
 anchor_bottom = 1.0
 grow_horizontal = 2
-grow_vertical = 2
 grow_vertical = 2
 
 [node name="ServerLineEdit" type="LineEdit" parent="LoginPanel"]
@@ -47,6 +46,7 @@ offset_top = 60.0
 offset_right = 740.0
 offset_bottom = 90.0
 placeholder_text = "7000"
+text = "7000"
 
 [node name="AccountLineEdit" type="LineEdit" parent="LoginPanel"]
 layout_mode = 1
@@ -182,21 +182,18 @@ offset_right = 800.0
 offset_bottom = 500.0
 text = "创建角色"
 
-[node name="GameView" type="Control" parent="."]
+[node name="World" type="Node2D" parent="."]
 visible = false
-layout_mode = 3
-anchors_preset = 15
-anchor_right = 1.0
-anchor_bottom = 1.0
-grow_horizontal = 2
-grow_vertical = 2
 
-[node name="MapRoot" type="Node2D" parent="GameView"]
-position = Vector2(-9600, -6400)
+[node name="MapRoot" type="Node2D" parent="World"]
 
-[node name="Camera2D" type="Camera2D" parent="GameView"]
+[node name="Camera2D" type="Camera2D" parent="World"]
+enabled = false
 position = Vector2(12816, 12816)
 zoom = Vector2(0.75, 0.75)
+
+[node name="GameView" type="CanvasLayer" parent="."]
+visible = false
 
 [node name="StatusBar" type="Label" parent="GameView"]
 layout_mode = 1
