@@ -5,6 +5,7 @@
 //! 启动: `cargo run -p crystal-server`（默认 127.0.0.1:7000）
 
 mod db;
+mod group;
 mod items;
 mod magics;
 mod maps;

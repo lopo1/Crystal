@@ -142,6 +142,8 @@ pub struct World {
     pub map: Arc<crate::maps::GameMap>,
     /// 地图注册表：map_index -> GameMap（支持多地图传送）
     pub maps: Arc<std::sync::RwLock<std::collections::HashMap<u32, Arc<crate::maps::GameMap>>>>,
+    /// 组队管理器（跨连接共享）
+    pub group: Arc<Mutex<crate::group::GroupManager>>,
 }
 
 /// 无真实地图时的程序化空地图（保持原有 800x800 全通行为，供无头/缺图运行）
@@ -183,6 +185,7 @@ impl World {
             next_item_unique: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             map: Arc::new(map),
             maps: Arc::new(std::sync::RwLock::new(maps)),
+            group: Arc::new(Mutex::new(crate::group::GroupManager::new())),
         }
     }
 

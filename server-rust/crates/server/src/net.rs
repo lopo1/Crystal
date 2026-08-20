@@ -287,6 +287,76 @@ async fn handle_client_packet(
                 }
             }
         }
+        ClientPacket::AddMember(am) => {
+            // 队长按名字邀请玩家入队：向被邀请者发 S.GroupInvite
+            if let Some(oid) = *object_id {
+                let inviter = world.get_player(oid).await.map(|p| p.name).unwrap_or_default();
+                let mut g = world.group.lock().await;
+                match g.invite(&inviter, &am.name) {
+                    Ok(_) => {
+                        if let Some(t_oid) = player_oid_by_name(world, &am.name).await {
+                            let frame = encode_packet(&s::GroupInvite { name: inviter.clone() });
+                            world.send_to(t_oid, frame).await;
+                        }
+                        drop(g);
+                        send_sys(world, oid, &format!("已邀请 {} 加入队伍", am.name)).await;
+                    }
+                    Err(_) => {
+                        drop(g);
+                        send_sys(world, oid, "无法邀请：对方已在队伍或你不是队长").await;
+                    }
+                }
+            }
+        }
+        ClientPacket::GroupInvite(gi) => {
+            // 响应邀请：accept=true 入队并广播 AddMember；false 拒绝
+            if let Some(oid) = *object_id {
+                let name = world.get_player(oid).await.map(|p| p.name).unwrap_or_default();
+                if gi.accept_invite {
+                    let members = { world.group.lock().await.accept(&name) };
+                    match members {
+                        Ok(list) => {
+                            for m in &list {
+                                if let Some(m_oid) = player_oid_by_name(world, m).await {
+                                    let frame = encode_packet(&s::AddMember { name: name.clone() });
+                                    world.send_to(m_oid, frame).await;
+                                }
+                            }
+                            send_sys(world, oid, &format!("已加入队伍，成员 {} 人", list.len())).await;
+                        }
+                        Err(_) => send_sys(world, oid, "没有待接受的队伍邀请").await,
+                    }
+                } else {
+                    world.group.lock().await.decline(&name);
+                }
+            }
+        }
+        ClientPacket::DelMember(dm) => {
+            // 离开/移除成员：向剩余成员广播 DeleteMember
+            if let Some(oid) = *object_id {
+                let name = world.get_player(oid).await.map(|p| p.name).unwrap_or_default();
+                let removed = if dm.name.is_empty() { name.clone() } else { dm.name.clone() };
+                let members = world.group.lock().await.leave(&removed);
+                if let Ok(list) = members {
+                    for m in &list {
+                        if let Some(m_oid) = player_oid_by_name(world, m).await {
+                            let frame = encode_packet(&s::DeleteMember { name: removed.clone() });
+                            world.send_to(m_oid, frame).await;
+                        }
+                    }
+                }
+            }
+        }
+        ClientPacket::SwitchGroup(sg) => {
+            // 切换是否接收邀请：回执
+            if let Some(oid) = *object_id {
+                tx.send(encode_packet(&s::SwitchGroup {
+                    allow_group: sg.allow_group,
+                }))
+                .await
+                .ok();
+            }
+        }
         ClientPacket::NewCharacter(nc) => {
             let result = match (account_id.as_ref(), char_name_valid(&nc.name)) {
                 (Some(aid), true) => match db.add_character(aid, &nc.name, nc.class, nc.gender)? {
@@ -679,6 +749,26 @@ async fn move_player(
             world.teleport_player(oid, dm, dx, dy).await;
         }
     }
+}
+
+/// 向指定玩家发送系统提示（ObjectChat type=1）
+async fn send_sys(world: &World, oid: u32, msg: &str) {
+    world
+        .send_to(
+            oid,
+            encode_packet(&s::ObjectChat {
+                object_id: oid,
+                text: msg.to_string(),
+                r#type: 1,
+            }),
+        )
+        .await;
+}
+
+/// 按角色名查找玩家 object_id；不在线则 None。
+async fn player_oid_by_name(world: &World, name: &str) -> Option<u32> {
+    let players = world.players.lock().await;
+    players.iter().find(|(_, p)| p.name == name).map(|(oid, _)| *oid)
 }
 
 fn valid_account_id(id: &str) -> bool {
