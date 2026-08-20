@@ -146,6 +146,7 @@ pub struct World {
     pub group: Arc<Mutex<crate::group::GroupManager>>,
     pub trade: Arc<Mutex<crate::trade::TradeManager>>,
     pub guild: Arc<Mutex<crate::guild::GuildManager>>,
+    pub market: Arc<Mutex<crate::market::MarketManager>>,
 }
 
 /// 无真实地图时的程序化空地图（保持原有 800x800 全通行为，供无头/缺图运行）
@@ -190,6 +191,7 @@ impl World {
             group: Arc::new(Mutex::new(crate::group::GroupManager::new())),
             trade: Arc::new(Mutex::new(crate::trade::TradeManager::new())),
             guild: Arc::new(Mutex::new(crate::guild::GuildManager::new())),
+            market: Arc::new(Mutex::new(crate::market::MarketManager::new())),
         }
     }
 

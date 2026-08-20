@@ -929,8 +929,71 @@ async fn handle_chat_command(
             } else { let _ = tx.send(sys("你不在公会")).await; }
         }
 
+        "/market" => {
+            let orders = world.market.lock().await.all_orders();
+            if orders.is_empty() {
+                let _ = tx.send(sys("市场暂无挂单")).await;
+            } else {
+                let msg = orders.iter().map(|o| format!("#{} <{}> 价{}", o.order_id, o.item_uid, o.price)).collect::<Vec<_>>().join("; ");
+                let _ = tx.send(sys(&format!("市场 {} 单: {msg}", orders.len()))).await;
+            }
+        }
+        "/market_sell" => {
+            let name = world.get_player(oid).await.map(|p| p.name).unwrap_or_default();
+            let slot = cmd.get(1).and_then(|s| s.parse::<i32>().ok());
+            let price = cmd.get(2).and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+            let uid = if let (Some(sl), Some(p)) = (slot, world.get_player(oid).await) {
+                db.load_inventory(p.character_index).ok().and_then(|inv| inv.into_iter().find(|(s, _)| *s == sl).map(|(_, it)| it.unique_id))
+            } else { None };
+            if let Some(uid) = uid {
+                match world.market.lock().await.list(&name, uid, price) {
+                    Ok(id) => { let _ = tx.send(sys(&format!("已挂单 #{id}，价 {price}"))).await; }
+                    Err(_) => { let _ = tx.send(sys("价格需>0")).await; }
+                }
+            } else { let _ = tx.send(sys("用法: /market_sell <背包槽位> <价格>")).await; }
+        }
+        "/market_buy" => {
+            if let Some(id) = cmd.get(1).and_then(|s| s.parse::<u64>().ok()) {
+                // 先查价格与卖家，再决定是否买入（避免金币不足仍扣单）
+                let (my_gold, buyer_char) = {
+                    let p = world.get_player(oid).await;
+                    (p.as_ref().map(|p| p.gold).unwrap_or(0), p.map(|p| p.character_index))
+                };
+                let (seller_name, price, item_uid) = {
+                    let m = world.market.lock().await;
+                    m.orders.get(&id).map(|o| (o.seller.clone(), o.price, o.item_uid)).unwrap_or_default()
+                };
+                let seller_char = match player_oid_by_name(world, &seller_name).await {
+                    Some(so) => world.get_player(so).await.map(|p| p.character_index),
+                    None => None,
+                };
+                if my_gold >= price && price > 0 {
+                    let order = world.market.lock().await.buy(id);
+                    if let Ok(o) = order {
+                        if let (Some(bc), Some(sc)) = (buyer_char, seller_char) {
+                            let _ = db.transfer_item(sc, bc, o.item_uid);
+                        }
+                        if remove_gold(world, oid, o.price).await {
+                            if let Some(so) = player_oid_by_name(world, &o.seller).await {
+                                gain_gold(world, so, o.price).await;
+                            }
+                        }
+                        let _ = tx.send(sys(&format!("✓ 已购买，扣除金币 {}", o.price))).await;
+                    } else { let _ = tx.send(sys("订单不存在")).await; }
+                } else { let _ = tx.send(sys("金币不足或价格非法")).await; }
+                let _ = item_uid;
+            } else { let _ = tx.send(sys("用法: /market_buy <订单id>")).await; }
+        }
+        "/market_cancel" => {
+            if let Some(id) = cmd.get(1).and_then(|s| s.parse::<u64>().ok()) {
+                if world.market.lock().await.cancel(id).is_ok() {
+                    let _ = tx.send(sys("已撤单")).await;
+                } else { let _ = tx.send(sys("订单不存在")).await; }
+            } else { let _ = tx.send(sys("用法: /market_cancel <订单id>")).await; }
+        }
+
         "/help" | "/?" => {
-            let _ = tx.send(sys("命令: /map <index> /spawn /trade_req <名> /trade_accept /trade_gold <n> /trade_item <槽> /trade_confirm /trade_cancel /guild_create <名> /guild_join <名> /guild")).await;
+            let _ = tx.send(sys("命令: /map <index> /spawn /guild_create <名> /guild_join <名> /guild /market /market_sell <槽> <价> /market_buy <id> /market_cancel <id> /trade_req <名> /trade_accept /trade_gold <n> /trade_item <槽> /trade_confirm /trade_cancel")).await;
         }
         _ => {
             let _ = tx.send(sys(&format!("未知命令 {full}"))).await;
