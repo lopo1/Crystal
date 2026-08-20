@@ -17,6 +17,20 @@ static func _read_items(r: Reader, item_reader: Callable, count: int) -> Array:
 		out.append(item_reader.call(r))
 	return out
 
+static func _read_u8_array(r: Reader) -> Array:
+	var count := r.read_i32()
+	var out := []
+	for i in range(count):
+		out.append(r.read_u8())
+	return out
+
+static func _read_i32_array(r: Reader) -> Array:
+	var count := r.read_i32()
+	var out := []
+	for i in range(count):
+		out.append(r.read_i32())
+	return out
+
 static func _read_item_slots(r: Reader, item_reader: Callable) -> Array:
 	## 与 C# 一致: bool 是否存在数组; 若存在 int32 长度 + 逐槽 bool(存在) + 数据
 	if not r.read_bool():
@@ -511,6 +525,7 @@ const S_START_GAME_DELAY := 16
 const S_MAP_INFORMATION := 17
 const S_NEW_MAP_INFO := 18
 const S_USER_INFORMATION := 21
+const S_USER_SLOTS_REFRESH := 22
 const S_USER_LOCATION := 23
 const S_OBJECT_PLAYER := 24
 const S_OBJECT_REMOVE := 26
@@ -520,6 +535,28 @@ const S_OBJECT_RUN := 29
 const S_CHAT := 30
 const S_OBJECT_CHAT := 31
 const S_TIME_OF_DAY := 61
+const S_OBJECT_ITEM := 64
+const S_OBJECT_GOLD := 65
+const S_GAINED_ITEM := 66
+const S_GAINED_GOLD := 67
+const S_LOSE_GOLD := 68
+const S_OBJECT_MONSTER := 71
+const S_OBJECT_ATTACK := 72
+const S_STRUCK := 73
+const S_OBJECT_STRUCK := 74
+const S_DAMAGE_INDICATOR := 75
+const S_HEALTH_CHANGED := 77
+const S_DEATH := 80
+const S_OBJECT_DIED := 81
+const S_GAIN_EXPERIENCE := 85
+const S_LEVEL_CHANGED := 87
+const S_OBJECT_NPC := 92
+const S_NPC_GOODS := 102
+const S_NPC_SELL := 103
+const S_NPC_REPAIR := 104
+const S_NPC_STORAGE := 110
+const S_REVIVED := 136
+const S_OBJECT_REVIVED := 137
 # Web3 钱包登录扩展（自定义 ID 300+，与 Rust server/web3.rs 一致）
 const S_WEB3_CHALLENGE := 300
 const S_WEB3_LOGIN_RESULT := 301
@@ -625,6 +662,10 @@ static func decode_server_packet(id: int, payload: PackedByteArray) -> Dictionar
 			ui["allow_observe"] = r.read_bool()
 			ui["observer"] = r.read_bool()
 			return {"id": id, "data": ui}
+		S_USER_SLOTS_REFRESH:
+			var inv := _read_item_slots(r, func(rr): return read_user_item(rr))
+			var equip := _read_item_slots(r, func(rr): return read_user_item(rr))
+			return {"id": id, "data": {"inventory": inv, "equipment": equip}}
 		S_USER_LOCATION:
 			return {"id": id, "data": {"location": read_point(r), "direction": r.read_u8()}}
 		S_OBJECT_PLAYER:
@@ -646,6 +687,127 @@ static func decode_server_packet(id: int, payload: PackedByteArray) -> Dictionar
 			return {"id": id, "data": {"object_id": r.read_u32(), "text": r.read_string(), "type": r.read_u8()}}
 		S_TIME_OF_DAY:
 			return {"id": id, "data": {"lights": r.read_u8()}}
+		S_OBJECT_ITEM:
+			return {"id": id, "data": {
+				"object_id": r.read_u32(),
+				"name": r.read_string(),
+				"name_colour": r.read_i32(),
+				"location": read_point(r),
+				"image": r.read_u16(),
+				"grade": r.read_u8(),
+			}}
+		S_OBJECT_GOLD:
+			return {"id": id, "data": {
+				"object_id": r.read_u32(),
+				"gold": r.read_u32(),
+				"location": read_point(r),
+			}}
+		S_GAINED_ITEM:
+			return {"id": id, "data": {"item": read_user_item(r)}}
+		S_GAINED_GOLD:
+			return {"id": id, "data": {"gold": r.read_u32()}}
+		S_LOSE_GOLD:
+			return {"id": id, "data": {"gold": r.read_u32()}}
+		S_OBJECT_MONSTER:
+			return {"id": id, "data": {
+				"object_id": r.read_u32(),
+				"name": r.read_string(),
+				"name_colour": r.read_i32(),
+				"location": read_point(r),
+				"image": r.read_u16(),
+				"direction": r.read_u8(),
+				"effect": r.read_u8(),
+				"ai": r.read_u8(),
+				"light": r.read_u8(),
+				"dead": r.read_bool(),
+				"skeleton": r.read_bool(),
+				"poison": r.read_u16(),
+				"hidden": r.read_bool(),
+				"shock_time": r.read_i64(),
+				"binding_shot_center": r.read_bool(),
+				"extra": r.read_bool(),
+				"extra_byte": r.read_u8(),
+				"master_object_id": r.read_u32(),
+				"rarity": r.read_u8(),
+				"buffs": _read_u8_array(r),
+			}}
+		S_OBJECT_ATTACK:
+			return {"id": id, "data": {
+				"object_id": r.read_u32(),
+				"location": read_point(r),
+				"direction": r.read_u8(),
+				"spell": r.read_u8(),
+				"level": r.read_u8(),
+				"type": r.read_u8(),
+			}}
+		S_STRUCK:
+			return {"id": id, "data": {
+				"attacker_id": r.read_u32(),
+			}}
+		S_OBJECT_STRUCK:
+			return {"id": id, "data": {
+				"object_id": r.read_u32(),
+				"attacker_id": r.read_u32(),
+				"location": read_point(r),
+				"direction": r.read_u8(),
+			}}
+		S_DAMAGE_INDICATOR:
+			return {"id": id, "data": {
+				"damage": r.read_i32(),
+				"type": r.read_u8(),
+				"object_id": r.read_u32(),
+			}}
+		S_HEALTH_CHANGED:
+			return {"id": id, "data": {
+				"hp": r.read_i32(),
+				"mp": r.read_i32(),
+			}}
+		S_DEATH:
+			return {"id": id, "data": {
+				"location": read_point(r),
+				"direction": r.read_u8(),
+			}}
+		S_OBJECT_DIED:
+			return {"id": id, "data": {
+				"object_id": r.read_u32(),
+				"location": read_point(r),
+				"direction": r.read_u8(),
+				"type": r.read_u8(),
+			}}
+		S_GAIN_EXPERIENCE:
+			return {"id": id, "data": {"amount": r.read_u32()}}
+		S_LEVEL_CHANGED:
+			return {"id": id, "data": {"level": r.read_u16()}}
+		S_OBJECT_NPC:
+			return {"id": id, "data": {
+				"object_id": r.read_u32(),
+				"name": r.read_string(),
+				"name_colour": r.read_i32(),
+				"image": r.read_u16(),
+				"colour": r.read_i32(),
+				"location": read_point(r),
+				"direction": r.read_u8(),
+				"quest_ids": _read_i32_array(r),
+			}}
+		S_NPC_GOODS:
+			var goods := []
+			var gcount := r.read_i32()
+			for i in range(gcount):
+				goods.append(read_user_item(r))
+			var rate := r.read_f32()
+			var panel_type := r.read_u8()
+			var hide_added := r.read_bool()
+			return {"id": id, "data": {"goods": goods, "rate": rate, "type": panel_type}}
+		S_NPC_SELL:
+			return {"id": id, "data": {"result": r.read_u8()}}
+		S_NPC_REPAIR:
+			return {"id": id, "data": {"result": r.read_u8()}}
+		S_NPC_STORAGE:
+			return {"id": id, "data": {}}
+		S_REVIVED:
+			return {"id": id, "data": {}}
+		S_OBJECT_REVIVED:
+			return {"id": id, "data": {"object_id": r.read_u32()}}
 		S_WEB3_CHALLENGE:
 			return {
 				"id": id,
@@ -656,13 +818,14 @@ static func decode_server_packet(id: int, payload: PackedByteArray) -> Dictionar
 				},
 			}
 		S_WEB3_LOGIN_RESULT:
-			# 布局与 Rust server/web3.rs 一致: result(u8) + int32 角色数 + SelectInfo*
+			# 布局与 Rust server/web3.rs 一致: result(u8) + int32 角色数 + SelectInfo* + session_token(string)
 			var wres := r.read_u8()
 			var wcc := r.read_i32()
 			var wchars := []
 			for i in range(wcc):
 				wchars.append(read_select_info(r))
-			return {"id": id, "data": {"result": wres, "characters": wchars}}
+			var session_token := r.read_string()
+			return {"id": id, "data": {"result": wres, "characters": wchars, "session_token": session_token}}
 		_:
 			return {"id": id, "data": {}}
 

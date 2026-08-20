@@ -372,3 +372,4 @@ FodyWeavers.xsd
 /server-rust/data/
 # Godot 客户端
 /client-godot/.godot/
+client-godot/addons/ziva_agent/zivacode/macos/zivacode

@@ -17,8 +17,9 @@ use crate::db::Database;
 use crate::items;
 use crate::web3::Web3Auth;
 use crate::world::{
-    drop_ground_item, equipment_slots, gain_gold, npc_shop, persist_player, player_attack,
-    player_magic_attack, pick_up, recompute_stats, remove_gold, use_consumable, Player, World,
+    drop_ground_item, drop_gold, equipment_slots, gain_experience, gain_gold, npc_name, npc_shop,
+    persist_player, player_attack, player_gold, player_magic_attack, pick_up, recompute_stats,
+    remove_gold, use_consumable, Player, World,
 };
 
 /// 连接所处的游戏阶段（对应 C# `GameStage`）
@@ -471,10 +472,10 @@ async fn handle_client_packet(
                 let dir = MirDirection::from_u8(atk.direction);
                 if atk.spell != 0 {
                     // 魔法攻击（远程范围指向）
-                    player_magic_attack(world, oid, dir, atk.spell).await;
+                    player_magic_attack(world, db, oid, dir, atk.spell).await;
                 } else {
                     // 基础近战平A
-                    player_attack(world, oid, dir).await;
+                    player_attack(world, db, oid, dir).await;
                 }
             }
         }
@@ -484,7 +485,71 @@ async fn handle_client_packet(
             }
         }
         ClientPacket::CallNPC(c) => {
-            // 商人 -> 发送 NPCGoods 商店列表
+            // 1) 任务 NPC：记录“触碰”，并给出接任务/进度/领奖提示
+            let npc_name = npc_name(world, c.object_id).await;
+            if let Some(oid) = *object_id {
+                let me = world
+                    .get_player(oid)
+                    .await
+                    .map(|p| p.name)
+                    .unwrap_or_default();
+                if let Some(nn) = &npc_name {
+                    let quest_npc = crate::quest::QUESTS.iter().any(|q| q.npc_name == nn.as_str());
+                    if quest_npc {
+                        world.quest.lock().await.touch(&me, nn);
+                        let char_index = world
+                            .get_player(oid)
+                            .await
+                            .map(|p| p.character_index)
+                            .unwrap_or(0);
+                        let q = world.quest.lock().await.quest_for_touch(&me, &db, char_index);
+                        match q {
+                            Some(def) => {
+                                let progress = db
+                                    .load_quest_progress(char_index)
+                                    .unwrap_or_default();
+                                let mine = progress.iter().find(|p| p.quest_id == def.id);
+                                let msg = match mine {
+                                    Some(p) if p.completed => format!(
+                                        "【{}】: {} —— 任务已完成！用 /quest_reward 领取奖励",
+                                        def.name, def.description
+                                    ),
+                                    Some(p) => {
+                                        let target = match def.objective {
+                                            crate::quest::QuestObjective::Kill { count, .. } => count,
+                                        };
+                                        format!(
+                                            "【{}】: {} 进度 {}/{}  (继续击杀推进)",
+                                            def.name, def.description, p.killed, target
+                                        )
+                                    }
+                                    None => format!(
+                                        "【{}】: {} —— /quest_accept 接受任务",
+                                        def.name, def.description
+                                    ),
+                                };
+                                tx.send(encode_packet(&s::ObjectChat {
+                                    object_id: oid,
+                                    text: msg,
+                                    r#type: 1,
+                                }))
+                                .await
+                                .ok();
+                            }
+                            None => {
+                                tx.send(encode_packet(&s::ObjectChat {
+                                    object_id: oid,
+                                    text: format!("{}: 你暂时没有可接/未完成的任务。", nn),
+                                    r#type: 1,
+                                }))
+                                .await
+                                .ok();
+                            }
+                        }
+                    }
+                }
+            }
+            // 2) 商人 -> 发送 NPCGoods 商店列表
             if let Some(shop) = npc_shop(world, c.object_id).await {
                 let list: Vec<UserItem> = shop
                     .iter()
@@ -526,6 +591,14 @@ async fn handle_client_packet(
                         if let Some(tmpl) = items::find(tmpl_idx) {
                             let gain = tmpl.price.saturating_mul(si.count as u32) / 2;
                             gain_gold(world, oid, gain).await;
+                            // 记录最近出售，供 NPC 回购（含价格与件数）
+                            let mut players = world.players.lock().await;
+                            if let Some(pl) = players.get_mut(&oid) {
+                                if pl.recently_sold.len() >= 20 {
+                                    pl.recently_sold.remove(0);
+                                }
+                                pl.recently_sold.push((si.unique_id, tmpl_idx, si.count, gain));
+                            }
                         }
                     }
                 }
@@ -539,6 +612,297 @@ async fn handle_client_packet(
         }
         ClientPacket::DropItem(d) => {
             handle_drop_item(world, db, object_id, d, tx).await?;
+        }
+        ClientPacket::MoveItem(m) => {
+            // 背包(1) 或 装备(2) 槽内移动/互换
+            if let Some(oid) = *object_id {
+                if let Some(p) = world.get_player(oid).await {
+                    let ok = if m.grid == GRID_INVENTORY {
+                        db.move_inventory_item(p.character_index, m.from, m.to).map(|r| r.0)
+                    } else if m.grid == GRID_EQUIPMENT {
+                        db.move_equipment_slot(p.character_index, m.from, m.to)
+                    } else {
+                        Ok(false)
+                    };
+                    if ok.unwrap_or(false) {
+                        send_slots_refresh(world, db, oid, p.character_index, tx).await;
+                    }
+                }
+            }
+        }
+        ClientPacket::SplitItem(sp) => {
+            if let Some(oid) = *object_id {
+                if let Some(p) = world.get_player(oid).await {
+                    if sp.grid == GRID_INVENTORY {
+                        if let Some(slot) =
+                            db.split_inventory_item(p.character_index, sp.unique_id, sp.count)?
+                        {
+                            let _ = slot;
+                            send_slots_refresh(world, db, oid, p.character_index, tx).await;
+                            send_sys(world, oid, "已拆分堆叠").await;
+                        }
+                    }
+                }
+            }
+        }
+        ClientPacket::StoreItem(st) => {
+            // 存入仓库：背包槽 from → 仓库槽 to
+            if let Some(oid) = *object_id {
+                if let Some(p) = world.get_player(oid).await {
+                    // 仓库密码门：未设密码或本会话已解锁才可存入
+                    if db.get_storage_pw(p.character_index).is_some() && !p.storage_unlocked {
+                        send_sys(world, oid, "需要先解锁仓库密码").await;
+                    } else if db.store_item(p.character_index, st.from, st.to).unwrap_or(false) {
+                        send_slots_refresh(world, db, oid, p.character_index, tx).await;
+                        send_sys(world, oid, &format!("已存入仓库槽 {}", st.to)).await;
+                    }
+                }
+            }
+        }
+        ClientPacket::TakeBackItem(tb) => {
+            // 取出：仓库槽 from → 背包槽 to
+            if let Some(oid) = *object_id {
+                if let Some(p) = world.get_player(oid).await {
+                    // 仓库密码门：未设密码或本会话已解锁才可取出
+                    if db.get_storage_pw(p.character_index).is_some() && !p.storage_unlocked {
+                        send_sys(world, oid, "需要先解锁仓库密码").await;
+                    } else if db.take_item(p.character_index, tb.from, tb.to).unwrap_or(false) {
+                        send_slots_refresh(world, db, oid, p.character_index, tx).await;
+                        send_sys(world, oid, &format!("已从仓库取出到背包槽 {}", tb.to)).await;
+                    }
+                }
+            }
+        }
+        ClientPacket::SetStoragePassword(ssp) => {
+            if let Some(oid) = *object_id {
+                handle_set_storage_password(world, db, oid, ssp.current_password.clone(), ssp.new_password.clone()).await;
+            }
+        }
+        ClientPacket::RemoveStoragePassword(rsp) => {
+            if let Some(oid) = *object_id {
+                handle_remove_storage_password(world, db, oid, rsp.current_password.clone()).await;
+            }
+        }
+        ClientPacket::UnlockStorage(us) => {
+            if let Some(oid) = *object_id {
+                handle_unlock_storage(world, db, oid, us.password.clone(), tx).await;
+            }
+        }
+        // 钓鱼
+        ClientPacket::FishingCast(fc) => {
+            if let Some(oid) = *object_id {
+                handle_fishing_cast(world, db, oid, fc.cast_out).await;
+            }
+        }
+        ClientPacket::FishingChangeAutocast(fac) => {
+            if let Some(oid) = *object_id {
+                handle_fishing_change_autocast(world, oid, fac.auto_cast).await;
+            }
+        }
+        // 精炼
+        ClientPacket::CheckRefine(cr) => {
+            if let Some(oid) = *object_id {
+                handle_check_refine(world, db, oid, cr.unique_id).await;
+            }
+        }
+        ClientPacket::RefineItem(ri) => {
+            if let Some(oid) = *object_id {
+                handle_refine_item(world, db, oid, ri.unique_id, tx).await;
+            }
+        }
+        ClientPacket::RefineCancel(_) => {
+            if let Some(oid) = *object_id {
+                handle_refine_cancel(world, oid).await;
+            }
+        }
+        // 师徒
+        ClientPacket::MentorReply(mr) => {
+            if let Some(oid) = *object_id {
+                handle_mentor_reply(world, db, oid, mr.accept_invite, tx).await;
+            }
+        }
+        ClientPacket::AllowMentor(_) => {
+            if let Some(oid) = *object_id {
+                let mut players = world.players.lock().await;
+                if let Some(p) = players.get_mut(&oid) {
+                    p.can_be_mentor = !p.can_be_mentor;
+                    let v = p.can_be_mentor;
+                    send_sys(world, oid, if v { "已开启：他人可邀请你收徒" } else { "已关闭：他人无法邀请你收徒" }).await;
+                }
+            }
+        }
+        ClientPacket::CancelMentor(_) => {
+            if let Some(oid) = *object_id {
+                handle_mentor_cancel(world, db, oid, tx).await;
+            }
+        }
+        // 婚姻
+        ClientPacket::MarriageRequest(_) => {
+            if let Some(oid) = *object_id {
+                handle_marriage_prompt(world, oid, tx).await;
+            }
+        }
+        ClientPacket::MarriageReply(mr) => {
+            if let Some(oid) = *object_id {
+                handle_marriage_reply(world, db, oid, mr.accept_invite, tx).await;
+            }
+        }
+        ClientPacket::DivorceRequest(_) => {
+            if let Some(oid) = *object_id {
+                handle_divorce(world, db, oid, tx).await;
+            }
+        }
+        // 转生
+        ClientPacket::AcceptReincarnation(_) => {
+            if let Some(oid) = *object_id {
+                handle_accept_reincarnation(world, db, oid, tx).await;
+            }
+        }
+        ClientPacket::CancelReincarnation(_) => {
+            // 取消转生：仅确认，无需动作
+        }
+        // 商城
+        ClientPacket::GameshopBuy(gb) => {
+            if let Some(oid) = *object_id {
+                handle_gameshop_buy(world, db, oid, gb.g_index, gb.quantity, gb.p_type, tx).await;
+            }
+        }
+        ClientPacket::DropGold(dg) => {
+            if let Some(oid) = *object_id {
+                handle_drop_gold(world, oid, dg.amount).await;
+            }
+        }
+        ClientPacket::RepairItem(ri) => {
+            if let Some(oid) = *object_id {
+                handle_repair_item(world, db, oid, ri.unique_id, tx).await;
+            }
+        }
+        // 查看玩家：回 PlayerInspect（装备/等级/职业等）
+        ClientPacket::Inspect(ins) => {
+            if let Some(oid) = *object_id {
+                handle_inspect(world, tx, oid, ins.object_id).await;
+            }
+        }
+        // 按名字观察玩家
+        ClientPacket::Observe(ob) => {
+            if let Some(oid) = *object_id {
+                handle_inspect_observe(world, tx, oid, &ob.name).await;
+            }
+        }
+        // 好友
+        ClientPacket::AddFriend(af) => {
+            if let Some(oid) = *object_id {
+                handle_add_friend(world, db, tx, oid, &af.name, af.blocked).await;
+            }
+        }
+        ClientPacket::RemoveFriend(rf) => {
+            if let Some(oid) = *object_id {
+                if let Some(p) = world.get_player(oid).await {
+                    if db.remove_friend(p.character_index, rf.character_index).unwrap_or(false) {
+                        send_sys(world, oid, "已移除好友").await;
+                    }
+                }
+                send_friends(world, db, tx, oid).await;
+            }
+        }
+        ClientPacket::RefreshFriends(_) => {
+            if let Some(oid) = *object_id {
+                send_friends(world, db, tx, oid).await;
+            }
+        }
+        // 信息请求
+        ClientPacket::RequestMapInfo(rmi) => {
+            if let Some(oid) = *object_id {
+                handle_request_map_info(world, tx, oid, rmi.map_index).await;
+            }
+        }
+        ClientPacket::RequestItemInfo(rii) => {
+            if let Some(oid) = *object_id {
+                handle_request_item_info(tx, oid, rii.item_index).await;
+            }
+        }
+        ClientPacket::RequestUserName(ru) => {
+            if let Some(oid) = *object_id {
+                let name = db.char_name(ru.user_id as i32).ok().flatten().unwrap_or_default();
+                tx.send(encode_packet(&s::UserName { id: ru.user_id, name })).await.ok();
+            }
+        }
+        ClientPacket::RequestNPCInfo(rni) => {
+            if let Some(oid) = *object_id {
+                handle_request_npc_info(world, tx, oid, rni.npc_index).await;
+            }
+        }
+        // 回城复活
+        ClientPacket::TownRevive(_) => {
+            if let Some(oid) = *object_id {
+                crate::world::revive_player(world, oid).await;
+            }
+        }
+        // 自动喝药设置
+        ClientPacket::SetAutoPotItem(sp) => {
+            if let Some(oid) = *object_id {
+                let mut players = world.players.lock().await;
+                if let Some(p) = players.get_mut(&oid) {
+                    p.auto_pot_item = sp.item_index;
+                }
+                drop(players);
+                send_sys(world, oid, if sp.item_index > 0 { "已设置自动喝药物品" } else { "已关闭自动喝药" }).await;
+            }
+        }
+        ClientPacket::SetAutoPotValue(sv) => {
+            if let Some(oid) = *object_id {
+                let mut players = world.players.lock().await;
+                if let Some(p) = players.get_mut(&oid) {
+                    p.auto_pot_hp = sv.value;
+                }
+                drop(players);
+                send_sys(world, oid, &format!("已设置自动喝药血量阈值 {}", sv.value)).await;
+            }
+        }
+        // 回购：把最近出售的物品买回
+        ClientPacket::BuyItemBack(bi) => {
+            if let Some(oid) = *object_id {
+                handle_buy_back(world, db, oid, bi.unique_id, bi.count).await;
+            }
+        }
+        // 信息请求
+        ClientPacket::RequestMonsterInfo(rm) => {
+            if let Some(oid) = *object_id {
+                handle_request_monster_info(tx, oid, rm.monster_index).await;
+            }
+        }
+        ClientPacket::RequestGuildInfo(rgi) => {
+            if let Some(oid) = *object_id {
+                handle_request_guild_info(world, tx, oid, rgi.r#type).await;
+            }
+        }
+        ClientPacket::SearchMap(sm) => {
+            if let Some(oid) = *object_id {
+                handle_search_map(world, tx, oid, &sm.text).await;
+            }
+        }
+        ClientPacket::TeleportToNPC(ttn) => {
+            if let Some(oid) = *object_id {
+                handle_teleport_to_npc(world, oid, ttn.object_id).await;
+            }
+        }
+        // 装备到指定槽 / 合并堆叠
+        ClientPacket::EquipSlotItem(esi) => {
+            if let Some(oid) = *object_id {
+                handle_equip_slot_item(world, db, oid, esi, tx).await;
+            }
+        }
+        ClientPacket::MergeItem(mi) => {
+            if let Some(oid) = *object_id {
+                if let Some(p) = world.get_player(oid).await {
+                    if db.merge_inventory_items(p.character_index, mi.id_from, mi.id_to).unwrap_or((false, 0)).0 {
+                        send_slots_refresh(world, db, oid, p.character_index, tx).await;
+                        send_sys(world, oid, "已合并堆叠").await;
+                    } else {
+                        send_sys(world, oid, "合并失败：非同类物品或目标无效").await;
+                    }
+                }
+            }
         }
         ClientPacket::Disconnect(_) => {}
         _ => {
@@ -618,6 +982,16 @@ async fn enter_world(
         hp_changed: false,
         equipment: equipment.clone(),
         map_index: 0,
+        auto_pot_item: 0,
+        auto_pot_hp: 0,
+        recently_sold: vec![],
+        fishing: false,
+        fishing_progress: 0,
+        auto_fish: false,
+        storage_unlocked: false,
+        pending_mentor: None,
+        can_be_mentor: false,
+        pending_marriage: None,
     };
     // 穿戴装备后重算攻击/防御
     recompute_stats(&mut player);
@@ -769,6 +1143,642 @@ async fn send_sys(world: &World, oid: u32, msg: &str) {
 async fn player_oid_by_name(world: &World, name: &str) -> Option<u32> {
     let players = world.players.lock().await;
     players.iter().find(|(_, p)| p.name == name).map(|(oid, _)| *oid)
+}
+
+// ---------------------------------------------------------------------------
+// 1) 仓库密码
+// ---------------------------------------------------------------------------
+
+async fn handle_set_storage_password(
+    world: &World,
+    db: &Database,
+    oid: u32,
+    current_password: String,
+    new_password: String,
+) {
+    let Some(p) = world.get_player(oid).await else { return };
+    let c = p.character_index;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let existing = db.get_storage_pw(c);
+    let (result, removing, has_password, last_set_time);
+    match existing {
+        None => {
+            // 未设过：当前密码必须为空才接受
+            if current_password.is_empty() {
+                let h = crate::db::hash_password(&new_password);
+                let _ = db.set_storage_pw(c, &h, now);
+                result = 1;
+                removing = false;
+                has_password = true;
+                last_set_time = now;
+            } else {
+                result = 2;
+                removing = false;
+                has_password = false;
+                last_set_time = 0;
+            }
+        }
+        Some((hash, set_at)) => {
+            if hash == crate::db::hash_password(&current_password) {
+                // 校验旧密码通过，改新密码
+                let h = crate::db::hash_password(&new_password);
+                let _ = db.set_storage_pw(c, &h, now);
+                result = 1;
+                removing = false;
+                has_password = true;
+                last_set_time = now;
+            } else {
+                result = 2;
+                removing = false;
+                has_password = true;
+                last_set_time = set_at;
+            }
+        }
+    }
+    world.send_to(oid, encode_packet(&s::StoragePasswordResult {
+        result,
+        removing,
+        has_password,
+        last_set_time,
+    })).await;
+}
+
+async fn handle_remove_storage_password(
+    world: &World,
+    db: &Database,
+    oid: u32,
+    current_password: String,
+) {
+    let Some(p) = world.get_player(oid).await else { return };
+    let c = p.character_index;
+    let (result, removing, has_password, last_set_time) = match db.get_storage_pw(c) {
+        Some((hash, _)) if hash == crate::db::hash_password(&current_password) => {
+            let _ = db.clear_storage_pw(c);
+            (1u8, true, false, 0i64)
+        }
+        Some((_, set_at)) => (2u8, false, true, set_at),
+        None => (2u8, false, false, 0i64),
+    };
+    world.send_to(oid, encode_packet(&s::StoragePasswordResult {
+        result, removing, has_password, last_set_time,
+    })).await;
+}
+
+async fn handle_unlock_storage(
+    world: &World,
+    db: &Database,
+    oid: u32,
+    password: String,
+    tx: &mpsc::Sender<Vec<u8>>,
+) {
+    let Some(p) = world.get_player(oid).await else { return };
+    let c = p.character_index;
+    let (result, has_password) = match db.get_storage_pw(c) {
+        Some((hash, _)) if hash == crate::db::hash_password(&password) => (1u8, true),
+        Some(_) => (2u8, true),
+        None => (1u8, false),
+    };
+    if result == 1 {
+        // 解锁成功后设置本会话解锁标记
+        let mut players = world.players.lock().await;
+        if let Some(pl) = players.get_mut(&oid) {
+            pl.storage_unlocked = true;
+        }
+        drop(players);
+    }
+    tx.send(encode_packet(&s::StorageUnlockResult { result, has_password })).await.ok();
+}
+
+// ---------------------------------------------------------------------------
+// 2) 钓鱼
+// ---------------------------------------------------------------------------
+
+async fn handle_fishing_cast(world: &World, db: &Database, oid: u32, cast_out: bool) {
+    {
+        let mut players = world.players.lock().await;
+        if let Some(p) = players.get_mut(&oid) {
+            p.fishing = cast_out;
+            p.fishing_progress = 0;
+        }
+    }
+    let loc = world.get_player(oid).await.map(|p| p.location).unwrap_or(crystal_protocol::binary::Point::new(0, 0));
+    world.send_to(oid, encode_packet(&s::FishingUpdate {
+        object_id: oid,
+        fishing: cast_out,
+        progress_percent: 0,
+        chance_percent: 30,
+        fishing_point: loc,
+        found_fish: false,
+    })).await;
+    let _ = db; // 预留：di保卫钓到的鱼入库在 fishing_tick 中处理
+}
+
+async fn handle_fishing_change_autocast(world: &World, oid: u32, auto_cast: bool) {
+    let mut players = world.players.lock().await;
+    if let Some(p) = players.get_mut(&oid) {
+        p.auto_fish = auto_cast;
+        // 关闭自动抛竿：若正在钓鱼则停止
+        if !auto_cast {
+            p.fishing = false;
+            p.fishing_progress = 0;
+        }
+    }
+    drop(players);
+    let loc = world.get_player(oid).await.map(|p| p.location).unwrap_or(crystal_protocol::binary::Point::new(0, 0));
+    world.send_to(oid, encode_packet(&s::FishingUpdate {
+        object_id: oid,
+        fishing: false,
+        progress_percent: 0,
+        chance_percent: 0,
+        fishing_point: loc,
+        found_fish: false,
+    })).await;
+}
+
+// ---------------------------------------------------------------------------
+// 3) 精炼
+// ---------------------------------------------------------------------------
+
+async fn handle_check_refine(world: &World, db: &Database, oid: u32, unique_id: u64) {
+    let Some(p) = world.get_player(oid).await else { return };
+    let c = p.character_index;
+    let cur = refine_of(db, c, unique_id);
+    let (rate, _cost) = Database::next_refine(cur);
+    world.send_to(oid, encode_packet(&s::NPCRefine { rate, refining: true })).await;
+}
+
+async fn handle_refine_item(
+    world: &World,
+    db: &Database,
+    oid: u32,
+    unique_id: u64,
+    tx: &mpsc::Sender<Vec<u8>>,
+) {
+    let Some(p) = world.get_player(oid).await else { return };
+    let c = p.character_index;
+    // 定位物品：先装备表后背包表
+    let (table, cur_refines) = locate_item_refine(db, c, unique_id);
+    let Some(table) = table else {
+        send_sys(world, oid, "未找到要精炼的物品").await;
+        return;
+    };
+    let (rate, cost) = Database::next_refine(cur_refines);
+    // 扣金币
+    if !remove_gold(world, oid, cost).await {
+        send_sys(world, oid, &format!("金币不足，精炼需要 {} 金币", cost)).await;
+        world.send_to(oid, encode_packet(&s::NPCRefine { rate: 0.0, refining: false })).await;
+        return;
+    }
+    use rand::Rng;
+    let roll: f32 = rand::thread_rng().gen::<f32>();
+    let success = roll < rate;
+    if success {
+        let _ = db.set_refines(&table, c, unique_id, cur_refines + 1);
+        world.send_to(oid, encode_packet(&s::NPCRefine { rate, refining: false })).await;
+        send_sys(world, oid, &format!("精炼成功！({} -> {})", cur_refines, cur_refines + 1)).await;
+    } else {
+        world.send_to(oid, encode_packet(&s::NPCRefine { rate: 0.0, refining: false })).await;
+        send_sys(world, oid, "精炼失败").await;
+    }
+    // 若装备被精炼且已穿戴，重算属性
+    if table == "equipment" {
+        let mut players = world.players.lock().await;
+        if let Some(pl) = players.get_mut(&oid) {
+            recompute_stats(pl);
+        }
+        drop(players);
+        let p = world.get_player(oid).await;
+        if let Some(p) = p {
+            broadcast_player(world, &p).await;
+        }
+    }
+    send_slots_refresh(world, db, oid, c, tx).await;
+}
+
+async fn handle_refine_cancel(world: &World, oid: u32) {
+    world.send_to(oid, encode_packet(&s::NPCRefine { rate: 0.0, refining: false })).await;
+}
+
+/// 返回 (表名, 当前精炼值)；物品不存在则 (None, 0)。
+fn locate_item_refine(db: &Database, c: i32, unique_id: u64) -> (Option<String>, u32) {
+    // 装备表
+    let equip = db.read_refines("equipment", c, unique_id);
+    // 判断该物品是否确实在装备表中（read_refines 对不存在的行返回 0，需再验证存在性）
+    let equip_exists = db.find_equipment_by_uid(c, unique_id);
+    if equip_exists {
+        return (Some("equipment".to_string()), equip);
+    }
+    let inv_exists = db.find_inventory_item(c, unique_id).ok().flatten().is_some();
+    if inv_exists {
+        return (Some("inventory".to_string()), db.read_refines("inventory", c, unique_id));
+    }
+    (None, 0)
+}
+
+fn refine_of(db: &Database, c: i32, unique_id: u64) -> u32 {
+    let (table, cur) = locate_item_refine(db, c, unique_id);
+    if table.is_some() { cur } else { 0 }
+}
+
+// ---------------------------------------------------------------------------
+// 4) 师徒
+// ---------------------------------------------------------------------------
+
+async fn handle_mentor_reply(
+    world: &World,
+    db: &Database,
+    oid: u32,
+    accept: bool,
+    _tx: &mpsc::Sender<Vec<u8>>,
+) {
+    let Some(p) = world.get_player(oid).await else { return };
+    let mentee_name = p.name.clone();
+    let mentor_name = match p.pending_mentor.clone() {
+        Some(n) => n,
+        None => {
+            send_sys(world, oid, "当前没有待确认的收徒邀请").await;
+            return;
+        }
+    };
+    let Some(mentor_oid) = player_oid_by_name(world, &mentor_name).await else {
+        send_sys(world, oid, &format!("师父 {mentor_name} 不在线")).await;
+        return;
+    };
+    // 清除待确认
+    {
+        let mut players = world.players.lock().await;
+        if let Some(pl) = players.get_mut(&oid) {
+            pl.pending_mentor = None;
+        }
+    }
+    if !accept {
+        send_sys(world, oid, &format!("已拒绝 {mentor_name} 的收徒邀请")).await;
+        world.send_to(mentor_oid, encode_packet(&s::ObjectChat {
+            object_id: mentor_oid,
+            text: format!("{mentee_name} 拒绝了你的收徒邀请"),
+            r#type: 1,
+        })).await;
+        return;
+    }
+    // 建立师徒关系（mentee=oid, mentor=mentor_oid）
+    let mentee_char = p.character_index;
+    let Some(mentor) = world.get_player(mentor_oid).await else { return };
+    let mentor_char = mentor.character_index;
+    let _ = db.set_mentor(mentee_char, mentor_char);
+    // 双方发 MentorUpdate
+    let mentee_level = world.get_player(oid).await.map(|x| x.level).unwrap_or(1);
+    let mentor_level = world.get_player(mentor_oid).await.map(|x| x.level).unwrap_or(1);
+    world.send_to(oid, encode_packet(&s::MentorUpdate {
+        name: mentor_name.clone(),
+        level: mentor_level,
+        online: true,
+        mentee_exp: 0,
+    })).await;
+    world.send_to(mentor_oid, encode_packet(&s::MentorUpdate {
+        name: mentee_name.clone(),
+        level: mentee_level,
+        online: true,
+        mentee_exp: 0,
+    })).await;
+    send_sys(world, oid, &format!("✓ 已拜 {mentor_name} 为师")).await;
+    send_sys(world, mentor_oid, &format!("✓ {mentee_name} 已成为你的徒弟")).await;
+}
+
+async fn handle_mentor_cancel(
+    world: &World,
+    db: &Database,
+    oid: u32,
+    tx: &mpsc::Sender<Vec<u8>>,
+) {
+    let Some(p) = world.get_player(oid).await else { return };
+    let c = p.character_index;
+    db.clear_mentor(c).ok();
+    tx.send(encode_packet(&s::MentorUpdate {
+        name: String::new(),
+        level: 0,
+        online: false,
+        mentee_exp: 0,
+    })).await.ok();
+    send_sys(world, oid, "已解除师徒关系").await;
+}
+
+/// /mentor <师父名>：向指定玩家发出收徒邀请（要求对方已开启 can_be_mentor）。
+async fn chat_mentor_request(world: &World, oid: u32, target: &str, tx: &mpsc::Sender<Vec<u8>>) {
+    let Some(p) = world.get_player(oid).await else { return };
+    let my_name = p.name.clone();
+    let target_oid = match player_oid_by_name(world, target).await {
+        Some(o) => o,
+        None => {
+            let _ = tx.send(encode_packet(&s::ObjectChat {
+                object_id: oid, text: format!("玩家 {target} 不在线"), r#type: 1,
+            })).await;
+            return;
+        }
+    };
+    let target_player = world.get_player(target_oid).await;
+    if let Some(tp) = target_player.clone() {
+        if tp.name == my_name {
+            let _ = tx.send(encode_packet(&s::ObjectChat {
+                object_id: oid, text: "不能拜自己为师".to_string(), r#type: 1,
+            })).await;
+            return;
+        }
+        if !tp.can_be_mentor {
+            let _ = tx.send(encode_packet(&s::ObjectChat {
+                object_id: oid, text: format!("{target} 未开启收徒（对方需先允许）"), r#type: 1,
+            })).await;
+            return;
+        }
+    }
+    // 记录待确认（存储到 target 的 pending_mentor 与自身的请求）
+    {
+        let mut players = world.players.lock().await;
+        if let Some(tp) = players.get_mut(&target_oid) {
+            tp.pending_mentor = Some(my_name.clone());
+        }
+    }
+    // 向 target 发送 MentorRequest
+    let level = world.get_player(oid).await.map(|x| x.level).unwrap_or(1);
+    world.send_to(target_oid, encode_packet(&s::MentorRequest {
+        name: my_name.clone(),
+        level,
+    })).await;
+    let _ = tx.send(encode_packet(&s::ObjectChat {
+        object_id: oid, text: format!("已向 {target} 发出收徒请求"), r#type: 1,
+    })).await;
+}
+
+// ---------------------------------------------------------------------------
+// 5) 婚姻
+// ---------------------------------------------------------------------------
+
+async fn handle_marriage_prompt(world: &World, oid: u32, tx: &mpsc::Sender<Vec<u8>>) {
+    let Some(p) = world.get_player(oid).await else { return };
+    match p.pending_marriage.clone() {
+        Some(name) => {
+            tx.send(encode_packet(&s::MarriageRequest { name })).await.ok();
+        }
+        None => {
+            send_sys(world, oid, "当前没有待确认的结婚邀请").await;
+        }
+    }
+}
+
+async fn handle_marriage_reply(
+    world: &World,
+    db: &Database,
+    oid: u32,
+    accept: bool,
+    tx: &mpsc::Sender<Vec<u8>>,
+) {
+    let Some(p) = world.get_player(oid).await else { return };
+    let my_char = p.character_index;
+    let my_name = p.name.clone();
+    let spouse_name = match p.pending_marriage.clone() {
+        Some(n) => n,
+        None => {
+            send_sys(world, oid, "当前没有待确认的结婚邀请").await;
+            return;
+        }
+    };
+    let spouse_oid = match player_oid_by_name(world, &spouse_name).await {
+        Some(o) => o,
+        None => {
+            send_sys(world, oid, &format!("{spouse_name} 不在线")).await;
+            return;
+        }
+    };
+    // 清除双方待确认
+    {
+        let mut players = world.players.lock().await;
+        if let Some(pl) = players.get_mut(&oid) {
+            pl.pending_marriage = None;
+        }
+        if let Some(sp) = players.get_mut(&spouse_oid) {
+            sp.pending_marriage = None;
+        }
+    }
+    if !accept {
+        send_sys(world, oid, &format!("已拒绝 {spouse_name} 的求婚")).await;
+        world.send_to(spouse_oid, encode_packet(&s::ObjectChat {
+            object_id: spouse_oid,
+            text: format!("{my_name} 拒绝了你的求婚"),
+            r#type: 1,
+        })).await;
+        return;
+    }
+    // 双方在线才可结婚
+    let spouse = world.get_player(spouse_oid).await;
+    let Some(spouse) = spouse else {
+        send_sys(world, oid, &format!("{spouse_name} 不在线")).await;
+        return;
+    };
+    let spouse_char = spouse.character_index;
+    let date = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let _ = db.set_spouse(my_char, spouse_char, date);
+    // 双方发送 LoverUpdate
+    let my_map = world.get_player(oid).await.map(|x| x.map_index).unwrap_or(0);
+    let sp_map = world.get_player(spouse_oid).await.map(|x| x.map_index).unwrap_or(0);
+    tx.send(encode_packet(&s::LoverUpdate {
+        name: spouse_name.clone(),
+        date,
+        map_name: format!("m{sp_map}"),
+        married_days: 0,
+    })).await.ok();
+    world.send_to(spouse_oid, encode_packet(&s::LoverUpdate {
+        name: my_name.clone(),
+        date,
+        map_name: format!("m{my_map}"),
+        married_days: 0,
+    })).await;
+    send_sys(world, oid, &format!("✓ 你与 {spouse_name} 喜结连理！")).await;
+    send_sys(world, spouse_oid, &format!("✓ 你与 {my_name} 喜结连理！")).await;
+}
+
+async fn handle_divorce(world: &World, db: &Database, oid: u32, tx: &mpsc::Sender<Vec<u8>>) {
+    let Some(p) = world.get_player(oid).await else { return };
+    let my_char = p.character_index;
+    let my_name = p.name.clone();
+    let spouse_char = db.get_spouse(my_char);
+    // 清除双方关系
+    db.clear_spouse(my_char).ok();
+    if let Some(sc) = spouse_char {
+        if db.get_spouse(sc) == Some(my_char) {
+            db.clear_spouse(sc).ok();
+        }
+    }
+    tx.send(encode_packet(&s::LoverUpdate {
+        name: String::new(),
+        date: 0,
+        map_name: String::new(),
+        married_days: 0,
+    })).await.ok();
+    // 若对方在线，通知
+    let _ = my_name;
+    let _ = spouse_char;
+    send_sys(world, oid, "你已离婚").await;
+    if let Some(sc) = spouse_char {
+        if let Some(sc_name) = db.char_name(sc).ok().flatten() {
+            if let Some(so) = player_oid_by_name(world, &sc_name).await {
+                world.send_to(so, encode_packet(&s::LoverUpdate {
+                    name: String::new(),
+                    date: 0,
+                    map_name: String::new(),
+                    married_days: 0,
+                })).await;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 6) 转生
+// ---------------------------------------------------------------------------
+
+async fn handle_accept_reincarnation(
+    world: &World,
+    db: &Database,
+    oid: u32,
+    tx: &mpsc::Sender<Vec<u8>>,
+) {
+    let Some(p) = world.get_player(oid).await else { return };
+    let c = p.character_index;
+    let _ = db.add_reincarnation(c);
+    // 重置等级为 1，保留金币，恢复满 HP/MP
+    {
+        let mut players = world.players.lock().await;
+        if let Some(pl) = players.get_mut(&oid) {
+            pl.level = 1;
+            let (bh, bk) = base_stats(pl.class, 1);
+            pl.max_hp = bh;
+            pl.hp = bh;
+            pl.max_mp = 25;
+            pl.mp = 25;
+            pl.attack = bk;
+            pl.defence = 0;
+            recompute_stats(pl);
+        }
+    }
+    tx.send(encode_packet(&s::RequestReincarnation {})).await.ok();
+    let p = world.get_player(oid).await;
+    if let Some(p) = p {
+        tx.send(encode_packet(&s::UserInformation {
+            object_id: oid,
+            real_id: oid,
+            name: p.name.clone(),
+            guild_name: String::new(),
+            guild_rank: String::new(),
+            name_colour: crystal_protocol::binary::Argb(0),
+            class: p.class,
+            gender: p.gender,
+            level: 1,
+            location: p.location,
+            direction: p.direction,
+            hair: 0,
+            hp: p.hp,
+            mp: p.mp,
+            experience: 0,
+            max_experience: 100,
+            level_effects: crystal_protocol::types::LevelEffects(0),
+            has_hero: false,
+            hero_behaviour: 0,
+            inventory: None,
+            equipment: None,
+            quest_inventory: None,
+            gold: p.gold,
+            credit: 0,
+            has_expanded_storage: false,
+            has_storage_password: false,
+            require_storage_password: false,
+            storage_password_last_set: 0,
+            expanded_storage_expiry_time: 0,
+            magics: vec![],
+            intelligent_creatures: vec![],
+            summoned_creature_type: 0,
+            creature_summoned: false,
+            allow_observe: false,
+            observer: false,
+        })).await.ok();
+    }
+    send_sys(world, oid, "你已转生，等级重置为 1，金币保留").await;
+}
+
+// ---------------------------------------------------------------------------
+// 7) 商城
+// ---------------------------------------------------------------------------
+
+/// 定义两个商城道具（内置内存库存）。
+/// 回城卷(4) 价格 50 金币；布衣(2) 价格 120 金币。
+fn gameshop_items() -> Vec<s::GameShopItem> {
+    let mk = |item_index: i32, gold_price: u32, stock: i32| -> s::GameShopItem {
+        let name = items::find(item_index).map(|t| t.name.to_string()).unwrap_or_else(|| format!("#{item_index}"));
+        s::GameShopItem {
+            item_index,
+            g_index: item_index,
+            info: crystal_protocol::types::ItemInfo {
+                index: item_index,
+                name,
+                ..Default::default()
+            },
+            gold_price,
+            credit_price: 0,
+            count: 1,
+            class: String::new(),
+            category: String::new(),
+            stock,
+            i_stock: true,
+            deal: false,
+            top_item: false,
+            date: 0,
+            can_buy_credit: false,
+            can_buy_gold: true,
+        }
+    };
+    vec![
+        mk(4, 50, 100),   // 回城卷
+        mk(2, 120, 100),  // 布衣
+    ]
+}
+
+async fn handle_gameshop_buy(
+    world: &World,
+    db: &Database,
+    oid: u32,
+    g_index: i32,
+    quantity: u8,
+    p_type: i32,
+    tx: &mpsc::Sender<Vec<u8>>,
+) {
+    if p_type != 0 {
+        send_sys(world, oid, "暂不支持点心/点券支付").await;
+        return;
+    }
+    let Some(item) = gameshop_items().into_iter().find(|i| i.g_index == g_index) else {
+        send_sys(world, oid, "商城物品不存在").await;
+        return;
+    };
+    let qty = quantity.max(1) as u32;
+    let cost = item.gold_price.saturating_mul(qty);
+    let Some(p) = world.get_player(oid).await else { return };
+    if p.gold < cost {
+        send_sys(world, oid, "金币不足").await;
+        return;
+    }
+    if !remove_gold(world, oid, cost).await {
+        send_sys(world, oid, "金币不足").await;
+        return;
+    }
+    // 扣除剩余库存
+    let remaining_stock = (item.stock - qty as i32).max(0);
+    let _ = db.add_item_to_inventory(p.character_index, item.item_index, qty as u16);
+    tx.send(encode_packet(&s::GameShopStock { g_index, stock_level: remaining_stock })).await.ok();
+    send_sys(world, oid, &format!("✓ 已购买 {}x{qty}，花费 {cost} 金币", item.info.name)).await;
 }
 
 fn valid_account_id(id: &str) -> bool {
@@ -992,8 +2002,322 @@ async fn handle_chat_command(
             } else { let _ = tx.send(sys("用法: /market_cancel <订单id>")).await; }
         }
 
+        // ------------------------- 邮件（站内信） -------------------------
+        "/mail" => {
+            let char_index = world.get_player(oid).await.map(|p| p.character_index).unwrap_or(0);
+            let inbox = db.mail_inbox(char_index).unwrap_or_default();
+            if inbox.is_empty() {
+                let _ = tx.send(sys("收件箱为空")).await;
+            } else {
+                let summary = inbox.iter().map(|m| {
+                    format!("#{} {} {}金{}", m.id, m.title, m.gold, if m.is_read { "[读]" } else { "[新]" })
+                }).collect::<Vec<_>>().join("; ");
+                let _ = tx.send(sys(&format!("收件箱 {} 封: {summary}", inbox.len()))).await;
+            }
+        }
+        "/mail_detail" => {
+            let char_index = world.get_player(oid).await.map(|p| p.character_index).unwrap_or(0);
+            if let Some(id) = cmd.get(1).and_then(|s| s.parse::<i64>().ok()) {
+                if let Some(m) = db.get_mail(id, char_index).ok().flatten() {
+                    let _ = tx.send(sys(&format!(
+                        "邮件 #{} 来自「{}」: {} —— {}\n附件: 金币{} 物品{}",
+                        m.id, m.from_name, m.title, m.body, m.gold, if m.item_uid>0 {"有"} else {"无"}
+                    ))).await;
+                    let _ = db.mark_mail_read(id);
+                } else { let _ = tx.send(sys("邮件不存在")).await; }
+            } else { let _ = tx.send(sys("用法: /mail_detail <id>")).await; }
+        }
+        "/mail_send" => {
+            // /mail_send <角色名> <金币> <标题...>
+            let from = world.get_player(oid).await.map(|p| p.name).unwrap_or_default();
+            let Some(target) = cmd.get(1).cloned() else {
+                let _ = tx.send(sys("用法: /mail_send <角色名> <金币> <标题>")).await; return;
+            };
+            let gold = cmd.get(2).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+            // 若金币>0 且玩家在线，先扣除余额（避免凭空发钱）
+            if gold > 0 && player_gold(world, oid).await < gold as u32 {
+                let _ = tx.send(sys("你的金币不足")).await; return;
+            }
+            let Some(to_char) = db.char_index_by_name(&target).ok().flatten() else {
+                let _ = tx.send(sys("收件人角色不存在")).await; return;
+            };
+            if gold > 0 {
+                let _ = remove_gold(world, oid, gold as u32).await;
+            }
+            let title = cmd.get(3..).unwrap_or(&[]).iter().copied().collect::<Vec<_>>().join(" ");
+            let title = if title.is_empty() { "无标题".to_string() } else { title };
+            let _ = db.send_mail(to_char, &from, &title, "", gold, 0);
+            let _ = tx.send(sys(&format!("✓ 已发出邮件（金币 {gold}）"))).await;
+        }
+        "/mail_send_item" => {
+            // /mail_send_item <角色名> <背包槽位> <标题...>  物品所有权转移
+            let from = world.get_player(oid).await.map(|p| p.name).unwrap_or_default();
+            let Some(target) = cmd.get(1).cloned() else {
+                let _ = tx.send(sys("用法: /mail_send_item <角色名> <背包槽位> <标题>")).await; return;
+            };
+            let slot = cmd.get(2).and_then(|s| s.parse::<i32>().ok());
+            let Some(to_char) = db.char_index_by_name(&target).ok().flatten() else {
+                let _ = tx.send(sys("收件人角色不存在")).await; return;
+            };
+            let Some(p) = world.get_player(oid).await else { return; };
+            let from_char = p.character_index;
+            let (uid,) = match slot {
+                Some(sl) => db.load_inventory(from_char).ok().map(|inv| {
+                    inv.into_iter().find(|(s, _)| *s == sl).map(|(_, it)| it.unique_id)
+                }).flatten().map(|u| (u,)).unwrap_or((0,)),
+                None => (0,),
+            };
+            if uid == 0 {
+                let _ = tx.send(sys("该槽位没有物品")).await; return;
+            }
+            // 转移到收件人背包（转移即视为附件；不占用 mail.item_uid）
+            if !db.transfer_item(from_char, to_char, uid).unwrap_or(false) {
+                let _ = tx.send(sys("转移失败")).await; return;
+            }
+            let title = cmd.get(3..).unwrap_or(&[]).iter().copied().collect::<Vec<_>>().join(" ");
+            let title = if title.is_empty() { "物品附赠".to_string() } else { title };
+            let _ = db.send_mail(to_char, &from, &title, "给你寄来一件物品", 0, 0);
+            let _ = tx.send(sys("✓ 物品已随邮件寄出")).await;
+        }
+        "/mail_read" => {
+            let char_index = world.get_player(oid).await.map(|p| p.character_index).unwrap_or(0);
+            if let Some(id) = cmd.get(1).and_then(|s| s.parse::<i64>().ok()) {
+                if db.get_mail(id, char_index).ok().flatten().is_some() {
+                    let _ = db.mark_mail_read(id);
+                    let _ = tx.send(sys("已标记为已读")).await;
+                } else { let _ = tx.send(sys("邮件不存在")).await; }
+            } else { let _ = tx.send(sys("用法: /mail_read <id>")).await; }
+        }
+        "/mail_reward" => {
+            let char_index = world.get_player(oid).await.map(|p| p.character_index).unwrap_or(0);
+            if let Some(id) = cmd.get(1).and_then(|s| s.parse::<i64>().ok()) {
+                let Some(m) = db.get_mail(id, char_index).ok().flatten() else {
+                    let _ = tx.send(sys("邮件不存在")).await; return;
+                };
+                let gold = m.gold;
+                let item_uid = m.item_uid;
+                if gold > 0 {
+                    let _ = db.claim_mail_gold(id);
+                    // 收件人本人在线，直接入账
+                    let _ = gain_gold(world, oid, gold as u32).await;
+                }
+                if item_uid > 0 {
+                    let _ = db.claim_mail_item(id);
+                    // 物品所有权已在寄出时转移；此处仅作确认
+                }
+                let _ = tx.send(sys(&format!("✓ 已领取附件: 金币 {}, 物品 {}", gold, if item_uid>0 {"有"} else {"无"}))).await;
+            } else { let _ = tx.send(sys("用法: /mail_reward <id>")).await; }
+        }
+        "/mail_delete" => {
+            let char_index = world.get_player(oid).await.map(|p| p.character_index).unwrap_or(0);
+            if let Some(id) = cmd.get(1).and_then(|s| s.parse::<i64>().ok()) {
+                if db.get_mail(id, char_index).ok().flatten().is_some() {
+                    let _ = db.delete_mail(id);
+                    let _ = tx.send(sys("已删除邮件")).await;
+                } else { let _ = tx.send(sys("邮件不存在")).await; }
+            } else { let _ = tx.send(sys("用法: /mail_delete <id>")).await; }
+        }
+
+        // ------------------------- 任务 -------------------------
+        "/quest_accept" => {
+            let p = world.get_player(oid).await;
+            let (name, char_index) = match p {
+                Some(p) => (p.name, p.character_index),
+                None => return,
+            };
+            // 取当前触碰 NPC 对应的任务
+            let npc = { world.quest.lock().await.touched_npc(&name).map(|s| s.to_string()) };
+            let def = npc.and_then(|n| crate::quest::QUESTS.iter().find(|q| q.npc_name == n).cloned());
+            match def {
+                Some(q) => {
+                    let _ = db.accept_quest(char_index, q.id);
+                    let _ = tx.send(sys(&format!("✓ 已接受任务【{}】：{}", q.name, q.description))).await;
+                }
+                None => {
+                    let _ = tx.send(sys("请先走到任务管理员旁并触碰(CallNPC)，或 /quest_touch 任务管理员")).await;
+                }
+            }
+        }
+        "/quest_touch" => {
+            // 手动指定触碰某 NPC（调试/演示），便于不走近也能查进度
+            let name = world.get_player(oid).await.map(|p| p.name).unwrap_or_default();
+            if let Some(n) = cmd.get(1) {
+                world.quest.lock().await.touch(&name, n);
+                let _ = tx.send(sys(&format!("已触碰 NPC「{n}」，可用 /quest_accept 接受任务"))).await;
+            } else { let _ = tx.send(sys("用法: /quest_touch <NPC名>")).await; }
+        }
+        "/quest_status" => {
+            let char_index = world.get_player(oid).await.map(|p| p.character_index).unwrap_or(0);
+            let progress = db.load_quest_progress(char_index).unwrap_or_default();
+            if progress.is_empty() {
+                let _ = tx.send(sys("你还没有接受任何任务")).await;
+            } else {
+                let lines = progress.iter().map(|prog| {
+                    let def = crate::quest::QUESTS.iter().find(|q| q.id == prog.quest_id);
+                    match def {
+                        Some(d) => {
+                            let target = match d.objective {
+                                crate::quest::QuestObjective::Kill { count, .. } => count,
+                            };
+                            let state = if prog.finished { "✓已领奖".to_string() }
+                                else if prog.completed { "可领奖".to_string() }
+                                else { format!("{}/{}", prog.killed, target) };
+                            format!("[{}] {} {}", d.id, d.name, state)
+                        }
+                        None => format!("[{}] (未知任务)", prog.quest_id),
+                    }
+                }).collect::<Vec<_>>().join("; ");
+                let _ = tx.send(sys(&format!("任务: {lines}"))).await;
+            }
+        }
+        "/quest_reward" => {
+            let char_index = world.get_player(oid).await.map(|p| p.character_index).unwrap_or(0);
+            // 领取当前触碰 NPC 对应任务奖励；若无触碰则领取首个已完成未领奖的任务
+            let name = world.get_player(oid).await.map(|p| p.name).unwrap_or_default();
+            let touched = { world.quest.lock().await.touched_npc(&name).map(|s| s.to_string()) };
+            let quest_id: Option<u32> = {
+                let progress = db.load_quest_progress(char_index).unwrap_or_default();
+                touched
+                    .and_then(|n| crate::quest::QUESTS.iter().find(|q| q.npc_name == n).map(|q| q.id))
+                    .or_else(|| progress.iter().find(|p| p.completed && !p.finished).map(|p| p.quest_id))
+            };
+            match quest_id {
+                Some(qid) => {
+                    match crate::quest::reward(char_index, qid, &db) {
+                        Ok((def, gold, exp)) => {
+                            let _ = gain_gold(world, oid, gold).await;
+                            gain_experience(world, oid, exp).await;
+                            if def.reward_item > 0 {
+                                if let Some(p) = world.get_player(oid).await {
+                                    let _ = db.add_item_to_inventory(p.character_index, def.reward_item, def.reward_item_count);
+                                }
+                            }
+                            let _ = tx.send(sys(&format!(
+                                "✓ 领取任务【{}】奖励: 金币{} 经验{} 物品{}",
+                                def.name, gold, exp,
+                                if def.reward_item>0 { format!("{}x{}", def.reward_item, def.reward_item_count) } else { "无".into() }
+                            ))).await;
+                        }
+                        Err(e) => { let _ = tx.send(sys(&format!("无法领取: {e}"))).await; }
+                    }
+                }
+                None => { let _ = tx.send(sys("没有可领取的任务奖励（任务需完成且未领奖）")).await; }
+            }
+        }
+        "/quest_forget" => {
+            let char_index = world.get_player(oid).await.map(|p| p.character_index).unwrap_or(0);
+            if let Some(id) = cmd.get(1).and_then(|s| s.parse::<u32>().ok()) {
+                let _ = db.forget_quest(char_index, id);
+                let _ = tx.send(sys("已放弃任务")).await;
+            } else { let _ = tx.send(sys("用法: /quest_forget <任务ID>")).await; }
+        }
+
+        // 仓库查看（仓库存取走 SelectGame/Slot 协议：StoreItem 存入 / TakeBackItem 取出）
+        "/storage" | "/仓库" => {
+            let char_index = world.get_player(oid).await.map(|p| p.character_index).unwrap_or(0);
+            let slots = db.storage_slots(char_index).unwrap_or_default();
+            let occupied = slots.iter().enumerate()
+                .filter_map(|(i, s)| s.as_ref().map(|it| format!("槽{i}:#{}x{}", it.item_index, it.count)))
+                .collect::<Vec<_>>();
+            if occupied.is_empty() {
+                let _ = tx.send(sys("仓库为空（容量 48）。用 StoreItem/TakeBackItem 协议存入/取出，或/help")).await;
+            } else {
+                let _ = tx.send(sys(&format!("仓库 {} 件: {}", occupied.len(), occupied.join("; ")))).await;
+            }
+        }
+
+        // 好友
+        "/friends" | "/好友" => {
+            let char_index = world.get_player(oid).await.map(|p| p.character_index).unwrap_or(0);
+            let online: std::collections::HashSet<i32> =
+                world.players.lock().await.values().map(|p| p.character_index).collect();
+            let rows = db.friend_rows(char_index).unwrap_or_default();
+            if rows.is_empty() {
+                let _ = tx.send(sys("好友列表为空。用 /friend_add <角色名> 添加")).await;
+            } else {
+                let txt = rows.iter().map(|(idx, name, _m, _b)| {
+                    format!("{}{}", name, if online.contains(idx) { "[在线]" } else { "[离线]" })
+                }).collect::<Vec<_>>().join("; ");
+                let _ = tx.send(sys(&format!("好友 {} 人: {}", rows.len(), txt))).await;
+            }
+        }
+        "/friend_add" => {
+            let char_index = world.get_player(oid).await.map(|p| p.character_index).unwrap_or(0);
+            if let Some(n) = cmd.get(1) {
+                let (ok, _) = db.add_friend(char_index, n, "", false).unwrap_or((false, None));
+                let _ = tx.send(sys(if ok { "✓ 已添加好友" } else { "添加失败（不存在/已是好友/加自己）" })).await;
+            } else { let _ = tx.send(sys("用法: /friend_add <角色名>")).await; }
+        }
+        "/friend_del" => {
+            let char_index = world.get_player(oid).await.map(|p| p.character_index).unwrap_or(0);
+            if let Some(idx) = cmd.get(1).and_then(|s| s.parse::<i32>().ok()) {
+                let _ = db.remove_friend(char_index, idx);
+                let _ = tx.send(sys("已移除好友")).await;
+            } else { let _ = tx.send(sys("用法: /friend_del <好友角色索引>（/friends 可看）")).await; }
+        }
+
+        // ------------------------- 师徒 -------------------------
+        "/mentor" => {
+            if let Some(target) = cmd.get(1) {
+                chat_mentor_request(world, oid, target, tx).await;
+            } else { let _ = tx.send(sys("用法: /mentor <师父角色名>")).await; }
+        }
+        "/mentor_accept" => {
+            // 视作收到 MentorReply{accept=true}
+            handle_mentor_reply(world, db, oid, true, tx).await;
+        }
+        "/mentor_refuse" => {
+            handle_mentor_reply(world, db, oid, false, tx).await;
+        }
+        "/mentor_cancel" => {
+            handle_mentor_cancel(world, db, oid, tx).await;
+        }
+        "/mentor_toggle" => {
+            let mut players = world.players.lock().await;
+            if let Some(p) = players.get_mut(&oid) {
+                p.can_be_mentor = !p.can_be_mentor;
+                let v = p.can_be_mentor;
+                let _ = tx.send(sys(if v { "已开启收徒（他人可 /mentor 你）" } else { "已关闭收徒" })).await;
+            }
+        }
+
+        // ------------------------- 婚姻 -------------------------
+        "/marry" => {
+            let my_name = world.get_player(oid).await.map(|p| p.name.clone()).unwrap_or_default();
+            if let Some(target) = cmd.get(1) {
+                let target_oid = match player_oid_by_name(world, target).await {
+                    Some(o) => o,
+                    None => { let _ = tx.send(sys(&format!("玩家 {target} 不在线"))).await; return; }
+                };
+                if target_oid == oid {
+                    let _ = tx.send(sys("不能和自己结婚")).await; return;
+                }
+                // 记录双方待确认
+                {
+                    let mut players = world.players.lock().await;
+                    if let Some(me) = players.get_mut(&oid) {
+                        me.pending_marriage = Some(target.to_string());
+                    }
+                    if let Some(sp) = players.get_mut(&target_oid) {
+                        sp.pending_marriage = Some(my_name.clone());
+                    }
+                }
+                world.send_to(target_oid, encode_packet(&s::MarriageRequest { name: my_name.clone() })).await;
+                let _ = tx.send(sys(&format!("已向 {target} 求婚（对方 /marry_accept 接受）"))).await;
+            } else { let _ = tx.send(sys("用法: /marry <角色名>")).await; }
+        }
+        "/marry_accept" => {
+            handle_marriage_reply(world, db, oid, true, tx).await;
+        }
+        "/marry_refuse" => {
+            handle_marriage_reply(world, db, oid, false, tx).await;
+        }
+        "/divorce" => {
+            handle_divorce(world, db, oid, tx).await;
+        }
+
         "/help" | "/?" => {
-            let _ = tx.send(sys("命令: /map <index> /spawn /guild_create <名> /guild_join <名> /guild /market /market_sell <槽> <价> /market_buy <id> /market_cancel <id> /trade_req <名> /trade_accept /trade_gold <n> /trade_item <槽> /trade_confirm /trade_cancel")).await;
+            let _ = tx.send(sys("命令: /map <index> /spawn /guild_create <名> /guild_join <名> /guild /market /market_sell <槽> <价> /market_buy <id> /market_cancel <id> /trade_req <名> /trade_accept /trade_gold <n> /trade_item <槽> /trade_confirm /trade_cancel /mail /mail_send <名> <金币> <标题> /mail_send_item <名> <槽> <标题> /mail_read <id> /mail_reward <id> /mail_delete <id> /quest_accept /quest_status /quest_reward /quest_forget <id> /storage /friends /friend_add <名> /friend_del <索引> /mentor <师父> /mentor_accept /mentor_toggle /mentor_cancel /marry <名> /marry_accept /divorce")).await;
         }
         _ => {
             let _ = tx.send(sys(&format!("未知命令 {full}"))).await;
@@ -1078,6 +2402,432 @@ async fn handle_drop_item(
         send_slots_refresh(world, db, oid, player.character_index, tx).await;
     }
     Ok(())
+}
+
+/// 丢弃金币到脚下（扣除背包/身上金币，生成地面金币堆）。
+async fn handle_drop_gold(world: &World, oid: u32, amount: u32) {
+    if amount == 0 {
+        return;
+    }
+    // 余额校验并扣除
+    if !remove_gold(world, oid, amount).await {
+        return;
+    }
+    drop_gold(world, oid, amount).await;
+}
+
+/// 修理装备：按缺失耐久计费，扣除金币后修复。
+async fn handle_repair_item(
+    world: &World,
+    db: &Database,
+    oid: u32,
+    unique_id: u64,
+    tx: &mpsc::Sender<Vec<u8>>,
+) {
+    let Some(player) = world.get_player(oid).await else { return };
+    let char_index = player.character_index;
+    // 单点耐久价格
+    let price_per = 1u32;
+    let Some((_cd, _md, cost)) = db.repair_item(char_index, unique_id, price_per).unwrap_or(None) else {
+        send_sys(world, oid, "无法修理：物品不存在或无需修理").await;
+        return;
+    };
+    if cost > 0 {
+        if !remove_gold(world, oid, cost).await {
+            send_sys(world, oid, &format!("金币不足，修理需 {} 金币", cost)).await;
+            return;
+        }
+        let _ = db.apply_repair(char_index, unique_id);
+        send_sys(world, oid, &format!("✓ 已修理，花费 {} 金币", cost)).await;
+    } else {
+        send_sys(world, oid, "物品耐久是满的，无需修理").await;
+    }
+    // 同步内存中对应装备/背包物品的耐久，并重算属性
+    {
+        let mut players = world.players.lock().await;
+        if let Some(p) = players.get_mut(&oid) {
+            for (_slot, item) in p.equipment.iter_mut() {
+                if item.unique_id == unique_id && item.max_dura > 0 {
+                    item.current_dura = item.max_dura;
+                }
+            }
+            recompute_stats(p);
+        }
+    }
+    send_slots_refresh(world, db, oid, char_index, tx).await;
+}
+
+// ------------------------- 查看玩家（Inspect / Observe） -------------------------
+
+/// 回 PlayerInspect：查看目标玩家装备/等级/职业。
+async fn handle_inspect(
+    world: &World,
+    tx: &mpsc::Sender<Vec<u8>>,
+    oid: u32,
+    target_id: u32,
+) {
+    let Some(target) = world.get_player(target_id).await else { return };
+    let name = target.name.clone();
+    let guild_name = world
+        .guild
+        .lock()
+        .await
+        .guild_of(&name)
+        .map(|g| g.name.clone())
+        .unwrap_or_default();
+    let equipment = equipment_slots(&target);
+    tx.send(encode_packet(&s::PlayerInspect {
+        name,
+        guild_name,
+        guild_rank: String::new(),
+        equipment,
+        class: target.class as u8,
+        gender: target.gender as u8,
+        hair: 0,
+        level: target.level,
+        lover_name: String::new(),
+        allow_observe: true,
+        is_hero: false,
+    }))
+    .await
+    .ok();
+}
+
+/// 按名字观察玩家：Observe
+async fn handle_inspect_observe(
+    world: &World,
+    tx: &mpsc::Sender<Vec<u8>>,
+    oid: u32,
+    name: &str,
+) {
+    let tid = {
+        let players = world.players.lock().await;
+        players.values().find(|p| p.name == name).map(|p| p.object_id)
+    };
+    if let Some(tid) = tid {
+        handle_inspect(world, tx, oid, tid).await;
+    }
+}
+
+// ------------------------- 好友 -------------------------
+
+/// 读取好友列表并按在线状态发给客户端（FriendUpdate）。
+async fn send_friends(
+    world: &World,
+    db: &Database,
+    tx: &mpsc::Sender<Vec<u8>>,
+    oid: u32,
+) {
+    let Some(p) = world.get_player(oid).await else { return };
+    let char_index = p.character_index;
+    let online: std::collections::HashSet<i32> = world
+        .players
+        .lock()
+        .await
+        .values()
+        .map(|pl| pl.character_index)
+        .collect();
+    let friends: Vec<crystal_protocol::types::ClientFriend> = db
+        .friend_rows(char_index)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(idx, name, memo, blocked)| crystal_protocol::types::ClientFriend {
+            index: idx,
+            name,
+            memo,
+            blocked,
+            online: online.contains(&idx),
+        })
+        .collect();
+    tx.send(encode_packet(&s::FriendUpdate { friends })).await.ok();
+}
+
+/// 添加好友并刷新列表
+async fn handle_add_friend(
+    world: &World,
+    db: &Database,
+    tx: &mpsc::Sender<Vec<u8>>,
+    oid: u32,
+    name: &str,
+    blocked: bool,
+) {
+    let Some(p) = world.get_player(oid).await else { return };
+    let (ok, _fi) = db.add_friend(p.character_index, name, "", blocked).unwrap_or((false, None));
+    let msg = if ok {
+        format!("✓ 已添加好友 {name}")
+    } else {
+        "添加失败：角色不存在、已是好友或不能加自己".to_string()
+    };
+    send_sys(world, oid, &msg).await;
+    send_friends(world, db, tx, oid).await;
+}
+
+// ------------------------- 信息请求 -------------------------
+
+/// RequestMapInfo：回地图信息
+async fn handle_request_map_info(world: &World, tx: &mpsc::Sender<Vec<u8>>, oid: u32, map_index: i32) {
+    let map = world.maps.read().unwrap().get(&(map_index as u32)).cloned();
+    let Some(map) = map else { return };
+    let (w, h) = (map.width as i32, map.height as i32);
+    tx.send(encode_packet(&s::NewMapInfo {
+        map_index: map.index as i32,
+        info: crystal_protocol::types::ClientMapInfo {
+            title: format!("地图 {}", map.index),
+            width: w,
+            height: h,
+            big_map: 0,
+            movements: vec![],
+            npcs: vec![],
+        },
+    }))
+    .await
+    .ok();
+    tx.send(encode_packet(&s::MapInformation {
+        map_index: map.index as i32,
+        file_name: format!("{}", map.index),
+        title: format!("地图 {}", map.index),
+        mini_map: 0,
+        big_map: 0,
+        lights: 0,
+        lightning: false,
+        fire: false,
+        map_dark_light: 0,
+        music: 0,
+        weather_particles: 0,
+    }))
+    .await
+    .ok();
+    let _ = oid;
+}
+
+/// RequestItemInfo：回物品信息
+async fn handle_request_item_info(tx: &mpsc::Sender<Vec<u8>>, oid: u32, item_index: i32) {
+    let Some(t) = items::find(item_index) else { return };
+    tx.send(encode_packet(&s::NewItemInfo {
+        info: crystal_protocol::types::ItemInfo {
+            index: t.index,
+            name: t.name.to_string(),
+            item_type: t.item_type,
+            grade: 0,
+            required_type: 0,
+            required_class: 0,
+            required_gender: 0,
+            set: 0,
+            shape: 0,
+            weight: 0,
+            light: 0,
+            required_amount: 0,
+            image: t.image,
+            durability: t.max_dura,
+            stack_size: 1,
+            price: t.price,
+            start_item: false,
+            effect: 0,
+            need_identify: false,
+            show_group_pickup: false,
+            class_based: false,
+            level_based: false,
+            can_mine: false,
+            global_drop_notify: false,
+            bind: 0,
+            unique: 0,
+            random_stats_id: 0,
+            can_fast_run: false,
+            can_awakening: false,
+            slots: 0,
+            stats: Default::default(),
+            tool_tip: None,
+        },
+    }))
+    .await
+    .ok();
+    let _ = oid;
+}
+
+/// RequestNPCInfo：回 NPC 信息
+async fn handle_request_npc_info(world: &World, tx: &mpsc::Sender<Vec<u8>>, oid: u32, npc_index: i32) {
+    let npcs = world.npcs().await;
+    if let Some(n) = npcs.iter().find(|n| n.object_id as i32 == npc_index) {
+        tx.send(encode_packet(&s::NewNPCInfo {
+            info: crystal_protocol::types::ClientNpcInfo {
+                index: npc_index,
+                file_name: String::new(),
+                name: n.name.clone(),
+                map_index: n.map_index as i32,
+                location: n.location,
+                image: n.image,
+                rate: 0,
+                show_on_big_map: false,
+                big_map_icon: 0,
+                object_id: n.object_id,
+                icon: 0,
+                can_teleport_to: false,
+            },
+        }))
+        .await
+        .ok();
+    }
+    let _ = oid;
+}
+
+/// 回购：把最近出售的物品买回背包（按售出价计费）。
+async fn handle_buy_back(
+    world: &World,
+    db: &Database,
+    oid: u32,
+    unique_id: u64,
+    count: u16,
+) {
+    let Some(player) = world.get_player(oid).await else { return };
+    let (item_index, sold_count, price) = {
+        let players = world.players.lock().await;
+        let p = players.get(&oid);
+        match p.and_then(|p| p.recently_sold.iter().find(|(u, _, _, _)| *u == unique_id).cloned()) {
+            Some((_, idx, sc, pr)) => (idx, sc, pr),
+            None => { let _ = (count,); return; }
+        }
+    };
+    let _ = sold_count;
+    if price == 0 || !items::exists(item_index) {
+        return;
+    }
+    // 扣除金币后放回背包
+    if !remove_gold(world, oid, price).await {
+        send_sys(world, oid, "金币不足，无法回购").await;
+        return;
+    }
+    if db.add_item_to_inventory(player.character_index, item_index, 1).unwrap_or(false) {
+        // 从最近出售中移除
+        let mut players = world.players.lock().await;
+        if let Some(p) = players.get_mut(&oid) {
+            p.recently_sold.retain(|(u, _, _, _)| *u != unique_id);
+        }
+        drop(players);
+        send_sys(world, oid, &format!("✓ 已回购物品（花费 {} 金币）", price)).await;
+    } else {
+        gain_gold(world, oid, price).await; // 失败回退
+    }
+}
+
+/// RequestMonsterInfo：回怪物信息
+async fn handle_request_monster_info(tx: &mpsc::Sender<Vec<u8>>, oid: u32, monster_index: i32) {
+    if let Some(t) = crate::spawn_config::MONSTER_TEMPLATES.iter().find(|t| t.image as i32 == monster_index) {
+        tx.send(encode_packet(&s::NewMonsterInfo {
+            info: crystal_protocol::types::ClientMonsterInfo {
+                index: monster_index,
+                name: t.name.to_string(),
+                game_name: t.name.to_string(),
+                image: t.image,
+                ai: 0,
+                effect: 0,
+                level: t.level,
+                view_range: 5,
+                cool_eye: 0,
+                light: 0,
+                attack_speed: 0,
+                move_speed: 0,
+                experience: t.exp,
+                can_push: true,
+                can_tame: false,
+                auto_rev: false,
+                undead: false,
+                can_recall: false,
+                stats: Default::default(),
+            },
+        }))
+        .await
+        .ok();
+    }
+    let _ = oid;
+}
+
+/// RequestGuildInfo：回玩家所在公会的状态
+async fn handle_request_guild_info(world: &World, tx: &mpsc::Sender<Vec<u8>>, oid: u32, _type: u8) {
+    let name = world.get_player(oid).await.map(|p| p.name).unwrap_or_default();
+    if let Some(g) = world.guild.lock().await.guild_of(&name) {
+        let g = g.clone();
+        tx.send(encode_packet(&s::GuildStatus {
+            guild_name: g.name,
+            guild_rank_name: if g.owner == name { "会长".to_string() } else { "成员".to_string() },
+            level: 1,
+            experience: 0,
+            max_experience: 100,
+            gold: 0,
+            spare_points: 0,
+            member_count: g.members.len() as i32,
+            max_members: 100,
+            voting: false,
+            item_count: 0,
+            buff_count: 0,
+            my_options: 0,
+            my_rank_id: 0,
+        }))
+        .await
+        .ok();
+    } else {
+        send_sys(world, oid, "你不在任何公会").await;
+    }
+}
+
+/// SearchMap：搜索地图列表（以系统消息返回匹配项）
+async fn handle_search_map(world: &World, tx: &mpsc::Sender<Vec<u8>>, oid: u32, text: &str) {
+    let matches: Vec<u32> = {
+        let maps = world.maps.read().unwrap();
+        maps.keys()
+            .filter(|idx| idx.to_string().contains(text))
+            .copied()
+            .collect()
+    };
+    if matches.is_empty() {
+        send_sys(world, oid, &format!("未找到匹配「{text}」的地图")).await;
+    } else {
+        let list = matches.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(" ");
+        send_sys(world, oid, &format!("匹配地图: {list}")).await;
+    }
+    let _ = tx;
+}
+
+/// TeleportToNPC：传送到指定 NPC 位置
+async fn handle_teleport_to_npc(world: &World, oid: u32, npc_object_id: u32) {
+    let npcs = world.npcs().await;
+    if let Some(n) = npcs.iter().find(|n| n.object_id == npc_object_id) {
+        world.teleport_player(oid, n.map_index, n.location.x, n.location.y).await;
+        send_sys(world, oid, &format!("已传送至 NPC「{}」", n.name)).await;
+    }
+}
+
+/// EquipSlotItem：把背包物品穿戴到指定装备槽（等价 EquipItem 的简化版）
+async fn handle_equip_slot_item(
+    world: &World,
+    db: &Database,
+    oid: u32,
+    esi: &c::EquipSlotItem,
+    tx: &mpsc::Sender<Vec<u8>>,
+) {
+    let Some(player) = world.get_player(oid).await else { return };
+    let char_index = player.character_index;
+    if esi.grid != GRID_INVENTORY {
+        return;
+    }
+    let Some((_slot, item)) = db.find_inventory_item(char_index, esi.unique_id).ok().flatten() else { return };
+    let Some(tmpl) = items::find(item.item_index) else { return };
+    let valid = (tmpl.item_type == 1 && esi.to == 0) || (tmpl.item_type == 3 && esi.to == 1);
+    if !valid {
+        send_equip_fail(tx, &c::EquipItem { grid: esi.grid, unique_id: esi.unique_id, to: esi.to }).await;
+        return;
+    }
+    let outcome = db.equip_item(char_index, esi.unique_id, item.item_index, esi.to).unwrap_or(crate::db::EquipOutcome { returned_to_inventory: false });
+    if outcome.returned_to_inventory {
+        let mut players = world.players.lock().await;
+        if let Some(p) = players.get_mut(&oid) {
+            p.equipment.insert(esi.to, item.clone());
+            recompute_stats(p);
+        }
+        drop(players);
+        tx.send(encode_packet(&s::EquipItem { grid: esi.grid, unique_id: esi.unique_id, to: esi.to, success: true })).await.ok();
+    } else {
+        send_equip_fail(tx, &c::EquipItem { grid: esi.grid, unique_id: esi.unique_id, to: esi.to }).await;
+    }
 }
 
 /// 穿戴/卸下装备：grid=Inventory 穿戴到 to 装备槽；grid=Equipment 从 to 槽卸下。

@@ -12,6 +12,7 @@ mod magics;
 mod maps;
 mod market;
 mod net;
+mod quest;
 mod spawn_config;
 mod trade;
 mod web3;

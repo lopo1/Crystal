@@ -16,6 +16,8 @@ pub struct ItemTemplate {
     pub bonus: i32,
     /// 使用回复 HP 量（消耗品）
     pub heal: i32,
+    /// 最大耐久（装备用；消耗品/杂物为 0）
+    pub max_dura: u16,
 }
 
 /// 内置物品表（index -> 模板）
@@ -29,6 +31,7 @@ pub fn items() -> Vec<ItemTemplate> {
             image: 100,
             bonus: 2,
             heal: 0,
+            max_dura: 20,
         },
         ItemTemplate {
             index: 2,
@@ -38,6 +41,7 @@ pub fn items() -> Vec<ItemTemplate> {
             image: 101,
             bonus: 1,
             heal: 0,
+            max_dura: 25,
         },
         ItemTemplate {
             index: 3,
@@ -47,6 +51,7 @@ pub fn items() -> Vec<ItemTemplate> {
             image: 120,
             bonus: 0,
             heal: 30,
+            max_dura: 0,
         },
         ItemTemplate {
             index: 4,
@@ -56,6 +61,7 @@ pub fn items() -> Vec<ItemTemplate> {
             image: 121,
             bonus: 0,
             heal: 0,
+            max_dura: 0,
         },
         ItemTemplate {
             index: 5,
@@ -65,6 +71,7 @@ pub fn items() -> Vec<ItemTemplate> {
             image: 130,
             bonus: 0,
             heal: 0,
+            max_dura: 0,
         },
     ]
 }

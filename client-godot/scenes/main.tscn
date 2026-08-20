@@ -114,6 +114,15 @@ offset_right = 460.0
 offset_bottom = 460.0
 text = "进入游戏"
 
+[node name="DeleteCharButton" type="Button" parent="LoginPanel"]
+layout_mode = 1
+anchors_preset = 0
+offset_left = 470.0
+offset_top = 430.0
+offset_right = 590.0
+offset_bottom = 460.0
+text = "删除角色"
+
 [node name="NewCharName" type="LineEdit" parent="LoginPanel"]
 layout_mode = 1
 anchors_preset = 0
@@ -179,9 +188,233 @@ anchors_preset = 10
 anchor_right = 1.0
 offset_left = 8.0
 offset_top = 8.0
-offset_right = 400.0
+offset_right = 600.0
 offset_bottom = 30.0
 text = "位置: (400, 400)"
+
+[node name="HUD" type="Control" parent="GameView"]
+layout_mode = 1
+anchors_preset = 2
+anchor_top = 1.0
+anchor_bottom = 1.0
+offset_left = 8.0
+offset_top = -120.0
+offset_right = 300.0
+offset_bottom = -44.0
+
+[node name="HPBar" type="ColorRect" parent="GameView/HUD"]
+layout_mode = 1
+offset_left = 0.0
+offset_top = 0.0
+offset_right = 200.0
+offset_bottom = 16.0
+color = Color(0.5, 0.1, 0.1, 1)
+
+[node name="HPBarFill" type="ColorRect" parent="GameView/HUD"]
+layout_mode = 1
+offset_left = 0.0
+offset_top = 0.0
+offset_right = 200.0
+offset_bottom = 16.0
+color = Color(0.1, 0.8, 0.1, 1)
+
+[node name="HPLabel" type="Label" parent="GameView/HUD"]
+layout_mode = 1
+offset_left = 4.0
+offset_top = 0.0
+offset_right = 200.0
+offset_bottom = 16.0
+text = "HP: 100/100"
+horizontal_alignment = 1
+
+[node name="MPBar" type="ColorRect" parent="GameView/HUD"]
+layout_mode = 1
+offset_left = 0.0
+offset_top = 20.0
+offset_right = 200.0
+offset_bottom = 36.0
+color = Color(0.1, 0.1, 0.5, 1)
+
+[node name="MPBarFill" type="ColorRect" parent="GameView/HUD"]
+layout_mode = 1
+offset_left = 0.0
+offset_top = 20.0
+offset_right = 200.0
+offset_bottom = 36.0
+color = Color(0.2, 0.4, 0.9, 1)
+
+[node name="MPLabel" type="Label" parent="GameView/HUD"]
+layout_mode = 1
+offset_left = 4.0
+offset_top = 20.0
+offset_right = 200.0
+offset_bottom = 36.0
+text = "MP: 50/50"
+horizontal_alignment = 1
+
+[node name="XPBar" type="ColorRect" parent="GameView/HUD"]
+layout_mode = 1
+offset_left = 0.0
+offset_top = 40.0
+offset_right = 200.0
+offset_bottom = 56.0
+color = Color(0.3, 0.3, 0.1, 1)
+
+[node name="XPBarFill" type="ColorRect" parent="GameView/HUD"]
+layout_mode = 1
+offset_left = 0.0
+offset_top = 40.0
+offset_right = 200.0
+offset_bottom = 56.0
+color = Color(0.9, 0.8, 0.1, 1)
+
+[node name="XPLabel" type="Label" parent="GameView/HUD"]
+layout_mode = 1
+offset_left = 4.0
+offset_top = 40.0
+offset_right = 200.0
+offset_bottom = 56.0
+text = "EXP: 0/10"
+horizontal_alignment = 1
+
+[node name="LevelLabel" type="Label" parent="GameView/HUD"]
+layout_mode = 1
+offset_left = 0.0
+offset_top = 60.0
+offset_right = 100.0
+offset_bottom = 76.0
+text = "Lv.1"
+
+[node name="GoldLabel" type="Label" parent="GameView/HUD"]
+layout_mode = 1
+offset_left = 100.0
+offset_top = 60.0
+offset_right = 200.0
+offset_bottom = 76.0
+text = "金: 0"
+
+[node name="ControlsLabel" type="Label" parent="GameView/HUD"]
+layout_mode = 1
+offset_left = 0.0
+offset_top = 76.0
+offset_right = 300.0
+offset_bottom = 92.0
+text = "方向键:移动  空格:攻击  Z:拾取  C:对话  I:背包  R:复活  F1-F8:技能  Shift:跑  双击背包:使用/装备"
+horizontal_alignment = 0
+
+[node name="LogoutButton" type="Button" parent="GameView"]
+layout_mode = 1
+anchors_preset = 1
+anchor_left = 1.0
+anchor_right = 1.0
+offset_left = -120.0
+offset_top = 8.0
+offset_right = -8.0
+offset_bottom = 34.0
+text = "登出"
+
+[node name="InventoryPanel" type="PanelContainer" parent="GameView"]
+visible = false
+layout_mode = 1
+offset_left = 800.0
+offset_top = 60.0
+offset_right = 1120.0
+offset_bottom = 500.0
+
+[node name="VBox" type="VBoxContainer" parent="GameView/InventoryPanel"]
+layout_mode = 2
+theme_override_constants/separation = 4
+
+[node name="Title" type="Label" parent="GameView/InventoryPanel/VBox"]
+layout_mode = 2
+text = "背包 (I 关闭)"
+horizontal_alignment = 1
+
+[node name="ItemList" type="ItemList" parent="GameView/InventoryPanel/VBox"]
+layout_mode = 2
+custom_minimum_size = Vector2(280, 250)
+
+[node name="NPCDialog" type="PanelContainer" parent="GameView"]
+visible = false
+layout_mode = 1
+offset_left = 200.0
+offset_top = 100.0
+offset_right = 600.0
+offset_bottom = 400.0
+
+[node name="VBox" type="VBoxContainer" parent="GameView/NPCDialog"]
+layout_mode = 2
+theme_override_constants/separation = 8
+
+[node name="NPCName" type="Label" parent="GameView/NPCDialog/VBox"]
+layout_mode = 2
+text = "NPC"
+horizontal_alignment = 1
+
+[node name="DialogText" type="RichTextLabel" parent="GameView/NPCDialog/VBox"]
+layout_mode = 2
+custom_minimum_size = Vector2(380, 150)
+
+[node name="CloseButton" type="Button" parent="GameView/NPCDialog"]
+layout_mode = 1
+anchors_preset = 7
+anchor_left = 0.5
+anchor_top = 1.0
+anchor_right = 0.5
+anchor_bottom = 1.0
+offset_left = -40.0
+offset_top = -30.0
+offset_right = 40.0
+offset_bottom = -4.0
+text = "关闭"
+
+[node name="ShopPanel" type="PanelContainer" parent="GameView"]
+visible = false
+layout_mode = 1
+offset_left = 200.0
+offset_top = 100.0
+offset_right = 550.0
+offset_bottom = 420.0
+
+[node name="VBox" type="VBoxContainer" parent="GameView/ShopPanel"]
+layout_mode = 2
+theme_override_constants/separation = 4
+
+[node name="ShopTitle" type="Label" parent="GameView/ShopPanel/VBox"]
+layout_mode = 2
+text = "商店"
+horizontal_alignment = 1
+
+[node name="ItemList" type="ItemList" parent="GameView/ShopPanel/VBox"]
+layout_mode = 2
+custom_minimum_size = Vector2(330, 240)
+
+[node name="CloseButton" type="Button" parent="GameView/ShopPanel"]
+layout_mode = 1
+anchors_preset = 7
+anchor_left = 0.5
+anchor_top = 1.0
+anchor_right = 0.5
+anchor_bottom = 1.0
+offset_left = -40.0
+offset_top = -30.0
+offset_right = 40.0
+offset_bottom = -4.0
+text = "关闭"
+
+[node name="SkillBar" type="HBoxContainer" parent="GameView"]
+layout_mode = 1
+anchors_preset = 7
+anchor_left = 0.5
+anchor_top = 1.0
+anchor_right = 0.5
+anchor_bottom = 1.0
+offset_left = -350.0
+offset_top = -44.0
+offset_right = 350.0
+offset_bottom = -12.0
+theme_override_constants/separation = 4
+alignment = 1
 
 [node name="ChatLog" type="RichTextLabel" parent="GameView"]
 layout_mode = 1
@@ -191,7 +424,7 @@ anchor_bottom = 1.0
 offset_left = 8.0
 offset_top = -160.0
 offset_right = 600.0
-offset_bottom = -44.0
+offset_bottom = -124.0
 scroll_active = false
 
 [node name="ChatInput" type="LineEdit" parent="GameView"]

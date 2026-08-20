@@ -75,6 +75,26 @@ pub struct Player {
     pub equipment: std::collections::BTreeMap<i32, UserItem>,
     /// 当前所在地图编号（默认 0）
     pub map_index: u32,
+    /// 自动喝药：要自动使用的消耗品 item_index（0=关闭）
+    pub auto_pot_item: i32,
+    /// 自动喝药：HP 低于该阈值时触发
+    pub auto_pot_hp: u32,
+    /// 最近出售记录：(unique_id, item_index, count, 售出价)，供 NPC 回购
+    pub recently_sold: Vec<(u64, i32, u16, u32)>,
+    /// 钓鱼：是否正抛竿
+    pub fishing: bool,
+    /// 钓鱼进度 0..100
+    pub fishing_progress: u16,
+    /// 自动抛竿：钓到后是否继续
+    pub auto_fish: bool,
+    /// 本会话是否已解锁仓库密码
+    pub storage_unlocked: bool,
+    /// 待确认的 mentor 邀请（对方角色名）
+    pub pending_mentor: Option<String>,
+    /// 是否允许他人邀请我收徒
+    pub can_be_mentor: bool,
+    /// 待确认的结婚邀请（对方角色名）
+    pub pending_marriage: Option<String>,
 }
 
 /// 地面掉落物
@@ -86,6 +106,8 @@ pub struct GroundItem {
     pub location: Point,
     pub unique_id: u64,
     pub map_index: u32,
+    /// 金币堆：>0 表示这是一个金币掉落，而不是物品
+    pub gold: u32,
 }
 
 /// 怪物
@@ -147,6 +169,8 @@ pub struct World {
     pub trade: Arc<Mutex<crate::trade::TradeManager>>,
     pub guild: Arc<Mutex<crate::guild::GuildManager>>,
     pub market: Arc<Mutex<crate::market::MarketManager>>,
+    /// 任务管理器（记录触碰的 NPC，供对话接任务）
+    pub quest: Arc<Mutex<crate::quest::QuestManager>>,
 }
 
 /// 无真实地图时的程序化空地图（保持原有 800x800 全通行为，供无头/缺图运行）
@@ -192,6 +216,7 @@ impl World {
             trade: Arc::new(Mutex::new(crate::trade::TradeManager::new())),
             guild: Arc::new(Mutex::new(crate::guild::GuildManager::new())),
             market: Arc::new(Mutex::new(crate::market::MarketManager::new())),
+            quest: Arc::new(Mutex::new(crate::quest::QuestManager::new())),
         }
     }
 
@@ -533,12 +558,17 @@ impl World {
     pub async fn add_ground_item(&self, gi: GroundItem) {
         let _ = gi.unique_id;
         let mi = gi.map_index;
+        let (name, image) = if gi.gold > 0 {
+            ("金币".to_string(), 0u16)
+        } else {
+            (format!("#{}", gi.item_index), gi.item_index as u16)
+        };
         self.broadcast_on(mi, encode_packet(&s::ObjectItem {
             object_id: gi.object_id,
-            name: format!("#{}", gi.item_index),
+            name,
             name_colour: Argb(0),
             location: gi.location,
-            image: gi.item_index as u16,
+            image,
             grade: 0,
         })).await;
         self.items.lock().await.insert(gi.object_id, gi);
@@ -665,6 +695,52 @@ async fn seed_world(world: &World) {
             }));
         world.npcs.lock().await.push(npc);
 
+        // 任务管理员 NPC：触碰它(CallNPC)可对话接任务（猎杀骷髅/除蜘蛛）
+        let (qx, qy) = world.nearest_walkable(402, 400);
+        let quest_npc = Npc {
+            object_id: world.next_object_id(),
+            name: "任务管理员".to_string(),
+            image: 0,
+            location: Point::new(qx, qy),
+            shop_items: vec![],
+            map_index: 0,
+        };
+        world
+            .broadcast_on(0, encode_packet(&s::ObjectPlayer {
+                object_id: quest_npc.object_id,
+                name: quest_npc.name.clone(),
+                guild_name: String::new(),
+                guild_rank_name: String::new(),
+                name_colour: Argb(0xFF55FF55),
+                class: MirClass::Warrior,
+                gender: MirGender::Male,
+                level: 1,
+                location: quest_npc.location,
+                direction: MirDirection::Down,
+                hair: 0,
+                light: 0,
+                weapon: 0,
+                weapon_effect: 0,
+                armour: 0,
+                poison: 0,
+                dead: false,
+                hidden: false,
+                effect: 0,
+                wing_effect: 0,
+                extra: false,
+                mount_type: 0,
+                riding_mount: false,
+                fishing: false,
+                transform_type: 0,
+                element_orb_effect: 0,
+                element_orb_lvl: 0,
+                element_orb_max: 0,
+                buffs: vec![],
+                level_effects: crystal_protocol::types::LevelEffects(0),
+            }))
+            .await;
+        world.npcs.lock().await.push(quest_npc);
+
         // 传送门标记 NPC（在新手村，踏上其所在格即传送到 0100）
         let (pw, ph) = world.nearest_walkable(404, 412);
         let portal_npc = Npc {
@@ -683,11 +759,73 @@ async fn seed_world(world: &World) {
 
 async fn world_tick(world: &World, db: &crate::db::Database, tick: u32) {
     respawn_monsters(world).await;
-    monster_ai(world).await;
-    regen_players(world).await;
+    monster_ai(world, db).await;
+    regen_players(world, db).await;
+    fishing_tick(world, db).await;
     // 每 25 tick（约 10 秒）周期性持久化玩家状态，降低掉线/宕机丢失进度风险
     if tick % 25 == 0 {
         persist_all_players(world, db).await;
+    }
+}
+
+/// 钓鱼 tick：每 tick 给正在抛竿的玩家加进度；进度到 100 即“上钩”，随机钓起物品入库。
+async fn fishing_tick(world: &World, db: &crate::db::Database) {
+    // 先收集上钩事件，避免在锁内调用 IO
+    let mut catches: Vec<(u32, i32, u16)> = Vec::new(); // (oid, item_index, count)
+    let mut stop_fishing: Vec<u32> = Vec::new();
+    {
+        let mut players = world.players.lock().await;
+        for p in players.values_mut() {
+            if !p.fishing {
+                continue;
+            }
+            p.fishing_progress = p.fishing_progress.saturating_add(8);
+            if p.fishing_progress >= 100 {
+                // 上钩：从演示掉落 [3 金创药, 5 铜币袋] 随机一个
+                use rand::seq::IteratorRandom;
+                let idx = {
+                    let mut rng = rand::thread_rng();
+                    *[3i32, 5].iter().choose(&mut rng).unwrap()
+                };
+                catches.push((p.object_id, idx, 1));
+                p.fishing_progress = 0;
+                if !p.auto_fish {
+                    p.fishing = false;
+                    stop_fishing.push(p.object_id);
+                }
+            }
+        }
+    }
+    for (oid, item_index, count) in catches {
+        let Some(player) = world.get_player(oid).await else { continue };
+        let ok = db.add_item_to_inventory(player.character_index, item_index, count).unwrap_or(false);
+        if ok {
+            let item = UserItem {
+                unique_id: 0,
+                item_index,
+                count,
+                current_dura: 0,
+                max_dura: 0,
+                ..Default::default()
+            };
+            world.send_to(oid, encode_packet(&s::GainedItem { item })).await;
+        } else {
+            world.send_to(oid, encode_packet(&s::ObjectChat {
+                object_id: oid,
+                text: "背包已满，未能拾取钓到的物品".to_string(),
+                r#type: 1,
+            })).await;
+        }
+    }
+    for oid in stop_fishing {
+        world.send_to(oid, encode_packet(&s::FishingUpdate {
+            object_id: oid,
+            fishing: false,
+            progress_percent: 0,
+            chance_percent: 0,
+            fishing_point: world.get_player(oid).await.map(|p| p.location).unwrap_or(SPAWN),
+            found_fish: false,
+        })).await;
     }
 }
 
@@ -719,7 +857,7 @@ async fn respawn_monsters(world: &World) {
 ///
 /// - 感知半径 `MONSTER_PERCEPTION`：进入的玩家会被设为仇恨目标（主动索敌）。
 /// - `MONSTER_LEASH`：追击超过此距离则脱战，清空仇恨。
-async fn monster_ai(world: &World) {
+async fn monster_ai(world: &World, db: &crate::db::Database) {
     const PERCEPTION: i32 = 5;
     const LEASH: i32 = 12;
 
@@ -805,7 +943,7 @@ async fn monster_ai(world: &World) {
             .await;
     }
     for (mid, pid, dmg) in attacks {
-        monster_hit_player(world, mid, pid, dmg).await;
+        monster_hit_player(world, db, mid, pid, dmg).await;
     }
 }
 
@@ -839,8 +977,9 @@ fn dir_from_delta(dx: i32, dy: i32) -> MirDirection {
 }
 
 /// 玩家生命回复
-async fn regen_players(world: &World) {
+async fn regen_players(world: &World, db: &crate::db::Database) {
     let mut to_heal: Vec<(u32, i32, i32)> = Vec::new();
+    let mut to_autopot: Vec<(u32, i32)> = Vec::new();
     {
         let players = world.players.lock().await;
         for p in players.values() {
@@ -848,6 +987,10 @@ async fn regen_players(world: &World) {
                 let nhp = (p.hp + 4).min(p.max_hp);
                 let nmp = (p.mp + 2).min(p.max_mp);
                 to_heal.push((p.object_id, nhp, nmp));
+            }
+            // 自动喝药：血量低于阈值且有配置的消耗品
+            if p.auto_pot_item > 0 && p.auto_pot_hp > 0 && (p.hp as u32) <= p.auto_pot_hp {
+                to_autopot.push((p.object_id, p.auto_pot_item));
             }
         }
     }
@@ -860,6 +1003,29 @@ async fn regen_players(world: &World) {
         drop(players);
         world.send_to(oid, encode_packet(&s::HealthChanged { hp, mp })).await;
     }
+    for (oid, item_index) in to_autopot {
+        auto_pot(world, db, oid, item_index).await;
+    }
+}
+
+/// 自动喝药：从背包中找到指定消耗品并使用一个（回复 HP 并扣除一格）。
+async fn auto_pot(world: &World, db: &crate::db::Database, player_id: u32, item_index: i32) {
+    let Some(player) = world.get_player(player_id).await else { return };
+    let char_index = player.character_index;
+    // 在背包中找该 item_index 的物品
+    let uid = db
+        .load_inventory(char_index)
+        .ok()
+        .and_then(|inv| inv.into_iter().find(|(_, it)| it.item_index == item_index).map(|(_, it)| it.unique_id));
+    let Some(uid) = uid else { return };
+    // 找到物品模板并确认是消耗品（heal>0）
+    if !crate::items::find(item_index).map(|t| t.heal > 0).unwrap_or(false) {
+        return;
+    }
+    let Some((_slot, item)) = db.find_inventory_item(char_index, uid).ok().flatten() else { return };
+    if use_consumable(world, player_id, item.clone()).await {
+        let _ = db.consume_inventory_item(char_index, uid);
+    }
 }
 
 fn manhattan(a: Point, b: Point) -> i32 {
@@ -871,7 +1037,12 @@ fn manhattan(a: Point, b: Point) -> i32 {
 // ---------------------------------------------------------------------------
 
 /// 玩家攻击：命中正前方相邻格内的怪物并结算。返回是否命中。
-pub async fn player_attack(world: &World, player_id: u32, direction: MirDirection) -> bool {
+pub async fn player_attack(
+    world: &World,
+    db: &crate::db::Database,
+    player_id: u32,
+    direction: MirDirection,
+) -> bool {
     let Some(player) = world.get_player(player_id).await else {
         return false;
     };
@@ -918,7 +1089,8 @@ pub async fn player_attack(world: &World, player_id: u32, direction: MirDirectio
         let m = mons.get(&monster_id).unwrap();
         (player.attack + rand_range(1, 3) - m.defence.max(0)).max(1)
     };
-    player_hit_monster(world, player_id, monster_id, dmg).await;
+    player_hit_monster(world, db, player_id, monster_id, dmg).await;
+    damage_equipment(world, db, player_id, 0, 1).await; // 武器耐久消耗
     true
 }
 
@@ -926,6 +1098,7 @@ pub async fn player_attack(world: &World, player_id: u32, direction: MirDirectio
 /// 返回是否施放成功（射程内有目标且有足额 MP）。
 pub async fn player_magic_attack(
     world: &World,
+    db: &crate::db::Database,
     player_id: u32,
     direction: MirDirection,
     spell: u8,
@@ -1010,7 +1183,7 @@ pub async fn player_magic_attack(
 
     // 命中结算（复用物理近战的击杀/掉落/经验逻辑）
     let dmg = (tmpl.damage + player.attack / 2 - monster_defence(world, target_id).await.max(0)).max(1);
-    player_hit_monster(world, player_id, target_id, dmg).await;
+    player_hit_monster(world, db, player_id, target_id, dmg).await;
     true
 }
 
@@ -1019,7 +1192,13 @@ async fn monster_defence(world: &World, monster_id: u32) -> i32 {
     mons.get(&monster_id).map(|m| m.defence).unwrap_or(0)
 }
 
-pub async fn player_hit_monster(world: &World, player_id: u32, monster_id: u32, dmg: i32) {
+pub async fn player_hit_monster(
+    world: &World,
+    db: &crate::db::Database,
+    player_id: u32,
+    monster_id: u32,
+    dmg: i32,
+) {
     let mut died = false;
     let mut monster_map = 0u32;
     {
@@ -1060,15 +1239,27 @@ pub async fn player_hit_monster(world: &World, player_id: u32, monster_id: u32, 
         }))
         .await;
     if died {
-        monster_died(world, player_id, monster_id).await;
+        monster_died(world, db, player_id, monster_id).await;
     }
 }
 
-async fn monster_died(world: &World, player_id: u32, monster_id: u32) {
-    let (loc, drops, exp_reward, gold_reward, map_index) = {
+async fn monster_died(
+    world: &World,
+    db: &crate::db::Database,
+    player_id: u32,
+    monster_id: u32,
+) {
+    let (loc, drops, exp_reward, gold_reward, map_index, monster_image) = {
         let mons = world.monsters.lock().await;
         let m = mons.get(&monster_id).unwrap();
-        (m.location, m.drops.clone(), m.exp_reward, m.gold_reward, m.map_index)
+        (
+            m.location,
+            m.drops.clone(),
+            m.exp_reward,
+            m.gold_reward,
+            m.map_index,
+            m.image,
+        )
     };
     world
         .broadcast_on(map_index, encode_packet(&s::ObjectDied {
@@ -1091,6 +1282,7 @@ async fn monster_died(world: &World, player_id: u32, monster_id: u32) {
                 location: loc,
                 unique_id: world.next_item_unique(),
                 map_index,
+                gold: 0,
             })
             .await;
     }
@@ -1100,9 +1292,30 @@ async fn monster_died(world: &World, player_id: u32, monster_id: u32) {
     if gold_reward > 0 {
         gain_gold(world, player_id, gold_reward).await;
     }
+    // 任务击杀进度登记（击杀怪物可能推进任务）
+    let player_name = world
+        .get_player(player_id)
+        .await
+        .map(|p| p.name)
+        .unwrap_or_default();
+    if !player_name.is_empty() {
+        if let Some(char_index) = world
+            .get_player(player_id)
+            .await
+            .map(|p| p.character_index)
+        {
+            crate::quest::register_kill(&player_name, char_index, monster_image, db);
+        }
+    }
 }
 
-async fn monster_hit_player(world: &World, monster_id: u32, player_id: u32, dmg: i32) {
+async fn monster_hit_player(
+    world: &World,
+    db: &crate::db::Database,
+    monster_id: u32,
+    player_id: u32,
+    dmg: i32,
+) {
     {
         let mut mons = world.monsters.lock().await;
         if let Some(m) = mons.get_mut(&monster_id) {
@@ -1148,6 +1361,8 @@ async fn monster_hit_player(world: &World, monster_id: u32, player_id: u32, dmg:
         location: loc,
         direction: MirDirection::Up,
     }));
+    // 被击中：护甲耐久消耗
+    damage_equipment(world, db, player_id, 1, 1).await;
     if killer {
         player_died(world, player_id).await;
     }
@@ -1155,6 +1370,11 @@ async fn monster_hit_player(world: &World, monster_id: u32, player_id: u32, dmg:
 
 /// 玩家死亡：回城复活
 pub async fn player_died(world: &World, player_id: u32) {
+    revive_player(world, player_id).await;
+}
+
+/// 复活：回城传送回出生点并恢复部分 HP/MP（死亡后自动调用，或收到 TownRevive 时调用）。
+pub async fn revive_player(world: &World, player_id: u32) {
     // 回城：传送到可通行的出生点（在地图上找到可走的格子）
     let spawn = {
         let s = world.nearest_walkable(SPAWN.x, SPAWN.y);
@@ -1322,6 +1542,15 @@ pub async fn npc_shop(world: &World, npc_object_id: u32) -> Option<Vec<i32>> {
         .map(|n| n.shop_items)
 }
 
+/// 按 object_id 查 NPC 名字；无返回 None。
+pub async fn npc_name(world: &World, npc_object_id: u32) -> Option<String> {
+    let npcs = world.npcs.lock().await.clone();
+    npcs
+        .into_iter()
+        .find(|n| n.object_id == npc_object_id)
+        .map(|n| n.name)
+}
+
 // ---------------------------------------------------------------------------
 // 装备 / 道具使用
 // ---------------------------------------------------------------------------
@@ -1351,22 +1580,73 @@ pub fn recompute_stats(player: &mut Player) {
     player.armour = 0;
     for (slot, item) in &player.equipment {
         let Some(tmpl) = crate::items::find(item.item_index) else { continue };
+        // 耐久为 0 时装备失效（不提供加成/不显示外观）
+        let broken = item.max_dura > 0 && item.current_dura == 0;
         match slot {
             0 => {
                 // 武器槽：加攻击
-                player.weapon = tmpl.index as i16;
-                attack += tmpl.bonus;
+                if !broken {
+                    player.weapon = tmpl.index as i16;
+                    attack += tmpl.bonus;
+                }
             }
             1 => {
                 // 护甲槽：加防御
-                player.armour = tmpl.index as i16;
-                defence += tmpl.bonus;
+                if !broken {
+                    player.armour = tmpl.index as i16;
+                    defence += tmpl.bonus;
+                }
             }
             _ => {}
         }
     }
     player.attack = attack;
     player.defence = defence;
+}
+
+/// 扣除玩家某装备槽的耐久（同步 DB 与内存，并在耐久耗尽时刷新外观/属性）。
+pub async fn damage_equipment(
+    world: &World,
+    db: &crate::db::Database,
+    player_id: u32,
+    slot: i32,
+    amount: u16,
+) {
+    let Some(player) = world.get_player(player_id).await else { return };
+    let char_index = player.character_index;
+    let Ok((new_cd, md)) = db.damage_equipment(char_index, slot, amount) else {
+        return;
+    };
+    if md == 0 {
+        return;
+    }
+    let mut broke_now = false;
+    {
+        let mut players = world.players.lock().await;
+        if let Some(p) = players.get_mut(&player_id) {
+            if let Some(item) = p.equipment.get_mut(&slot) {
+                let prev = item.current_dura;
+                item.current_dura = new_cd;
+                if prev > 0 && new_cd == 0 {
+                    broke_now = true;
+                }
+            }
+            recompute_stats(p);
+        }
+    }
+    if broke_now {
+        // 耐久耗尽，通知玩家
+        world
+            .send_to(
+                player_id,
+                encode_packet(&s::ObjectChat {
+                    object_id: player_id,
+                    text: "你的装备耐久耗尽，已失效！请到铁匠处修理。".to_string(),
+                    r#type: 1,
+                }),
+            )
+            .await;
+    }
 }
 
 /// 使用物品：金创药等消耗品回复 HP。成功消耗并回复返回 (true, 用后剩余数量)。
@@ -1418,6 +1698,12 @@ pub async fn pick_up(world: &World, player_id: u32, db: &crate::db::Database) {
     let Some(gi) = gi else { return };
     world.remove_ground_item(oid).await;
 
+    // 金币堆：直接加金币
+    if gi.gold > 0 {
+        gain_gold(world, player_id, gi.gold).await;
+        return;
+    }
+
     let ok = db.add_item_to_inventory(player.character_index, gi.item_index, gi.count);
     if ok.is_err() {
         return;
@@ -1426,6 +1712,8 @@ pub async fn pick_up(world: &World, player_id: u32, db: &crate::db::Database) {
         unique_id: gi.unique_id,
         item_index: gi.item_index,
         count: gi.count,
+        current_dura: 0,
+        max_dura: 0,
         ..Default::default()
     };
     world.send_to(player_id, encode_packet(&s::GainedItem { item })).await;
@@ -1446,6 +1734,26 @@ pub async fn drop_ground_item(world: &World, player_id: u32, item: UserItem) -> 
             location: player.location,
             unique_id: item.unique_id,
             map_index: player.map_index,
+            gold: 0,
+        })
+        .await;
+    true
+}
+
+/// 丢弃金币到脚下（生成地面金币堆）。成功返回 true。
+pub async fn drop_gold(world: &World, player_id: u32, amount: u32) -> bool {
+    let Some(player) = world.get_player(player_id).await else {
+        return false;
+    };
+    world
+        .add_ground_item(GroundItem {
+            object_id: world.next_object_id(),
+            item_index: 0,
+            count: 0,
+            location: player.location,
+            unique_id: 0,
+            map_index: player.map_index,
+            gold: amount,
         })
         .await;
     true
@@ -1681,6 +1989,16 @@ mod tests {
             hp_changed: false,
             equipment: std::collections::BTreeMap::new(),
             map_index: 0,
+            auto_pot_item: 0,
+            auto_pot_hp: 0,
+            recently_sold: vec![],
+            fishing: false,
+            fishing_progress: 0,
+            auto_fish: false,
+            storage_unlocked: false,
+            pending_mentor: None,
+            can_be_mentor: false,
+            pending_marriage: None,
         };
         world.players.lock().await.insert(1, player);
 
