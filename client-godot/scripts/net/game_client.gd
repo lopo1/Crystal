@@ -23,6 +23,34 @@ signal gained_item(item: Dictionary)
 signal death()
 signal user_slots_refresh(inventory: Array, equipment: Array)
 signal magics_loaded(magics: Array)
+signal equip_result(grid: int, unique_id: int, success: bool)
+signal use_item_result(unique_id: int, success: bool)
+signal delete_item(unique_id: int, count: int)
+signal colour_changed(name_colour: int)
+signal player_inspect(info: Dictionary)
+signal logout_success(characters: Array)
+signal return_to_login()
+signal attack_mode_changed(mode: int)
+signal peace_mode_changed(mode: int)
+signal object_harvest(object_id: int)
+signal npc_refine(rate: float, refining: bool)
+signal object_magic(data: Dictionary)
+signal new_magic(magic: Dictionary)
+signal magic_leveled(spell: int, level: int, experience: int)
+signal switch_group(allow: bool)
+signal delete_member(name: String)
+signal group_invite(name: String)
+signal add_member(name: String)
+signal friend_update(friends: Array)
+signal marriage_request(name: String)
+signal lover_update(data: Dictionary)
+signal mentor_update(data: Dictionary)
+signal request_reincarnation()
+signal fishing_update(data: Dictionary)
+signal object_hidden(object_id: int, hidden: bool)
+signal base_stats_info(data: Dictionary)
+signal storage_unlock_result(result: int, has_password: bool)
+signal storage_password_result(result: int)
 ## Web3: 收到待签名挑战 {"address","message","expires_in"}
 signal web3_challenge_received(challenge: Dictionary)
 ## Web3: 登录结果 {"result": int, "characters": Array, "session_token": String}
@@ -275,6 +303,213 @@ func take_back_hero_item(from: int = 0, to: int = 0) -> void:
 		w.write_i32(to)
 	send(p)
 
+func inspect(player_name: String) -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = 42
+	p.write_fn = func(w) -> void:
+		w.write_string(player_name)
+	send(p)
+
+func move_item(grid: int, from: int, to: int) -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = 14
+	p.write_fn = func(w) -> void:
+		w.write_u8(grid)
+		w.write_i32(from)
+		w.write_i32(to)
+	send(p)
+
+func merge_item(grid: int, from: int, to: int) -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = 17
+	p.write_fn = func(w) -> void:
+		w.write_u8(grid)
+		w.write_i32(from)
+		w.write_i32(to)
+	send(p)
+
+func split_item(grid: int, from: int, count: int) -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = 33
+	p.write_fn = func(w) -> void:
+		w.write_u8(grid)
+		w.write_i32(from)
+		w.write_i32(count)
+	send(p)
+
+func drop_gold(amount: int) -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = 34
+	p.write_fn = func(w) -> void:
+		w.write_u32(amount)
+	send(p)
+
+func store_item(unique_id: int) -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = 15
+	p.write_fn = func(w) -> void:
+		w.write_u64(unique_id)
+	send(p)
+
+func take_back_item(from: int, to: int) -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = 16
+	p.write_fn = func(w) -> void:
+		w.write_i32(from)
+		w.write_i32(to)
+	send(p)
+
+func repair_item(unique_id: int) -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = 54
+	p.write_fn = func(w) -> void:
+		w.write_u64(unique_id)
+	send(p)
+
+func switch_group() -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = 59
+	send(p)
+
+func add_group_member(name: String) -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = 60
+	p.write_fn = func(w) -> void:
+		w.write_string(name)
+	send(p)
+
+func del_group_member(name: String) -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = 61
+	p.write_fn = func(w) -> void:
+		w.write_string(name)
+	send(p)
+
+func group_invite_response(accept: bool) -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = 62
+	p.write_fn = func(w) -> void:
+		w.write_bool(accept)
+	send(p)
+
+func change_attack_mode() -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = 44
+	send(p)
+
+func change_peace_mode() -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = 45
+	send(p)
+
+func add_friend(name: String) -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = 127
+	p.write_fn = func(w) -> void:
+		w.write_string(name)
+	send(p)
+
+func remove_friend(name: String) -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = 128
+	p.write_fn = func(w) -> void:
+		w.write_string(name)
+	send(p)
+
+func refresh_friends() -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = 129
+	send(p)
+
+func spell_toggle(spell: int) -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = 69
+	p.write_fn = func(w) -> void:
+		w.write_u8(spell)
+	send(p)
+
+func fishing_cast() -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = 102
+	send(p)
+
+func fishing_change_autocast() -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = 103
+	send(p)
+
+func accept_reincarnation() -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = 108
+	send(p)
+
+func cancel_reincarnation() -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = 109
+	send(p)
+
+func harvest(direction: int) -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = 49
+	p.write_fn = func(w) -> void:
+		w.write_u8(direction)
+	send(p)
+
+func request_map_info() -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = 36
+	send(p)
+
+func request_item_info() -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = 39
+	send(p)
+
+func request_monster_info() -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = 37
+	send(p)
+
+func teleport_to_npc(object_id: int) -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = 40
+	p.write_fn = func(w) -> void:
+		w.write_u32(object_id)
+	send(p)
+
+func set_storage_password(password: String) -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = 151
+	p.write_fn = func(w) -> void:
+		w.write_string(password)
+	send(p)
+
+func remove_storage_password(password: String) -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = 152
+	p.write_fn = func(w) -> void:
+		w.write_string(password)
+	send(p)
+
+func unlock_storage(password: String) -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = 150
+	p.write_fn = func(w) -> void:
+		w.write_string(password)
+	send(p)
+
+func request_guild_info() -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = 83
+	send(p)
+
+func request_user_name(name: String) -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = 77
+	p.write_fn = func(w) -> void:
+		w.write_string(name)
+	send(p)
+
 # ---------------------------------------------------------------------------
 # 接收与分发
 # ---------------------------------------------------------------------------
@@ -382,6 +617,66 @@ func _dispatch(id: int, payload: PackedByteArray) -> void:
 			lost_gold.emit(data.get("gold", 0))
 		Packets.S_GAINED_ITEM:
 			gained_item.emit(data.get("item", {}))
+		Packets.S_EQUIP_ITEM:
+			equip_result.emit(data.get("grid", 0), data.get("unique_id", 0), data.get("success", false))
+		Packets.S_USE_ITEM:
+			use_item_result.emit(data.get("unique_id", 0), data.get("success", false))
+		Packets.S_DELETE_ITEM:
+			delete_item.emit(data.get("unique_id", 0), data.get("count", 0))
+		Packets.S_COLOUR_CHANGED:
+			colour_changed.emit(data.get("name_colour", 0))
+		Packets.S_PLAYER_INSPECT:
+			player_inspect.emit(data)
+		Packets.S_LOG_OUT_SUCCESS:
+			_stage = "select"
+			_keepalive_timer.stop()
+			logout_success.emit(data.get("characters", []))
+		Packets.S_RETURN_TO_LOGIN:
+			_stage = "none"
+			_keepalive_timer.stop()
+			return_to_login.emit()
+		Packets.S_CHANGE_A_MODE:
+			attack_mode_changed.emit(data.get("mode", 0))
+		Packets.S_CHANGE_P_MODE:
+			peace_mode_changed.emit(data.get("mode", 0))
+		Packets.S_OBJECT_HARVEST:
+			object_harvest.emit(data.get("object_id", 0))
+		Packets.S_NPC_REFINE:
+			npc_refine.emit(data.get("rate", 0.0), data.get("refining", false))
+		Packets.S_OBJECT_MAGIC:
+			object_magic.emit(data)
+		Packets.S_NEW_MAGIC:
+			new_magic.emit(data.get("magic", {}))
+		Packets.S_MAGIC_LEVELED:
+			magic_leveled.emit(data.get("spell", 0), data.get("level", 0), data.get("experience", 0))
+		Packets.S_SWITCH_GROUP:
+			switch_group.emit(data.get("allow_group", false))
+		Packets.S_DELETE_MEMBER:
+			delete_member.emit(data.get("name", ""))
+		Packets.S_GROUP_INVITE:
+			group_invite.emit(data.get("name", ""))
+		Packets.S_ADD_MEMBER:
+			add_member.emit(data.get("name", ""))
+		Packets.S_FRIEND_UPDATE:
+			friend_update.emit(data.get("friends", []))
+		Packets.S_MARRIAGE_REQUEST:
+			marriage_request.emit(data.get("name", ""))
+		Packets.S_LOVER_UPDATE:
+			lover_update.emit(data)
+		Packets.S_MENTOR_UPDATE:
+			mentor_update.emit(data)
+		Packets.S_REQUEST_REINCARNATION:
+			request_reincarnation.emit()
+		Packets.S_FISHING_UPDATE:
+			fishing_update.emit(data)
+		Packets.S_OBJECT_HIDDEN:
+			object_hidden.emit(data.get("object_id", 0), data.get("hidden", false))
+		Packets.S_BASE_STATS_INFO:
+			base_stats_info.emit(data)
+		Packets.S_STORAGE_UNLOCK_RESULT:
+			storage_unlock_result.emit(data.get("result", 0), data.get("has_password", false))
+		Packets.S_STORAGE_PASSWORD_RESULT:
+			storage_password_result.emit(data.get("result", 0))
 		Packets.S_OBJECT_ATTACK:
 			pass
 		Packets.S_OBJECT_STRUCK:

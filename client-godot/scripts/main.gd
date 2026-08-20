@@ -81,6 +81,26 @@ func _ready() -> void:
 	client.death.connect(_on_death)
 	client.user_slots_refresh.connect(_on_user_slots_refresh)
 	client.magics_loaded.connect(_on_magics_loaded)
+	client.equip_result.connect(_on_equip_result)
+	client.use_item_result.connect(_on_use_item_result)
+	client.delete_item.connect(_on_delete_item)
+	client.colour_changed.connect(_on_colour_changed)
+	client.player_inspect.connect(_on_player_inspect)
+	client.logout_success.connect(_on_logout_success)
+	client.return_to_login.connect(_on_return_to_login)
+	client.attack_mode_changed.connect(func(m): chat_log.append_text("[color=gray]攻击模式: %d[/color]\n" % m))
+	client.peace_mode_changed.connect(func(m): chat_log.append_text("[color=gray]和平模式: %d[/color]\n" % m))
+	client.object_magic.connect(_on_object_magic)
+	client.new_magic.connect(_on_new_magic)
+	client.magic_leveled.connect(_on_magic_leveled)
+	client.switch_group.connect(_on_switch_group)
+	client.delete_member.connect(_on_delete_member)
+	client.group_invite.connect(_on_group_invite)
+	client.add_member.connect(_on_add_member)
+	client.friend_update.connect(_on_friend_update)
+	client.npc_refine.connect(func(rate, refining): chat_log.append_text("[color=cyan]精炼: 成功率%.1f%% %s[/color]\n" % [rate * 100.0, "进行中" if refining else ""]))
+	client.object_hidden.connect(_on_object_hidden)
+	client.object_harvest.connect(func(oid): chat_log.append_text("[color=gray]采集中...[/color]\n"))
 	$LoginPanel/ConnectButton.pressed.connect(_on_connect_pressed)
 	$LoginPanel/NewAccountButton.pressed.connect(_on_new_account_pressed)
 	$LoginPanel/StartGameButton.pressed.connect(_on_start_game_pressed)
@@ -456,11 +476,109 @@ func _on_user_slots_refresh(inventory: Array, equipment: Array) -> void:
 	_my_inventory = inventory
 	_my_equipment = equipment
 	_populate_inventory_panel()
-	chat_log.append_text("[color=gray]背包已更新[/color]\n")
 
 func _on_magics_loaded(magics: Array) -> void:
 	_my_magics = magics
 	_populate_skill_bar()
+
+func _on_equip_result(grid: int, unique_id: int, success: bool) -> void:
+	if success:
+		chat_log.append_text("[color=green]装备成功[/color]\n")
+	else:
+		chat_log.append_text("[color=red]装备失败[/color]\n")
+
+func _on_use_item_result(unique_id: int, success: bool) -> void:
+	if success:
+		chat_log.append_text("[color=green]使用成功 uid=%d[/color]\n" % unique_id)
+	else:
+		chat_log.append_text("[color=red]使用失败[/color]\n")
+
+func _on_delete_item(unique_id: int, count: int) -> void:
+	chat_log.append_text("[color=gray]物品消失 uid=%d x%d[/color]\n" % [unique_id, count])
+
+func _on_colour_changed(name_colour: int) -> void:
+	chat_log.append_text("[color=gray]名称颜色已变化[/color]\n")
+
+func _on_player_inspect(info: Dictionary) -> void:
+	_show_inspect_panel(info)
+
+func _on_logout_success(characters: Array) -> void:
+	game_view.hide()
+	login_panel.show()
+	_on_characters_loaded(characters)
+	status_label.text = "已登出"
+	inventory_panel.hide()
+	npc_dialog.hide()
+	shop_panel.hide()
+	players.clear()
+	monsters.clear()
+	npcs.clear()
+	ground_items.clear()
+
+func _on_return_to_login() -> void:
+	game_view.hide()
+	login_panel.show()
+	status_label.text = "已返回登录界面"
+	inventory_panel.hide()
+	npc_dialog.hide()
+	shop_panel.hide()
+
+func _on_object_magic(data: Dictionary) -> void:
+	var oid: int = data.get("object_id", 0)
+	var spell: int = data.get("spell", 0)
+	var level: int = data.get("level", 0)
+	if oid != client.my_object_id():
+		_flash_entity(oid)
+
+func _on_new_magic(magic: Dictionary) -> void:
+	_my_magics.append(magic)
+	_populate_skill_bar()
+	chat_log.append_text("[color=cyan]学会新技能: %s[/color]\n" % magic.get("name", "?"))
+
+func _on_magic_leveled(spell: int, level: int, experience: int) -> void:
+	for m in _my_magics:
+		if m.get("spell", -1) == spell:
+			m["level"] = level
+			m["experience"] = experience
+			chat_log.append_text("[color=cyan]技能升级: %s Lv.%d[/color]\n" % [m.get("name", "?"), level])
+			break
+
+func _on_switch_group(allow: bool) -> void:
+	chat_log.append_text("[color=gray]组队邀请: %s[/color]\n" % ["允许" if allow else "禁止"])
+
+func _on_delete_member(name: String) -> void:
+	chat_log.append_text("[color=yellow]队友离开: %s[/color]\n" % name)
+
+func _on_group_invite(name: String) -> void:
+	chat_log.append_text("[color=yellow]收到组队邀请: %s (输入 /join 加入)[/color]\n" % name)
+
+func _on_add_member(name: String) -> void:
+	chat_log.append_text("[color=green]队友加入: %s[/color]\n" % name)
+
+func _on_friend_update(friends: Array) -> void:
+	chat_log.append_text("[color=gray]好友列表更新 (%d 人)[/color]\n" % friends.size())
+
+func _on_object_hidden(object_id: int, hidden: bool) -> void:
+	if hidden:
+		_remove_sprite(object_id)
+		_remove_monster(object_id)
+		_remove_npc(object_id)
+	else:
+		chat_log.append_text("[color=gray]实体显现 oid=%d[/color]\n" % object_id)
+
+func _show_inspect_panel(info: Dictionary) -> void:
+	var text: String = "查看: %s\n行会: %s %s\nclass: %d  等级: %d\n配偶: %s\n装备:\n" % [
+		info.get("name", "?"),
+		info.get("guild_name", ""),
+		info.get("guild_rank", ""),
+		info.get("class", 0),
+		info.get("level", 0),
+		info.get("lover_name", ""),
+	]
+	for item in info.get("equipment", []):
+		if item != null:
+			text += "  物品#%d\n" % item.get("item_index", 0)
+	_show_npc_dialog("查看 " + info.get("name", "?"), text)
 
 # ---------------------------------------------------------------------------
 # 战斗
@@ -540,9 +658,68 @@ func _on_chat_line(object_id: int, text: String) -> void:
 	chat_log.append_text("[b]%s[/b]: %s\n" % [name, text])
 
 func _on_chat_submitted(text: String) -> void:
-	if text != "":
+	if text == "":
+		return
+	# 斜杠命令
+	if text.begins_with("/"):
+		_handle_chat_command(text)
+	else:
 		client.chat(text)
 	chat_input.clear()
+
+func _handle_chat_command(text: String) -> void:
+	var parts := text.split(" ")
+	var cmd: String = parts[0].to_lower()
+	match cmd:
+		"/inspect", "/look", "/查看":
+			if parts.size() > 1:
+				client.inspect(parts[1])
+			else:
+				chat_log.append_text("[color=gray]用法: /inspect <玩家名>[/color]\n")
+		"/join", "/加入组队":
+			client.group_invite_response(true)
+		"/leave", "/离队":
+			client.del_group_member(my_name)
+		"/group", "/组队":
+			client.switch_group()
+		"/invite", "/邀请":
+			if parts.size() > 1:
+				client.add_group_member(parts[1])
+			else:
+				chat_log.append_text("[color=gray]用法: /invite <玩家名>[/color]\n")
+		"/friend", "/好友":
+			if parts.size() > 1:
+				client.add_friend(parts[1])
+			else:
+				chat_log.append_text("[color=gray]用法: /friend <玩家名>[/color]\n")
+		"/unfriend", "/删好友":
+			if parts.size() > 1:
+				client.remove_friend(parts[1])
+		"/friends", "/好友列表":
+			client.refresh_friends()
+		"/amode", "/攻击模式":
+			client.change_attack_mode()
+		"/pmode", "/和平模式":
+			client.change_peace_mode()
+		"/fish", "/钓鱼":
+			client.fishing_cast()
+		"/guild", "/行会":
+			client.request_guild_info()
+		"/dropgold", "/丢金":
+			if parts.size() > 1:
+				client.drop_gold(int(parts[1]))
+			else:
+				chat_log.append_text("[color=gray]用法: /dropgold <数量>[/color]\n")
+		"/tp", "/传送":
+			if parts.size() > 1:
+				# 尝试通过名称找到 NPC 并传送
+				for oid in npcs:
+					if npcs[oid]["name"] == parts[1]:
+						client.teleport_to_npc(oid)
+						return
+				chat_log.append_text("[color=red]未找到NPC: %s[/color]\n" % parts[1])
+		_:
+			chat_log.append_text("[color=gray]未知命令: %s[/color]\n" % cmd)
 
 func _show_npc_dialog(npc_name: String, text: String) -> void:
 	npc_dialog.visible = true

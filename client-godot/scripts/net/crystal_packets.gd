@@ -548,15 +548,43 @@ const S_DAMAGE_INDICATOR := 75
 const S_HEALTH_CHANGED := 77
 const S_DEATH := 80
 const S_OBJECT_DIED := 81
+const S_COLOUR_CHANGED := 82
 const S_GAIN_EXPERIENCE := 85
 const S_LEVEL_CHANGED := 87
+const S_OBJECT_HARVEST := 90
 const S_OBJECT_NPC := 92
 const S_NPC_GOODS := 102
 const S_NPC_SELL := 103
 const S_NPC_REPAIR := 104
+const S_NPC_REFINE := 106
 const S_NPC_STORAGE := 110
+const S_NEW_MAGIC := 117
+const S_MAGIC_LEVELED := 119
+const S_OBJECT_MAGIC := 123
+const S_OBJECT_HIDDEN := 147
 const S_REVIVED := 136
 const S_OBJECT_REVIVED := 137
+const S_SWITCH_GROUP := 131
+const S_DELETE_MEMBER := 133
+const S_GROUP_INVITE := 134
+const S_ADD_MEMBER := 135
+const S_BASE_STATS_INFO := 162
+const S_MARRIAGE_REQUEST := 189
+const S_FISHING_UPDATE := 200
+const S_REQUEST_REINCARNATION := 208
+const S_FRIEND_UPDATE := 245
+const S_LOVER_UPDATE := 246
+const S_MENTOR_UPDATE := 247
+const S_DELETE_ITEM := 79
+const S_PLAYER_INSPECT := 57
+const S_LOG_OUT_SUCCESS := 58
+const S_RETURN_TO_LOGIN := 60
+const S_CHANGE_A_MODE := 62
+const S_CHANGE_P_MODE := 63
+const S_EQUIP_ITEM := 38
+const S_USE_ITEM := 52
+const S_STORAGE_UNLOCK_RESULT := 277
+const S_STORAGE_PASSWORD_RESULT := 278
 # Web3 钱包登录扩展（自定义 ID 300+，与 Rust server/web3.rs 一致）
 const S_WEB3_CHALLENGE := 300
 const S_WEB3_LOGIN_RESULT := 301
@@ -826,6 +854,182 @@ static func decode_server_packet(id: int, payload: PackedByteArray) -> Dictionar
 				wchars.append(read_select_info(r))
 			var session_token := r.read_string()
 			return {"id": id, "data": {"result": wres, "characters": wchars, "session_token": session_token}}
+		S_EQUIP_ITEM:
+			return {"id": id, "data": {
+				"grid": r.read_u8(),
+				"unique_id": r.read_u64(),
+				"to": r.read_i32(),
+				"success": r.read_bool(),
+			}}
+		S_USE_ITEM:
+			return {"id": id, "data": {
+				"unique_id": r.read_u64(),
+				"success": r.read_bool(),
+				"grid": r.read_u8(),
+			}}
+		S_DELETE_ITEM:
+			return {"id": id, "data": {
+				"unique_id": r.read_u64(),
+				"count": r.read_u16(),
+			}}
+		S_COLOUR_CHANGED:
+			return {"id": id, "data": {"name_colour": r.read_i32()}}
+		S_PLAYER_INSPECT:
+			var pi := {}
+			pi["name"] = r.read_string()
+			pi["guild_name"] = r.read_string()
+			pi["guild_rank"] = r.read_string()
+			# equipment: inverted bool (true = present, false = empty)
+			var has_arr := r.read_bool()
+			var equip := []
+			if has_arr:
+				var len := r.read_i32()
+				equip.resize(len)
+				for i in range(len):
+					if r.read_bool():
+						equip[i] = read_user_item(r)
+					else:
+						equip[i] = null
+			pi["equipment"] = equip
+			pi["class"] = r.read_u8()
+			pi["gender"] = r.read_u8()
+			pi["hair"] = r.read_u8()
+			pi["level"] = r.read_u16()
+			pi["lover_name"] = r.read_string()
+			pi["allow_observe"] = r.read_bool()
+			pi["is_hero"] = r.read_bool()
+			return {"id": id, "data": pi}
+		S_LOG_OUT_SUCCESS:
+			var chars := []
+			var count := r.read_i32()
+			for i in range(count):
+				chars.append(read_select_info(r))
+			return {"id": id, "data": {"characters": chars}}
+		S_RETURN_TO_LOGIN:
+			return {"id": id, "data": {}}
+		S_CHANGE_A_MODE:
+			return {"id": id, "data": {"mode": r.read_u8()}}
+		S_CHANGE_P_MODE:
+			return {"id": id, "data": {"mode": r.read_u8()}}
+		S_OBJECT_HARVEST:
+			return {"id": id, "data": {
+				"object_id": r.read_u32(),
+				"location": read_point(r),
+				"direction": r.read_u8(),
+			}}
+		S_NPC_REFINE:
+			return {"id": id, "data": {
+				"rate": r.read_f32(),
+				"refining": r.read_bool(),
+			}}
+		S_OBJECT_MAGIC:
+			var om := {}
+			om["object_id"] = r.read_u32()
+			om["location"] = read_point(r)
+			om["direction"] = r.read_u8()
+			om["spell"] = r.read_u8()
+			om["target_id"] = r.read_u32()
+			om["target"] = read_point(r)
+			om["cast"] = r.read_bool()
+			om["level"] = r.read_u8()
+			om["self_broadcast"] = r.read_bool()
+			var sec_count := r.read_i32()
+			var sec_ids := []
+			for i in range(sec_count):
+				sec_ids.append(r.read_u32())
+			om["secondary_target_ids"] = sec_ids
+			return {"id": id, "data": om}
+		S_NEW_MAGIC:
+			return {"id": id, "data": {"magic": read_client_magic(r)}}
+		S_MAGIC_LEVELED:
+			return {"id": id, "data": {
+				"spell": r.read_u8(),
+				"level": r.read_u8(),
+				"experience": r.read_u16(),
+			}}
+		S_SWITCH_GROUP:
+			return {"id": id, "data": {"allow_group": r.read_bool()}}
+		S_DELETE_MEMBER:
+			return {"id": id, "data": {"name": r.read_string()}}
+		S_GROUP_INVITE:
+			return {"id": id, "data": {"name": r.read_string()}}
+		S_ADD_MEMBER:
+			return {"id": id, "data": {"name": r.read_string()}}
+		S_FRIEND_UPDATE:
+			var friends := []
+			var fcount := r.read_i32()
+			for i in range(fcount):
+				friends.append({
+					"index": r.read_i32(),
+					"name": r.read_string(),
+					"memo": r.read_string(),
+					"blocked": r.read_bool(),
+					"online": r.read_bool(),
+				})
+			return {"id": id, "data": {"friends": friends}}
+		S_MARRIAGE_REQUEST:
+			return {"id": id, "data": {"name": r.read_string()}}
+		S_LOVER_UPDATE:
+			return {"id": id, "data": {
+				"name": r.read_string(),
+				"date": r.read_i64(),
+				"map_name": r.read_string(),
+				"married_days": r.read_i16(),
+			}}
+		S_MENTOR_UPDATE:
+			return {"id": id, "data": {
+				"name": r.read_string(),
+				"level": r.read_u16(),
+				"online": r.read_bool(),
+				"mentee_exp": r.read_i64(),
+			}}
+		S_REQUEST_REINCARNATION:
+			return {"id": id, "data": {}}
+		S_FISHING_UPDATE:
+			return {"id": id, "data": {
+				"object_id": r.read_u32(),
+				"fishing": r.read_bool(),
+				"progress_percent": r.read_i32(),
+				"chance_percent": r.read_i32(),
+				"fishing_point": read_point(r),
+				"found_fish": r.read_bool(),
+			}}
+		S_OBJECT_HIDDEN:
+			return {"id": id, "data": {
+				"object_id": r.read_u32(),
+				"hidden": r.read_bool(),
+			}}
+		S_BASE_STATS_INFO:
+			# BaseStats: job(u8) + stats_vec + caps(stats)
+			var job := r.read_u8()
+			var stat_count := r.read_i32()
+			var stats := []
+			for i in range(stat_count):
+				stats.append({
+					"type": r.read_u8(),
+					"formula_type": r.read_u8(),
+					"base": r.read_i32(),
+					"gain": r.read_f32(),
+					"gain_rate": r.read_f32(),
+					"max": r.read_i32(),
+				})
+			var caps_count := r.read_i32()
+			var caps := {}
+			for i in range(caps_count):
+				caps[r.read_u8()] = r.read_i32()
+			return {"id": id, "data": {"job": job, "stats": stats, "caps": caps}}
+		S_STORAGE_UNLOCK_RESULT:
+			return {"id": id, "data": {
+				"result": r.read_u8(),
+				"has_password": r.read_bool(),
+			}}
+		S_STORAGE_PASSWORD_RESULT:
+			return {"id": id, "data": {
+				"result": r.read_u8(),
+				"removing": r.read_bool(),
+				"has_password": r.read_bool(),
+				"last_set_time": r.read_i64(),
+			}}
 		_:
 			return {"id": id, "data": {}}
 

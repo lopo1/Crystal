@@ -479,6 +479,12 @@ async fn handle_client_packet(
                 }
             }
         }
+        ClientPacket::Magic(m) => {
+            if let Some(oid) = *object_id {
+                let dir = MirDirection::from_u8(m.direction);
+                player_magic_attack(world, db, oid, dir, m.spell).await;
+            }
+        }
         ClientPacket::PickUp(_) => {
             if let Some(oid) = *object_id {
                 pick_up(world, oid, db).await;

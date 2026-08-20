@@ -299,7 +299,7 @@ offset_left = 0.0
 offset_top = 76.0
 offset_right = 300.0
 offset_bottom = 92.0
-text = "方向键:移动  空格:攻击  Z:拾取  C:对话  I:背包  R:复活  F1-F8:技能  Shift:跑  双击背包:使用/装备"
+text = "方向键:移动  空格:攻击  Z:拾取  C:对话  I:背包  R:复活  F1-F8:技能  Shift:跑  双击背包:使用/装备  /help:命令"
 horizontal_alignment = 0
 
 [node name="LogoutButton" type="Button" parent="GameView"]
