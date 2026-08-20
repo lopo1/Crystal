@@ -370,6 +370,29 @@ impl Database {
         Ok(false)
     }
 
+    /// 交易/转移: 把某件背包物品的所有权从 from_char 转到 to_char。
+    pub fn transfer_item(
+        &self,
+        from_char: i32,
+        to_char: i32,
+        unique_id: u64,
+    ) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let exists: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM inventory WHERE character_index=?1 AND unique_id=?2",
+            params![from_char, unique_id as i64],
+            |r| r.get(0),
+        )?;
+        if exists == 0 {
+            return Ok(false);
+        }
+        conn.execute(
+            "UPDATE inventory SET character_index=?1 WHERE unique_id=?2",
+            params![to_char, unique_id as i64],
+        )?;
+        Ok(true)
+    }
+
     /// 按 unique_id 查找背包物品的模板索引；无则 None。
     pub fn inventory_item_index(
         &self,

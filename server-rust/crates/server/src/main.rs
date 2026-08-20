@@ -10,6 +10,7 @@ mod items;
 mod magics;
 mod maps;
 mod net;
+mod trade;
 mod web3;
 mod world;
 

@@ -454,7 +454,7 @@ async fn handle_client_packet(
                 let msg = chat.message.trim();
                 let cmd: Vec<&str> = msg.split_whitespace().collect();
                 if !cmd.is_empty() && cmd[0].starts_with('/') {
-                    handle_chat_command(world, tx, oid, &msg, cmd).await;
+                    handle_chat_command(world, db, tx, oid, &msg, cmd).await;
                 } else {
                     let frame = encode_packet(&s::ObjectChat {
                         object_id: oid,
@@ -787,6 +787,7 @@ const GRID_EQUIPMENT: u8 = 2;
 /// 聊天命令处理（调试/演示）：/map <index> 传送到指定地图，/spawn 回新手村。
 async fn handle_chat_command(
     world: &World,
+    db: &Database,
     tx: &mpsc::Sender<Vec<u8>>,
     oid: u32,
     full: &str,
@@ -817,8 +818,86 @@ async fn handle_chat_command(
             let ok = world.teleport_player(oid, 0, 400, 400).await;
             let _ = tx.send(sys(&format!("{}回新手村", if ok { "✓" } else { "✗" }))).await;
         }
+        "/trade" | "/trade_info" => {
+            let name = world.get_player(oid).await.map(|p| p.name).unwrap_or_default();
+            let in_trade = world.trade.lock().await.in_trade(&name);
+            let _ = tx.send(sys(&format!("交易状态: {}", if in_trade { "进行中" } else { "无" }))).await;
+        }
+        "/trade_req" => {
+            let name = world.get_player(oid).await.map(|p| p.name).unwrap_or_default();
+            if let Some(target) = cmd.get(1) {
+                if player_oid_by_name(world, target).await.is_some() {
+                    world.trade.lock().await.request(&name, target);
+                    let _ = tx.send(sys(&format!("已向 {target} 发起交易请求（对方用 /trade_accept 接受）"))).await;
+                } else {
+                    let _ = tx.send(sys("目标不在线")).await;
+                }
+            } else {
+                let _ = tx.send(sys("用法: /trade_req <角色名>")).await;
+            }
+        }
+        "/trade_accept" => {
+            let name = world.get_player(oid).await.map(|p| p.name).unwrap_or_default();
+            match world.trade.lock().await.accept(&name) {
+                Ok(()) => { let _ = tx.send(sys("✓ 已接受交易，双方用 /trade_gold <n> 或 /trade_item <槽位> 放入交易物")).await; }
+                Err(_) => { let _ = tx.send(sys("没有待接受的交易请求")).await; }
+            }
+        }
+        "/trade_gold" => {
+            let name = world.get_player(oid).await.map(|p| p.name).unwrap_or_default();
+            let amt = cmd.get(1).and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+            if world.trade.lock().await.add_gold(&name, amt).is_ok() {
+                let _ = tx.send(sys(&format!("已放入金币 {amt}"))).await;
+            } else { let _ = tx.send(sys("不在交易中")).await; }
+        }
+        "/trade_item" => {
+            let name = world.get_player(oid).await.map(|p| p.name).unwrap_or_default();
+            let slot = cmd.get(1).and_then(|s| s.parse::<i32>().ok());
+            let uid = match (slot, world.get_player(oid).await) {
+                (Some(sl), Some(p)) => {
+                    db.load_inventory(p.character_index).ok()
+                        .and_then(|inv| inv.into_iter().find(|(s, _)| *s == sl).map(|(_, it)| it.unique_id))
+                }
+                _ => None,
+            };
+            if let Some(uid) = uid {
+                if world.trade.lock().await.add_item(&name, uid).is_ok() {
+                    let _ = tx.send(sys("已放入一件背包物品")).await;
+                } else { let _ = tx.send(sys("不在交易中")).await; }
+            } else { let _ = tx.send(sys("用法: /trade_item <背包槽位> 或该槽无物品")).await; }
+        }
+        "/trade_confirm" => {
+            let name = world.get_player(oid).await.map(|p| p.name).unwrap_or_default();
+            let _ = world.trade.lock().await.confirm(&name);
+            let settle = world.trade.lock().await.complete(&name);
+            if let Ok(Some(s)) = settle {
+                // 结算: 转移物品(按名字找双方角色)与金币
+                let a_oid = player_oid_by_name(world, &s.a).await;
+                let b_oid = player_oid_by_name(world, &s.b).await;
+                if let (Some(ao), Some(bo)) = (a_oid, b_oid) {
+                    if let (Some(pa), Some(pb)) =
+                        (world.get_player(ao).await, world.get_player(bo).await)
+                    {
+                        for uid in &s.a_items_to_b { let _ = db.transfer_item(pa.character_index, pb.character_index, *uid); }
+                        for uid in &s.b_items_to_a { let _ = db.transfer_item(pb.character_index, pa.character_index, *uid); }
+                    }
+                }
+                if let Some(ao) = a_oid { if s.a_gold_to_b > 0 && remove_gold(world, ao, s.a_gold_to_b).await { if let Some(bo) = b_oid { gain_gold(world, bo, s.a_gold_to_b).await; } } }
+                if let Some(bo) = b_oid { if s.b_gold_to_a > 0 && remove_gold(world, bo, s.b_gold_to_a).await { if let Some(ao) = a_oid { gain_gold(world, ao, s.b_gold_to_a).await; } } }
+                let _ = tx.send(sys("✓ 交易完成，物品与金币已交换")).await;
+            } else {
+                let _ = tx.send(sys("已确认（等待对方确认后自动完成）")).await;
+            }
+        }
+        "/trade_cancel" => {
+            let name = world.get_player(oid).await.map(|p| p.name).unwrap_or_default();
+            if world.trade.lock().await.cancel(&name) {
+                let _ = tx.send(sys("已取消交易")).await;
+            } else { let _ = tx.send(sys("不在交易中")).await; }
+        }
+
         "/help" | "/?" => {
-            let _ = tx.send(sys("命令: /map <index> /spawn")).await;
+            let _ = tx.send(sys("命令: /map <index> /spawn /trade_req <名> /trade_accept /trade_gold <n> /trade_item <槽> /trade_confirm /trade_cancel")).await;
         }
         _ => {
             let _ = tx.send(sys(&format!("未知命令 {full}"))).await;
