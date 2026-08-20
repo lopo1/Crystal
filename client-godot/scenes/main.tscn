@@ -2,15 +2,31 @@
 
 [ext_resource type="Script" path="res://scripts/main.gd" id="1_main"]
 
-[node name="Main" type="Node"]
-script = ExtResource("1_main")
-
-[node name="LoginPanel" type="Control" parent="."]
+[node name="Main" type="Control"]
 layout_mode = 3
 anchors_preset = 15
 anchor_right = 1.0
 anchor_bottom = 1.0
 grow_horizontal = 2
+grow_vertical = 2
+script = ExtResource("1_main")
+
+[node name="Background" type="ColorRect" parent="."]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+color = Color(0.05, 0.05, 0.15, 1)
+
+[node name="LoginPanel" type="PanelContainer" parent="."]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
 grow_vertical = 2
 
 [node name="ServerLineEdit" type="LineEdit" parent="LoginPanel"]

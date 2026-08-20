@@ -50,15 +50,11 @@ class Reader:
 
 	func read_u64() -> int:
 		var b := _take(8)
-		var v: int = 0
-		for i in range(8):
-			v |= b[i] << (i * 8)
-		return v
+		return b.decode_u64(0)
 
 	func read_i64() -> int:
-		# GDScript int 为 64 位: 直接按位还原
-		var v := read_u64()
-		return v - 18446744073709551616 if v >= 9223372036854775808 else v
+		var b := _take(8)
+		return b.decode_s64(0)
 
 	func read_f32() -> float:
 		return _take(4).decode_float(0)
@@ -119,11 +115,11 @@ class Writer:
 	func write_u64(v: int) -> void:
 		var b := PackedByteArray()
 		b.resize(8)
-		b.encode_u64(0, v & 0xffffffffffffffff)
+		b.encode_u64(0, v)
 		data.append_array(b)
 
 	func write_i64(v: int) -> void:
-		write_u64(v & 0xffffffffffffffff)
+		write_u64(v)
 
 	func write_f32(v: float) -> void:
 		var b := PackedByteArray()
@@ -169,7 +165,7 @@ class Packet:
 		var w := Writer.new()
 		if write_fn.is_valid():
 			write_fn.call(w)
-		return encode_frame(packet_id, w.data)
+		return CrystalBinary.encode_frame(packet_id, w.data)
 
 
 ## ARGB 颜色辅助

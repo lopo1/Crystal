@@ -71,23 +71,27 @@ func _js_personal_sign(message: String, callable: Callable) -> void:
 	_js_exec(js, func(result: String) -> void:
 		var sig_bytes := PackedByteArray()
 		if result.begins_with("0x"):
-			sig_bytes = PackedByteArray.from_hex(result.substr(2))
+			sig_bytes = _hex_decode(result.substr(2))
 		callable.call(sig_bytes, "")
 	)
 
 
 func _js_available() -> bool:
-	return JavaScriptBridge.is_available() if \
-		ClassDB.class_exists("JavaScriptBridge") else false
+	return ClassDB.class_exists("JavaScriptBridge")
 
 
 func _js_exec(js: String, on_result: Callable) -> void:
 	if not _js_available():
 		on_result.call("")
 		return
-	var bridge = JavaScriptBridge.get_singleton()
-	# eval 返回 Promise；此处简化：直接 eval（同步拿到 Promise 交由前端处理）
-	bridge.eval(js, true)
+	JavaScriptBridge.eval(js, true)
+
+
+static func _hex_decode(hex_str: String) -> PackedByteArray:
+	var out := PackedByteArray()
+	for i in range(0, hex_str.length(), 2):
+		out.append(hex_str.substr(i, 2).hex_to_int())
+	return out
 
 
 # ---------------------------------------------------------------------------
@@ -115,7 +119,7 @@ func _rpc_personal_sign(message: String, callable: Callable) -> void:
 	_rpc_request("/wallet/sign", {"message": message}, func(text: String) -> void:
 		var sig_bytes := PackedByteArray()
 		if text.begins_with("0x"):
-			sig_bytes = PackedByteArray.from_hex(text.substr(2))
+			sig_bytes = _hex_decode(text.substr(2))
 		# 同时把地址也带回（简单起见从签名服务 GET；此处置空，由上层缓存）
 		callable.call(sig_bytes, "")
 	)

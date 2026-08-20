@@ -1,4 +1,4 @@
-extends Node
+extends Control
 ## 主场景控制: 登录 → 角色选择 → 进入世界(网格+移动+聊天+战斗+HUD+商店+技能)。
 ## 运行前提: 已启动 Rust 服务器 (`cargo run -p crystal-server`)。
 
@@ -45,7 +45,7 @@ var _shop_rate: float = 1.0
 var _shop_type: int = 0
 var _shop_npc_name: String = ""
 
-@onready var login_panel: Control = $LoginPanel
+@onready var login_panel: PanelContainer = $LoginPanel
 @onready var game_view: Control = $GameView
 @onready var map_root: Node2D = $GameView/MapRoot
 @onready var chat_log: RichTextLabel = $GameView/ChatLog
@@ -93,7 +93,7 @@ func _ready() -> void:
 	client.object_magic.connect(_on_object_magic)
 	client.new_magic.connect(_on_new_magic)
 	client.magic_leveled.connect(_on_magic_leveled)
-	client.switch_group.connect(_on_switch_group)
+	client.group_switched.connect(_on_switch_group)
 	client.delete_member.connect(_on_delete_member)
 	client.group_invite.connect(_on_group_invite)
 	client.add_member.connect(_on_add_member)
@@ -111,7 +111,7 @@ func _ready() -> void:
 	$GameView/NPCDialog/CloseButton.pressed.connect(func(): npc_dialog.hide())
 	$GameView/ShopPanel/CloseButton.pressed.connect(func(): shop_panel.hide())
 	$GameView/ShopPanel/VBox/ItemList.item_activated.connect(_on_shop_buy_pressed)
-	$GameView/InventoryPanel/ItemList.item_activated.connect(_on_inventory_item_activated)
+	$GameView/InventoryPanel/VBox/ItemList.item_activated.connect(_on_inventory_item_activated)
 	chat_input.text_submitted.connect(_on_chat_submitted)
 	game_view.hide()
 
@@ -172,7 +172,7 @@ func _on_wallet_login_pressed() -> void:
 			return
 		_wallet_address = addr
 		$LoginPanel/WalletStatus.text = "钱包: " + addr.substr(0, 10) + "..."
-		if client.is_connected():
+		if client.is_server_connected():
 			_begin_wallet_login()
 		else:
 			_wallet_login_pending = true
@@ -221,7 +221,7 @@ func _on_start_game_pressed() -> void:
 	if _loaded_chars.is_empty():
 		status_label.text = "没有角色，请先创建"
 		return
-	var selected := $LoginPanel/CharList.get_selected_items()
+	var selected: PackedInt32Array = $LoginPanel/CharList.get_selected_items()
 	var sel: int = selected[0] if selected.size() > 0 else 0
 	client.start_game(_loaded_chars[sel].index)
 
@@ -238,7 +238,7 @@ func _on_delete_char_pressed() -> void:
 	if _loaded_chars.is_empty():
 		status_label.text = "没有角色可删除"
 		return
-	var selected := $LoginPanel/CharList.get_selected_items()
+	var selected: PackedInt32Array = $LoginPanel/CharList.get_selected_items()
 	var sel: int = selected[0] if selected.size() > 0 else 0
 	client.delete_character(_loaded_chars[sel].index)
 	status_label.text = "已请求删除角色: %s" % _loaded_chars[sel].name
@@ -828,7 +828,7 @@ func _move_monster(object_id: int, pos: Vector2i) -> void:
 # ---------------------------------------------------------------------------
 
 func _handle_movement_input() -> void:
-	if not client.is_connected():
+	if not client.is_server_connected():
 		return
 	if _input_cooldown > 0.0:
 		return

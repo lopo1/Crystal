@@ -37,7 +37,7 @@ signal npc_refine(rate: float, refining: bool)
 signal object_magic(data: Dictionary)
 signal new_magic(magic: Dictionary)
 signal magic_leveled(spell: int, level: int, experience: int)
-signal switch_group(allow: bool)
+signal group_switched(allow: bool)
 signal delete_member(name: String)
 signal group_invite(name: String)
 signal add_member(name: String)
@@ -138,11 +138,11 @@ func disconnect_from_server() -> void:
 		_stream.disconnect_from_host()
 	_connected = false
 
-func is_connected() -> bool:
+func is_server_connected() -> bool:
 	return _connected and _stream != null and _stream.get_status() == StreamPeerTCP.STATUS_CONNECTED
 
 func send(packet) -> void:
-	if not is_connected():
+	if not is_server_connected():
 		return
 	var frame: PackedByteArray = packet.encode()
 	_stream.put_data(frame)
@@ -152,7 +152,7 @@ func send(packet) -> void:
 # ---------------------------------------------------------------------------
 
 func _send_keepalive() -> void:
-	if is_connected():
+	if is_server_connected():
 		send(Packets.c_keep_alive(Time.get_unix_time_from_system()))
 
 # ---------------------------------------------------------------------------
@@ -536,14 +536,9 @@ func _receive() -> void:
 		_rx_buffer = _rx_buffer.slice(len, _rx_buffer.size())
 		# NPCGoods (102) 在 Rust 服务端标记为 COMPRESSED，载荷是 gzip 流
 		if id == Packets.S_NPC_GOODS:
-			var gz := StreamPeerGZip.new()
-			if gz.start_decompress() == OK:
-				gz.put_data(payload)
-				var avail := gz.get_available_bytes()
-				if avail > 0:
-					var result := gz.get_data(avail)
-					if result[0] == OK:
-						payload = result[1]
+			var decompressed: PackedByteArray = payload.decompress_dynamic(-1, FileAccess.COMPRESSION_GZIP)
+			if decompressed.size() > 0:
+				payload = decompressed
 		_dispatch(id, payload)
 
 func _dispatch(id: int, payload: PackedByteArray) -> void:
@@ -650,7 +645,7 @@ func _dispatch(id: int, payload: PackedByteArray) -> void:
 		Packets.S_MAGIC_LEVELED:
 			magic_leveled.emit(data.get("spell", 0), data.get("level", 0), data.get("experience", 0))
 		Packets.S_SWITCH_GROUP:
-			switch_group.emit(data.get("allow_group", false))
+			group_switched.emit(data.get("allow_group", false))
 		Packets.S_DELETE_MEMBER:
 			delete_member.emit(data.get("name", ""))
 		Packets.S_GROUP_INVITE:
