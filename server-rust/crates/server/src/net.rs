@@ -213,6 +213,7 @@ async fn handle_client_packet(
                     tx.send(encode_packet(&s::Web3LoginResult {
                         result: 1,
                         characters: vec![],
+                        session_token: String::new(),
                     }))
                     .await
                     .ok();
@@ -228,9 +229,12 @@ async fn handle_client_packet(
                     *account_id = Some(addr.clone());
                     *stage = Stage::Select;
                     let characters = db.web3_login(&addr)?;
+                    // 登录成功签发会话 token（免签名重连）
+                    let session = web3_auth.issue_session(&addr);
                     tx.send(encode_packet(&s::Web3LoginResult {
                         result: 0,
                         characters,
+                        session_token: session,
                     }))
                     .await
                     .ok();
@@ -239,6 +243,7 @@ async fn handle_client_packet(
                     tx.send(encode_packet(&s::Web3LoginResult {
                         result: 2,
                         characters: vec![],
+                        session_token: String::new(),
                     }))
                     .await
                     .ok();
@@ -247,6 +252,35 @@ async fn handle_client_packet(
                     tx.send(encode_packet(&s::Web3LoginResult {
                         result: 3,
                         characters: vec![],
+                        session_token: String::new(),
+                    }))
+                    .await
+                    .ok();
+                }
+            }
+        }
+        ClientPacket::Web3SessionLogin(sl) => {
+            // 用会话 token 免签名重连：消耗 token -> 恢复钱包地址为账号
+            match web3_auth.consume_session(&sl.token) {
+                Some(addr) => {
+                    *account_id = Some(addr.clone());
+                    *stage = Stage::Select;
+                    let characters = db.web3_login(&addr)?;
+                    // 换发新 token，便于持续重连
+                    let session = web3_auth.issue_session(&addr);
+                    tx.send(encode_packet(&s::Web3LoginResult {
+                        result: 0,
+                        characters,
+                        session_token: session,
+                    }))
+                    .await
+                    .ok();
+                }
+                None => {
+                    tx.send(encode_packet(&s::Web3LoginResult {
+                        result: 2, // token 无效或过期
+                        characters: vec![],
+                        session_token: String::new(),
                     }))
                     .await
                     .ok();

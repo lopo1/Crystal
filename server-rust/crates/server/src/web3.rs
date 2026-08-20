@@ -55,16 +55,42 @@ impl std::fmt::Display for Web3Error {
 #[derive(Debug, Clone)]
 pub struct Web3Auth {
     challenges: Arc<Mutex<HashMap<String, Challenge>>>,
+    /// 已签发会话 token：token -> (wallet_address, issued_at)
+    sessions: Arc<Mutex<HashMap<String, (String, Instant)>>>,
     /// 本服务器实例指纹（让挑战原文唯一且可辨识）
     server_id: String,
 }
+
+/// 会话 token 有效期（秒）
+pub const SESSION_TTL: Duration = Duration::from_secs(3600);
 
 impl Web3Auth {
     pub fn new() -> Self {
         Web3Auth {
             challenges: Arc::new(Mutex::new(HashMap::new())),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
             server_id: format!("{:x}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos()),
         }
+    }
+
+    /// 登录成功后签发一次性会话 token，TTL 内可免签名重连。
+    pub fn issue_session(&self, address: &str) -> String {
+        let token = format!("sess_{}", random_hex(24));
+        self.sessions
+            .lock()
+            .unwrap()
+            .insert(token.clone(), (address.to_string(), Instant::now()));
+        token
+    }
+
+    /// 校验并消费会话 token（一次性），返回绑定的钱包地址；无效/过期返回 None。
+    pub fn consume_session(&self, token: &str) -> Option<String> {
+        let mut map = self.sessions.lock().unwrap();
+        let (addr, issued_at) = map.remove(token)?;
+        if issued_at.elapsed() > SESSION_TTL {
+            return None; // 过期，删除
+        }
+        Some(addr)
     }
 
     /// 校验并规范化钱包地址（小写 0x 十六进制）。
@@ -316,5 +342,23 @@ mod tests {
 
         // 篡改挑战原文
         assert!(auth.verify_and_consume(&addr, &"篡改后的消息", &sig).is_err());
+    }
+
+    #[test]
+    fn session_token_issue_and_consume() {
+        let auth = Web3Auth::new();
+        let a = "0xabc0000000000000000000000000000000000001";
+        let t1 = auth.issue_session(a);
+        let t2 = auth.issue_session(a);
+        assert_ne!(t1, t2, "会话 token 应唯一");
+        assert!(t1.starts_with("sess_"));
+        // 校验并消费（一次性）
+        assert_eq!(auth.consume_session(&t1), Some(a.to_string()));
+        // 一次性使用后失效
+        assert_eq!(auth.consume_session(&t1), None);
+        // 未知 token
+        assert_eq!(auth.consume_session("sess_bogus"), None);
+        // t2 仍可用
+        assert_eq!(auth.consume_session(&t2), Some(a.to_string()));
     }
 }

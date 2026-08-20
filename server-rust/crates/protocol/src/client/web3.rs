@@ -60,3 +60,22 @@ impl PacketCodec for Web3Login {
         w.write_bytes(&self.signature);
     }
 }
+
+/// ID 202 —— 用会话 token 免签名重连（登录成功后服务器签发 token，TTL 内有效）
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Web3SessionLogin {
+    /// 会话 token
+    pub token: String,
+}
+
+impl PacketCodec for Web3SessionLogin {
+    const ID: i16 = WEB3_CLIENT_BASE + 2;
+    fn read(r: &mut Reader) -> Result<Self> {
+        Ok(Web3SessionLogin {
+            token: r.read_string()?,
+        })
+    }
+    fn write(&self, w: &mut Writer) {
+        w.write_string(&self.token);
+    }
+}

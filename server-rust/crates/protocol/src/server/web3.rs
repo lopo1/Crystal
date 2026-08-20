@@ -44,6 +44,8 @@ pub struct Web3LoginResult {
     pub result: u8,
     /// 成功时的角色列表（与 LoginSuccess 同构，供客户端进入选择界面）
     pub characters: Vec<SelectInfo>,
+    /// 登录成功签发的会话 token（免签名重连用；空串表示未签发）
+    pub session_token: String,
 }
 
 impl PacketCodec for Web3LoginResult {
@@ -55,7 +57,12 @@ impl PacketCodec for Web3LoginResult {
         for _ in 0..count {
             characters.push(SelectInfo::read(r)?);
         }
-        Ok(Web3LoginResult { result, characters })
+        let session_token = r.read_string()?;
+        Ok(Web3LoginResult {
+            result,
+            characters,
+            session_token,
+        })
     }
     fn write(&self, w: &mut Writer) {
         w.write_u8(self.result);
@@ -63,5 +70,6 @@ impl PacketCodec for Web3LoginResult {
         for c in &self.characters {
             c.write(w);
         }
+        w.write_string(&self.session_token);
     }
 }

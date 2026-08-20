@@ -151,6 +151,7 @@ async fn main() -> anyhow::Result<()> {
     .await;
 
     let (id, payload) = recv_packet(&mut buf, &mut stream).await;
+    let mut session_token = String::new();
     match ServerPacket::decode(id, &payload)? {
         ServerPacket::Web3LoginResult(r) => {
             if r.result != 0 {
@@ -158,10 +159,35 @@ async fn main() -> anyhow::Result<()> {
             }
             println!("✓ 钱包登录成功，角色数 = {}", r.characters.len());
             assert_eq!(r.characters.len(), 0, "新钱包账号应尚无角色");
+            session_token = r.session_token.clone();
+        }
+        other => fail(&format!("期望 Web3LoginResult，收到 {other:?}")),
+    }
+    assert!(!session_token.is_empty(), "登录成功应签发会话 token");
+    println!("✓ 已签发会话 token ({} 字符)", session_token.len());
+
+    // 断线后用会话 token 免签名重连
+    println!("== 断开重连，用 session token 登录 ==");
+    drop(stream);
+    drop(buf);
+    let mut stream = TcpStream::connect(&srv).await.expect("重连失败");
+    let mut buf: Vec<u8> = Vec::new();
+    let (id, payload) = recv_packet(&mut buf, &mut stream).await;
+    assert!(matches!(ServerPacket::decode(id, &payload)?, ServerPacket::Connected(_)));
+    send_packet(&mut stream, &c::ClientVersion { version_hash: vec![] }).await;
+    let (id, payload) = recv_packet(&mut buf, &mut stream).await;
+    assert!(matches!(ServerPacket::decode(id, &payload)?, ServerPacket::ClientVersion(_)));
+
+    send_packet(&mut stream, &c::Web3SessionLogin { token: session_token.clone() }).await;
+    let (id, payload) = recv_packet(&mut buf, &mut stream).await;
+    match ServerPacket::decode(id, &payload)? {
+        ServerPacket::Web3LoginResult(r) => {
+            assert_eq!(r.result, 0, "session token 登录应成功，实际 result={}", r.result);
+            println!("✓ 用会话 token 重连成功，回到钱包账号（角色数 {}）", r.characters.len());
         }
         other => fail(&format!("期望 Web3LoginResult，收到 {other:?}")),
     }
 
-    println!("\n✅ Web3 钱包登录端到端通过（地址即账号，已自动注册）");
+    println!("\n✅ Web3 钱包登录端到端通过（地址即账号 + 会话 token 免签名重连）");
     Ok(())
 }

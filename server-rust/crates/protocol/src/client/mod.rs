@@ -509,4 +509,5 @@ client_packet_dispatch! {
     // ---- Web3 钱包登录扩展（自定义 ID 200+）----
     Web3ChallengeRequest => Web3ChallengeRequest,
     Web3Login => Web3Login,
+    Web3SessionLogin => Web3SessionLogin,
 }
