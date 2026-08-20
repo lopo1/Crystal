@@ -576,74 +576,38 @@ async fn seed_world(world: &World) {
     if !world.monsters.lock().await.is_empty() {
         return;
     }
-    // (image, name, level, hp, attack, defence, exp, gold)
-    let defs: [(u16, &str, u16, i32, i32, i32, u32, u32); 3] = [
-        (2, "稻草人", 1, 12, 1, 0, 5, 3),
-        (3, "骷髅", 3, 20, 3, 1, 12, 8),
-        (4, "蜘蛛", 4, 26, 5, 2, 20, 12),
-    ];
+    // 刷怪点数据化：怪物模板 + 每图刷怪点来自 spawn_config（唯一数据源）
+    let defs: Vec<(u16, String, u16, i32, i32, i32, u32, u32)> =
+        crate::spawn_config::MONSTER_TEMPLATES
+            .iter()
+            .map(|t| (t.image, t.name.to_string(), t.level, t.hp, t.attack, t.defence, t.exp, t.gold))
+            .collect();
     let mut oid = world.next_object_id();
-    // 地图 0：新手村出生点附近的连续开阔地紧凑布怪（保证测试可达），并吸附可行走格。
-    let cluster: [(i32, i32); 20] = [
-        (400, 400), (403, 402), (406, 400), (401, 405), (405, 405),
-        (398, 403), (407, 403), (403, 399), (399, 407), (406, 407),
-        (402, 402), (404, 398), (397, 401), (408, 405), (401, 399),
-        (407, 401), (404, 408), (399, 404), (406, 405), (402, 406),
-    ];
-    for i in 0..20 {
-        let (image, name, level, hp, attack, defence, exp, gold) = defs[i % 3];
-        let (cx, cy) = cluster[i];
-        let (wx, wy) = world.nearest_walkable_on(0, cx, cy);
-        world
-            .add_monster(Monster {
-                object_id: oid,
-                name: name.to_string(),
-                image,
-                location: Point::new(wx, wy),
-                direction: MirDirection::Up,
-                level,
-                max_hp: hp,
-                hp,
-                attack,
-                defence,
-                exp_reward: exp,
-                gold_reward: gold,
-                drops: vec![1, 2, 3, 4, 5],
-                dead: false,
-                dead_ticks: 0,
-                target: None,
-                cooldown: 0,
-                map_index: 0,
-            })
-            .await;
-        oid += 1;
-    }
-    // 其它已注册地图：各自在可行走格布几只怪
-    let extra: &[(u32, &[(i32, i32)])] = &[
-        (100, &[(8, 5), (9, 6), (11, 7), (12, 8)]),
-        (101, &[(10, 14), (12, 15), (13, 12), (11, 11)]),
-    ];
-    for &(mi, pts) in extra {
+    // 遍历所有已注册地图的配置刷怪点
+    let map_indexes: Vec<u32> = world.maps.read().unwrap().keys().copied().collect();
+    for mi in map_indexes {
         let map = world.get_map(mi);
-        for &(cx, cy) in pts {
-            if !map.is_walkable(cx, cy) {
-                continue; // 该格不可走，跳过
-            }
-            let (image, name, level, hp, attack, defence, exp, gold) = defs[(oid as usize) % defs.len()];
+        for &(cx, cy) in crate::spawn_config::spawn_points_for(mi) {
+            let t = defs[(oid as usize) % defs.len()].clone();
+            let (wx, wy) = if map.is_walkable(cx, cy) {
+                (cx, cy)
+            } else {
+                world.nearest_walkable_on(mi, cx, cy)
+            };
             world
                 .add_monster(Monster {
                     object_id: oid,
-                    name: name.to_string(),
-                    image,
-                    location: Point::new(cx, cy),
+                    name: t.1.clone(),
+                    image: t.0,
+                    location: Point::new(wx, wy),
                     direction: MirDirection::Up,
-                    level,
-                    max_hp: hp,
-                    hp,
-                    attack,
-                    defence,
-                    exp_reward: exp,
-                    gold_reward: gold,
+                    level: t.2,
+                    max_hp: t.3,
+                    hp: t.3,
+                    attack: t.4,
+                    defence: t.5,
+                    exp_reward: t.6,
+                    gold_reward: t.7,
                     drops: vec![1, 2, 3, 4, 5],
                     dead: false,
                     dead_ticks: 0,
