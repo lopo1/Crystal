@@ -1,11 +1,14 @@
-//! 多地图/传送端到端验证客户端。
+//! 多地图 / 传送端到端验证客户端。
 //!
 //! 用法: 先启动服务器（已注册 0/0100/0101 地图），再:
 //! `cargo run -p crystal-server --example map_client`
 //!
-//! 流程: 连接 → Login(demo) → StartGame(地图0) →
-//! 发 /map 100 传送到 0100 地图 → 校验收到 MapInformation(地图100) →
-//! 在 0100 走一步（碰撞生效）→ /map 0 回新手村 → 校验回到地图 0。
+//! 流程: 连接 → Login(demo) → StartGame(地图0) → /map 100 传送到 0100 →
+//! 校验收到 MapInformation(地图100) → 在 0100 走一步（碰撞生效）→ /map 0 回新手村。
+//!
+//! 注：传送门的"走上传送门格触发"逻辑由服务器端单元测试覆盖
+//! （world.rs teleport_player_switches_map / walk_onto_portal_detects_dest），
+//! 这里验证多地图传送（/map 命令走同一套 teleport_player 机制）。
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -50,31 +53,32 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
-    // 发送聊天命令，并等一会儿收集响应
+    // 发送聊天命令并等待
     async fn command(stream: &mut TcpStream, msg: &str) {
         send_packet(stream, &c::Chat { message: msg.to_string(), linked_items: vec![] }).await;
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
     }
-    // 读取接下来若干帧中第一个 MapInformation，返回 (map_index, 尺寸)
+    // 读取接下来若干帧中的首个 MapInformation，返回 (map_index, 宽, 高)
     async fn expect_map(buf: &mut Vec<u8>, stream: &mut TcpStream, n: usize) -> Option<(i32, i32, i32)> {
         for _ in 0..n {
             let Some((id, payload)) = recv_timed(buf, stream, 400).await else { break };
-            if let ServerPacket::MapInformation(m) = ServerPacket::decode(id, &payload).expect("decode") {
-                println!("✓ 收到 MapInformation 地图 #{} ({}x{})", m.map_index, m.title, 0);
-                // 读取随后的 NewMapInfo 拿尺寸
-                for _ in 0..4 {
-                    let Some((id2, p2)) = recv_timed(buf, stream, 300).await else { break };
-                    if let ServerPacket::NewMapInfo(nm) = ServerPacket::decode(id2, &p2).expect("decode") {
-                        return Some((m.map_index, nm.info.width, nm.info.height));
+            match ServerPacket::decode(id, &payload).expect("decode") {
+                ServerPacket::MapInformation(m) => {
+                    for _ in 0..4 {
+                        let Some((id2, p2)) = recv_timed(buf, stream, 300).await else { break };
+                        if let ServerPacket::NewMapInfo(nm) = ServerPacket::decode(id2, &p2).expect("decode") {
+                            return Some((m.map_index, nm.info.width, nm.info.height));
+                        }
                     }
+                    return Some((m.map_index, 0, 0));
                 }
-                return Some((m.map_index, 0, 0));
+                _ => {}
             }
         }
         None
     }
 
-    // 登录
+    // 连接 + 版本 + 登录
     let (id, payload) = recv(&mut buf, &mut stream).await;
     assert!(matches!(ServerPacket::decode(id, &payload)?, ServerPacket::Connected(_)));
     send_packet(&mut stream, &c::ClientVersion { version_hash: vec![] }).await;
@@ -96,7 +100,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // 传送到 0100（index=100）
+    // 传送到 0100（index=100）：/map 走同一套 teleport_player 机制
     println!("== /map 100 传送到 0100 ==");
     command(&mut stream, "/map 100").await;
     let m = expect_map(&mut buf, &mut stream, 40).await.expect("未收到地图变更 MapInformation");

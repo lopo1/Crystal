@@ -21,6 +21,28 @@ pub const MAP_WIDTH: i32 = 800;
 pub const MAP_HEIGHT: i32 = 800;
 pub const SPAWN: Point = Point { x: 400, y: 400 };
 
+/// 传送门定义：踏上源坐标即传送到目标地图的坐标（目标会自动吸附可行走格）。
+#[derive(Debug, Clone, Copy)]
+pub struct PortalDef {
+    pub src_map: u32,
+    pub x: i32,
+    pub y: i32,
+    pub dest_map: u32,
+    pub dest_x: i32,
+    pub dest_y: i32,
+}
+
+/// 传送门配置（垂直切片）：新手村(地图0) <-> 0100(地图100)。
+/// 源坐标必须为可通行的格，玩家走上去即触发。
+pub fn portals() -> Vec<PortalDef> {
+    vec![
+        // 新手村南下到 0100 洞穴
+        PortalDef { src_map: 0, x: 404, y: 412, dest_map: 100, dest_x: 8, dest_y: 6 },
+        // 回新手村
+        PortalDef { src_map: 100, x: 4, y: 4, dest_map: 0, dest_x: 404, dest_y: 404 },
+    ]
+}
+
 // ---------------------------------------------------------------------------
 // 实体
 // ---------------------------------------------------------------------------
@@ -263,6 +285,14 @@ impl World {
             direction: MirDirection::Up,
         })).await;
         true
+    }
+
+    /// 查找某地图坐标是否有传送门；命中返回 (目标地图, 目标x, 目标y)。
+    pub fn portal_at(&self, map_index: u32, x: i32, y: i32) -> Option<(u32, i32, i32)> {
+        portals()
+            .into_iter()
+            .find(|p| p.src_map == map_index && p.x == x && p.y == y)
+            .map(|p| (p.dest_map, p.dest_x, p.dest_y))
     }
 
     pub fn next_object_id(&self) -> u32 {
@@ -589,6 +619,19 @@ async fn seed_world(world: &World) {
                 level_effects: crystal_protocol::types::LevelEffects(0),
             }));
         world.npcs.lock().await.push(npc);
+
+        // 传送门标记 NPC（在新手村，踏上其所在格即传送到 0100）
+        let (pw, ph) = world.nearest_walkable(404, 412);
+        let portal_npc = Npc {
+            object_id: world.next_object_id(),
+            name: "传送门(0100)".to_string(),
+            image: 0,
+            location: Point::new(pw, ph),
+            shop_items: vec![],
+        };
+        world.npcs.lock().await.push(portal_npc);
+        // 广而告之（此传送门为视觉标记，真正的触发是玩家走上去的坐标）
+        let _ = portal_npc;
     }
 }
 
@@ -1501,5 +1544,85 @@ mod tests {
         assert_eq!(world.try_move(Point::new(1, 0), MirDirection::Down, 1), None);
         // 从 (1,0) 向左到 (0,0) 可通行
         assert_eq!(world.try_move(Point::new(1, 0), MirDirection::Left, 1), Some(Point::new(0, 0)));
+    }
+
+    #[test]
+    fn portal_at_matches_config() {
+        let world = World::new();
+        // 新手村 (404,412) -> 地图 100 (8,6)
+        assert_eq!(world.portal_at(0, 404, 412), Some((100, 8, 6)));
+        // 0100 (4,4) -> 新手村 (404,404)
+        assert_eq!(world.portal_at(100, 4, 4), Some((0, 404, 404)));
+        // 非传送门格不匹配
+        assert_eq!(world.portal_at(0, 400, 400), None);
+        assert_eq!(world.portal_at(1, 404, 412), None);
+    }
+
+    #[test]
+    fn walk_onto_portal_detects_dest() {
+        let world = World::new();
+        // 从 (404,411) 向下走一步正好踏上传送门格 (404,412)
+        let new_loc = world.try_move(Point::new(404, 411), MirDirection::Down, 1);
+        assert_eq!(new_loc, Some(Point::new(404, 412)));
+        if let Some(Point { x, y }) = new_loc {
+            assert_eq!(world.portal_at(0, x, y), Some((100, 8, 6)));
+        }
+    }
+
+    #[tokio::test]
+    async fn teleport_player_switches_map() {
+        // 构造 10x10 全通地图 0 与 100
+        let mk = |w: u16, h: u16| {
+            let mut b = vec![0u8; 8 + w as usize * h as usize * 26];
+            b[0] = 1;
+            b[2] = 0x43;
+            b[3] = 0x23;
+            b[4..6].copy_from_slice(&w.to_le_bytes());
+            b[6..8].copy_from_slice(&h.to_le_bytes());
+            crate::maps::load_map_bytes(0, &b).unwrap()
+        };
+        let mut m0 = mk(10, 10);
+        m0.index = 0;
+        let mut m100 = mk(10, 10);
+        m100.index = 100;
+        let world = World::with_map(m0);
+        world.register_map(m100);
+
+        let (tx, _rx) = mpsc::channel(16);
+        let player = Player {
+            object_id: 1,
+            account_id: "t".into(),
+            name: "T".into(),
+            class: MirClass::Warrior,
+            gender: MirGender::Male,
+            level: 1,
+            location: Point::new(404, 411),
+            direction: MirDirection::Down,
+            max_hp: 100,
+            hp: 100,
+            max_mp: 10,
+            mp: 10,
+            attack: 1,
+            defence: 0,
+            experience: 0,
+            gold: 0,
+            weapon: 0,
+            armour: 0,
+            character_index: 1,
+            sender: tx,
+            hp_changed: false,
+            equipment: std::collections::BTreeMap::new(),
+            map_index: 0,
+        };
+        world.players.lock().await.insert(1, player);
+
+        // 传送门触发动作：跨地图传送
+        let ok = world.teleport_player(1, 100, 8, 6).await;
+        assert!(ok, "传送失败");
+        let p = world.players.lock().await.get(&1).cloned().unwrap();
+        assert_eq!(p.map_index, 100, "应切换到地图 100");
+        // 目标位置落在 100 地图可通行格
+        let map = world.get_map(100);
+        assert!(map.is_walkable(p.location.x, p.location.y));
     }
 }

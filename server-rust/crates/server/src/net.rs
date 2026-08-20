@@ -633,6 +633,18 @@ async fn move_player(
         })
     };
     world.broadcast_except(frame, oid).await;
+
+    // 传送门：踏上传送门所在格即传送到目标地图（仅 Walk/Run，转身不触发）
+    if steps > 0 && player.map_index != u32::MAX {
+        if let Some((dm, dx, dy)) = world.portal_at(player.map_index, new_loc.x, new_loc.y) {
+            tracing::debug!(
+                "传送门 {} 玩家@{:?} -> 地图 {dm} ({dx},{dy})",
+                oid,
+                new_loc
+            );
+            world.teleport_player(oid, dm, dx, dy).await;
+        }
+    }
 }
 
 fn valid_account_id(id: &str) -> bool {

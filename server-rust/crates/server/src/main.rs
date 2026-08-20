@@ -30,9 +30,15 @@ fn add_demo_chars(db: &db::Database) -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .init();
+    // 日志级别：默认 info，可用 RUST_LOG=debug/trace 开启更细日志
+    let level = match std::env::var("RUST_LOG").unwrap_or_default().to_lowercase().as_str() {
+        "trace" => tracing::Level::TRACE,
+        "debug" => tracing::Level::DEBUG,
+        "warn" => tracing::Level::WARN,
+        "error" => tracing::Level::ERROR,
+        _ => tracing::Level::INFO,
+    };
+    tracing_subscriber::fmt().with_max_level(level).init();
 
     let addr = std::env::var("CRYSTAL_BIND").unwrap_or_else(|_| "127.0.0.1:7000".to_string());
     let db_path = std::env::var("CRYSTAL_DB").unwrap_or_else(|_| "data/crystal.db".to_string());
