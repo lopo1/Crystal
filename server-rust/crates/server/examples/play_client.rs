@@ -214,6 +214,17 @@ async fn main() -> anyhow::Result<()> {
                 _ => {}
             }
         }
+        // 怪物已死：补读几包确保拿到紧随 ObjectDied 之后的 GainExperience
+        if killed && !gained_xp {
+            for _ in 0..6 {
+                let Some((id, payload)) = recv_timed(&mut buf, &mut stream, 300).await else { break };
+                if matches!(ServerPacket::decode(id, &payload)?, ServerPacket::GainExperience(_)) {
+                    gained_xp = true;
+                    println!("✓ 获得经验（补读）");
+                    break;
+                }
+            }
+        }
         if killed || attacks > 60 {
             break;
         }

@@ -85,6 +85,7 @@ pub struct GroundItem {
     pub count: u16,
     pub location: Point,
     pub unique_id: u64,
+    pub map_index: u32,
 }
 
 /// 怪物
@@ -109,6 +110,8 @@ pub struct Monster {
     /// 攻击目标玩家 / 攻击冷却
     pub target: Option<u32>,
     pub cooldown: u32,
+    /// 怪物所在地图
+    pub map_index: u32,
 }
 
 /// 静态 NPC（用 ObjectPlayer 显示）
@@ -119,6 +122,7 @@ pub struct Npc {
     pub image: u16,
     pub location: Point,
     pub shop_items: Vec<i32>,
+    pub map_index: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -328,6 +332,26 @@ impl World {
         }
     }
 
+    /// 仅对所在地图为 `map_index` 的玩家广播
+    pub async fn broadcast_on(&self, map_index: u32, frame: Vec<u8>) {
+        let players = self.players.lock().await;
+        for p in players.values() {
+            if p.map_index == map_index {
+                let _ = p.sender.try_send(frame.clone());
+            }
+        }
+    }
+
+    /// 仅对所在地图为 `map_index` 且非 `except` 的玩家广播
+    pub async fn broadcast_on_except(&self, map_index: u32, frame: Vec<u8>, except: u32) {
+        let players = self.players.lock().await;
+        for p in players.values() {
+            if p.map_index == map_index && p.object_id != except {
+                let _ = p.sender.try_send(frame.clone());
+            }
+        }
+    }
+
     pub async fn add_player(&self, player: Player) {
         let p = player.clone();
         self.broadcast_except(encode_packet(&s::ObjectPlayer {
@@ -369,9 +393,10 @@ impl World {
     }
 
     async fn send_world_state_to(&self, oid: u32) {
-        // 怪物
+        let player_map = self.players.lock().await.get(&oid).map(|p| p.map_index).unwrap_or(0);
+        // 怪物（仅本图）
         let monsters = self.monsters.lock().await.clone();
-        for m in monsters.values() {
+        for m in monsters.values().filter(|m| m.map_index == player_map) {
             self.send_to(oid, encode_packet(&s::ObjectMonster {
                 object_id: m.object_id,
                 name: m.name.clone(),
@@ -396,9 +421,9 @@ impl World {
             }))
             .await;
         }
-        // 掉落物
+        // 掉落物（仅本图）
         let items = self.items.lock().await.clone();
-        for gi in items.values() {
+        for gi in items.values().filter(|gi| gi.map_index == player_map) {
             self.send_to(oid, encode_packet(&s::ObjectItem {
                 object_id: gi.object_id,
                 name: format!("#{}", gi.item_index),
@@ -409,9 +434,9 @@ impl World {
             }))
             .await;
         }
-        // NPC
+        // NPC（仅本图）
         let npcs = self.npcs.lock().await.clone();
-        for n in npcs.iter() {
+        for n in npcs.iter().filter(|n| n.map_index == player_map) {
             self.send_to(oid, encode_packet(&s::ObjectPlayer {
                 object_id: n.object_id,
                 name: n.name.clone(),
@@ -458,8 +483,8 @@ impl World {
     }
 
     pub async fn add_monster(&self, m: Monster) {
-        // 若已存在则更新广播
-        self.broadcast(encode_packet(&s::ObjectMonster {
+        let mi = m.map_index;
+        self.broadcast_on(mi, encode_packet(&s::ObjectMonster {
             object_id: m.object_id,
             name: m.name.clone(),
             name_colour: Argb(0xFFFF2222),
@@ -480,31 +505,40 @@ impl World {
             master_object_id: 0,
             rarity: 0,
             buffs: vec![],
-        }));
+        })).await;
         self.monsters.lock().await.insert(m.object_id, m);
     }
 
     pub async fn remove_monster(&self, object_id: u32) {
+        let mi = self
+            .monsters
+            .lock()
+            .await
+            .get(&object_id)
+            .map(|m| m.map_index)
+            .unwrap_or(0);
         self.monsters.lock().await.remove(&object_id);
-        self.broadcast(encode_packet(&s::ObjectRemove { object_id }));
+        self.broadcast_on(mi, encode_packet(&s::ObjectRemove { object_id })).await;
     }
 
     pub async fn add_ground_item(&self, gi: GroundItem) {
         let _ = gi.unique_id;
-        self.broadcast(encode_packet(&s::ObjectItem {
+        let mi = gi.map_index;
+        self.broadcast_on(mi, encode_packet(&s::ObjectItem {
             object_id: gi.object_id,
             name: format!("#{}", gi.item_index),
             name_colour: Argb(0),
             location: gi.location,
             image: gi.item_index as u16,
             grade: 0,
-        }));
+        })).await;
         self.items.lock().await.insert(gi.object_id, gi);
     }
 
     pub async fn remove_ground_item(&self, object_id: u32) {
+        let mi = self.items.lock().await.get(&object_id).map(|i| i.map_index).unwrap_or(0);
         self.items.lock().await.remove(&object_id);
-        self.broadcast(encode_packet(&s::ObjectRemove { object_id }));
+        self.broadcast_on(mi, encode_packet(&s::ObjectRemove { object_id })).await;
     }
 
     pub async fn npcs(&self) -> Vec<Npc> {
@@ -540,8 +574,7 @@ async fn seed_world(world: &World) {
         (4, "蜘蛛", 4, 26, 5, 2, 20, 12),
     ];
     let mut oid = world.next_object_id();
-    // 在新手村出生点附近的连续开阔地（地图 0 的 400,400 附近）紧凑布怪，
-    // 保证玩家直线可达（确认位置行走测试用），并吸附到可行走格。
+    // 地图 0：新手村出生点附近的连续开阔地紧凑布怪（保证测试可达），并吸附可行走格。
     let cluster: [(i32, i32); 20] = [
         (400, 400), (403, 402), (406, 400), (401, 405), (405, 405),
         (398, 403), (407, 403), (403, 399), (399, 407), (406, 407),
@@ -551,7 +584,7 @@ async fn seed_world(world: &World) {
     for i in 0..20 {
         let (image, name, level, hp, attack, defence, exp, gold) = defs[i % 3];
         let (cx, cy) = cluster[i];
-        let (wx, wy) = world.nearest_walkable(cx, cy);
+        let (wx, wy) = world.nearest_walkable_on(0, cx, cy);
         world
             .add_monster(Monster {
                 object_id: oid,
@@ -571,9 +604,47 @@ async fn seed_world(world: &World) {
                 dead_ticks: 0,
                 target: None,
                 cooldown: 0,
+                map_index: 0,
             })
             .await;
         oid += 1;
+    }
+    // 其它已注册地图：各自在可行走格布几只怪
+    let extra: &[(u32, &[(i32, i32)])] = &[
+        (100, &[(8, 5), (9, 6), (11, 7), (12, 8)]),
+        (101, &[(10, 14), (12, 15), (13, 12), (11, 11)]),
+    ];
+    for &(mi, pts) in extra {
+        let map = world.get_map(mi);
+        for &(cx, cy) in pts {
+            if !map.is_walkable(cx, cy) {
+                continue; // 该格不可走，跳过
+            }
+            let (image, name, level, hp, attack, defence, exp, gold) = defs[(oid as usize) % defs.len()];
+            world
+                .add_monster(Monster {
+                    object_id: oid,
+                    name: name.to_string(),
+                    image,
+                    location: Point::new(cx, cy),
+                    direction: MirDirection::Up,
+                    level,
+                    max_hp: hp,
+                    hp,
+                    attack,
+                    defence,
+                    exp_reward: exp,
+                    gold_reward: gold,
+                    drops: vec![1, 2, 3, 4, 5],
+                    dead: false,
+                    dead_ticks: 0,
+                    target: None,
+                    cooldown: 0,
+                    map_index: mi,
+                })
+                .await;
+            oid += 1;
+        }
     }
     // 商人 NPC：卖 木剑(1)/布衣(2)/金创药(3)/回城卷(4)/铜钱袋(5)
     if world.npcs.lock().await.is_empty() {
@@ -584,9 +655,10 @@ async fn seed_world(world: &World) {
             image: 0,
             location: Point::new(wx, wy),
             shop_items: vec![1, 2, 3, 4, 5],
+            map_index: 0,
         };
         world
-            .broadcast(encode_packet(&s::ObjectPlayer {
+            .broadcast_on(0, encode_packet(&s::ObjectPlayer {
                 object_id: npc.object_id,
                 name: npc.name.clone(),
                 guild_name: String::new(),
@@ -628,6 +700,7 @@ async fn seed_world(world: &World) {
             image: 0,
             location: Point::new(pw, ph),
             shop_items: vec![],
+            map_index: 0,
         };
         world.npcs.lock().await.push(portal_npc);
         // 广而告之（此传送门为视觉标记，真正的触发是玩家走上去的坐标）
@@ -695,15 +768,16 @@ async fn monster_ai(world: &World) {
             let mut target_oid = m.target;
             let mut target_loc: Option<Point> = None;
             if target_oid.is_some() {
-                if let Some(p) = players.get(&target_oid.unwrap()) {
-                    target_loc = Some(p.location);
+                let tid = target_oid.unwrap();
+                if players.get(&tid).map(|p| p.map_index == m.map_index).unwrap_or(false) {
+                    target_loc = players.get(&tid).map(|p| p.location);
                 } else {
-                    target_oid = None; // 目标已消失，脱战
+                    target_oid = None; // 目标消失或跨图，脱战
                 }
             }
             if target_oid.is_none() {
                 let mut nearest: Option<(u32, i32)> = None;
-                for p in players.values() {
+                for p in players.values().filter(|p| p.map_index == m.map_index) {
                     let d = manhattan(m.location, p.location);
                     if d <= PERCEPTION && nearest.map(|(_, nd)| d < nd).unwrap_or(true) {
                         nearest = Some((p.object_id, d));
@@ -741,19 +815,21 @@ async fn monster_ai(world: &World) {
     }
     // 应用移动（更新位置 + 广播）
     for (mid, new_loc, dir) in moves {
-        {
+        let mi = {
             let mut mons = world.monsters.lock().await;
-            if let Some(m) = mons.get_mut(&mid) {
-                m.location = new_loc;
-                m.direction = dir;
-                m.cooldown = 1; // 限制移动频率
-            }
-        }
-        world.broadcast(encode_packet(&s::ObjectWalk {
-            object_id: mid,
-            location: new_loc,
-            direction: dir,
-        }));
+            let Some(m) = mons.get_mut(&mid) else { continue };
+            m.location = new_loc;
+            m.direction = dir;
+            m.cooldown = 1; // 限制移动频率
+            m.map_index
+        };
+        world
+            .broadcast_on(mi, encode_packet(&s::ObjectWalk {
+                object_id: mid,
+                location: new_loc,
+                direction: dir,
+            }))
+            .await;
     }
     for (mid, pid, dmg) in attacks {
         monster_hit_player(world, mid, pid, dmg).await;
@@ -826,23 +902,25 @@ pub async fn player_attack(world: &World, player_id: u32, direction: MirDirectio
     let Some(player) = world.get_player(player_id).await else {
         return false;
     };
-    world.broadcast(encode_packet(&s::ObjectAttack {
-        object_id: player_id,
-        location: player.location,
-        direction,
-        spell: 0,
-        level: 0,
-        r#type: 0,
-    }));
+    world
+        .broadcast_on(player.map_index, encode_packet(&s::ObjectAttack {
+            object_id: player_id,
+            location: player.location,
+            direction,
+            spell: 0,
+            level: 0,
+            r#type: 0,
+        }))
+        .await;
     let (dx, dy) = direction_offset(direction, 1);
     let target_pos = Point::new(player.location.x + dx, player.location.y + dy);
 
-    // 首选正前方邻格；若怪物贴侧/斜角，则回退到任意相邻死亡与否的怪物
+    // 首选正前方邻格；若怪物贴侧/斜角，则回退到任意相邻死亡与否的怪物（同图）
     let target_monster = {
         let mons = world.monsters.lock().await;
         let front = mons
             .values()
-            .find(|m| !m.dead && m.location == target_pos)
+            .find(|m| !m.dead && m.map_index == player.map_index && m.location == target_pos)
             .map(|m| m.object_id);
         front.or_else(|| {
             [
@@ -852,7 +930,12 @@ pub async fn player_attack(world: &World, player_id: u32, direction: MirDirectio
             ]
             .iter()
             .map(|(ox, oy)| Point::new(player.location.x + ox, player.location.y + oy))
-            .find_map(|cand| mons.values().find(|m| !m.dead && m.location == cand).map(|m| m.object_id))
+            .find_map(|cand| {
+                mons
+                    .values()
+                    .find(|m| !m.dead && m.map_index == player.map_index && m.location == cand)
+                    .map(|m| m.object_id)
+            })
         })
     };
     let Some(monster_id) = target_monster else { return false };
@@ -891,7 +974,7 @@ pub async fn player_magic_attack(
         let mons = world.monsters.lock().await;
         'line: for step in 1..=tmpl.range as i32 {
             let pos = Point::new(player.location.x + dx * step, player.location.y + dy * step);
-            for m in mons.values().filter(|m| !m.dead && m.location == pos) {
+            for m in mons.values().filter(|m| !m.dead && m.map_index == player.map_index && m.location == pos) {
                 target_monster = Some((m.object_id, m.location));
                 break 'line;
             }
@@ -901,7 +984,7 @@ pub async fn player_magic_attack(
         // 半平面兜底：朝向方向分量对齐、且在射程内的最近怪物
         let mut best: Option<(u32, Point, i32)> = None;
         let mons = world.monsters.lock().await;
-        for m in mons.values().filter(|m| !m.dead) {
+        for m in mons.values().filter(|m| !m.dead && m.map_index == player.map_index) {
             let ox = m.location.x - player.location.x;
             let oy = m.location.y - player.location.y;
             // 朝向分量需同向：前方方向的分量 > 0
@@ -937,18 +1020,20 @@ pub async fn player_magic_attack(
     }
 
     // 施法动画（前台广播 ObjectMagic）
-    world.broadcast(encode_packet(&s::ObjectMagic {
-        object_id: player_id,
-        location: player.location,
-        direction,
-        spell,
-        target_id,
-        target: target_pos,
-        cast: true,
-        level: 1,
-        self_broadcast: true,
-        secondary_target_ids: vec![],
-    }));
+    world
+        .broadcast_on(player.map_index, encode_packet(&s::ObjectMagic {
+            object_id: player_id,
+            location: player.location,
+            direction,
+            spell,
+            target_id,
+            target: target_pos,
+            cast: true,
+            level: 1,
+            self_broadcast: true,
+            secondary_target_ids: vec![],
+        }))
+        .await;
 
     // 命中结算（复用物理近战的击杀/掉落/经验逻辑）
     let dmg = (tmpl.damage + player.attack / 2 - monster_defence(world, target_id).await.max(0)).max(1);
@@ -963,12 +1048,14 @@ async fn monster_defence(world: &World, monster_id: u32) -> i32 {
 
 pub async fn player_hit_monster(world: &World, player_id: u32, monster_id: u32, dmg: i32) {
     let mut died = false;
+    let mut monster_map = 0u32;
     {
         let mut mons = world.monsters.lock().await;
         if let Some(m) = mons.get_mut(&monster_id) {
             if m.dead {
                 return;
             }
+            monster_map = m.map_index;
             m.target = Some(player_id);
             m.cooldown = 2;
             m.hp -= dmg;
@@ -980,38 +1067,44 @@ pub async fn player_hit_monster(world: &World, player_id: u32, monster_id: u32, 
             }
         }
     }
-    world.broadcast(encode_packet(&s::DamageIndicator {
-        damage: dmg,
-        r#type: 0,
-        object_id: player_id,
-    }));
+    world
+        .broadcast_on(monster_map, encode_packet(&s::DamageIndicator {
+            damage: dmg,
+            r#type: 0,
+            object_id: player_id,
+        }))
+        .await;
     let loc = {
         let mons = world.monsters.lock().await;
         mons.get(&monster_id).map(|m| m.location).unwrap_or(Point::new(0, 0))
     };
-    world.broadcast(encode_packet(&s::ObjectStruck {
-        object_id: monster_id,
-        attacker_id: player_id,
-        location: loc,
-        direction: MirDirection::Up,
-    }));
+    world
+        .broadcast_on(monster_map, encode_packet(&s::ObjectStruck {
+            object_id: monster_id,
+            attacker_id: player_id,
+            location: loc,
+            direction: MirDirection::Up,
+        }))
+        .await;
     if died {
         monster_died(world, player_id, monster_id).await;
     }
 }
 
 async fn monster_died(world: &World, player_id: u32, monster_id: u32) {
-    let (loc, drops, exp_reward, gold_reward) = {
+    let (loc, drops, exp_reward, gold_reward, map_index) = {
         let mons = world.monsters.lock().await;
         let m = mons.get(&monster_id).unwrap();
-        (m.location, m.drops.clone(), m.exp_reward, m.gold_reward)
+        (m.location, m.drops.clone(), m.exp_reward, m.gold_reward, m.map_index)
     };
-    world.broadcast(encode_packet(&s::ObjectDied {
-        object_id: monster_id,
-        location: loc,
-        direction: MirDirection::Up,
-        r#type: 0,
-    }));
+    world
+        .broadcast_on(map_index, encode_packet(&s::ObjectDied {
+            object_id: monster_id,
+            location: loc,
+            direction: MirDirection::Up,
+            r#type: 0,
+        }))
+        .await;
     for &item_index in &drops {
         if item_index <= 0 {
             continue;
@@ -1024,6 +1117,7 @@ async fn monster_died(world: &World, player_id: u32, monster_id: u32) {
                 count: 1,
                 location: loc,
                 unique_id: world.next_item_unique(),
+                map_index,
             })
             .await;
     }
@@ -1340,7 +1434,7 @@ pub async fn pick_up(world: &World, player_id: u32, db: &crate::db::Database) {
         let items = world.items.lock().await;
         items
             .values()
-            .find(|gi| manhattan(gi.location, player.location) <= 1)
+            .find(|gi| gi.map_index == player.map_index && manhattan(gi.location, player.location) <= 1)
             .map(|gi| gi.object_id)
     };
     let Some(oid) = target else { return };
@@ -1378,6 +1472,7 @@ pub async fn drop_ground_item(world: &World, player_id: u32, item: UserItem) -> 
             count: item.count,
             location: player.location,
             unique_id: item.unique_id,
+            map_index: player.map_index,
         })
         .await;
     true
@@ -1624,5 +1719,36 @@ mod tests {
         // 目标位置落在 100 地图可通行格
         let map = world.get_map(100);
         assert!(map.is_walkable(p.location.x, p.location.y));
+    }
+
+    #[tokio::test]
+    async fn monsters_are_tagged_with_map() {
+        let world = World::new();
+        // 手动布两只不同地图的怪
+        let mk = |oid: u32, mi: u32| Monster {
+            object_id: oid,
+            name: format!("M{oid}"),
+            image: 1,
+            location: Point::new(oid as i32, 0),
+            direction: MirDirection::Up,
+            level: 1,
+            max_hp: 10,
+            hp: 10,
+            attack: 1,
+            defence: 0,
+            exp_reward: 5,
+            gold_reward: 1,
+            drops: vec![],
+            dead: false,
+            dead_ticks: 0,
+            target: None,
+            cooldown: 0,
+            map_index: mi,
+        };
+        world.add_monster(mk(1, 0)).await;
+        world.add_monster(mk(2, 100)).await;
+        let mons = world.monsters.lock().await.clone();
+        assert_eq!(mons.get(&1).unwrap().map_index, 0);
+        assert_eq!(mons.get(&2).unwrap().map_index, 100);
     }
 }
