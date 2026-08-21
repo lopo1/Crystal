@@ -260,7 +260,7 @@ func attack(direction: int, spell: int = 0) -> void:
 	send(p)
 
 ## 远程攻击（弓手）：direction 朝向 + 目标对象与目标位置（同 C# C.RangeAttack）
-func range_attack(direction: int, target_id: int, location: Vector2i, target_location: Vector2i) -> void:
+func send_range_attack(direction: int, target_id: int, location: Vector2i, target_location: Vector2i) -> void:
 	var p := CrystalBinary.Packet.new()
 	p.packet_id = ClientPacketId.RANGE_ATTACK
 	p.write_fn = func(w) -> void:
@@ -287,7 +287,7 @@ func change_a_mode(mode: int) -> void:
 	send(p)
 
 ## 开城门
-func opendoor(door_index: int) -> void:
+func send_opendoor(door_index: int) -> void:
 	var p := CrystalBinary.Packet.new()
 	p.packet_id = ClientPacketId.OPENDOOR
 	p.write_fn = func(w) -> void:
@@ -295,7 +295,7 @@ func opendoor(door_index: int) -> void:
 	send(p)
 
 ## 发起面对面交易（须面对目标玩家）
-func trade_request() -> void:
+func send_trade_request() -> void:
 	var p := CrystalBinary.Packet.new()
 	p.packet_id = ClientPacketId.TRADE_REQUEST
 	send(p)
@@ -309,7 +309,7 @@ func trade_reply(accept: bool) -> void:
 	send(p)
 
 ## 放入交易金币
-func trade_gold(amount: int) -> void:
+func send_trade_gold(amount: int) -> void:
 	var p := CrystalBinary.Packet.new()
 	p.packet_id = ClientPacketId.TRADE_GOLD
 	p.write_fn = func(w) -> void:
@@ -441,7 +441,7 @@ func lock_mail(mail_id: int, lock: bool) -> void:
 	send(p)
 
 ## 查询邮寄费用（当前免费，服务端回 0）
-func mail_cost(gold: int, item_uids: Array = []) -> void:
+func send_mail_cost(gold: int, item_uids: Array = []) -> void:
 	var p := CrystalBinary.Packet.new()
 	p.packet_id = ClientPacketId.MAIL_COST
 	p.write_fn = func(w) -> void:
@@ -462,7 +462,7 @@ func mail_locked_item(unique_id: int, locked: bool) -> void:
 	send(p)
 
 ## 删除背包物品（count=0 表示全部）
-func delete_item(unique_id: int, count: int = 0) -> void:
+func send_delete_item(unique_id: int, count: int = 0) -> void:
 	var p := CrystalBinary.Packet.new()
 	p.packet_id = ClientPacketId.DELETE_ITEM
 	p.write_fn = func(w) -> void:
@@ -694,13 +694,6 @@ func refresh_friends() -> void:
 	p.packet_id = 129
 	send(p)
 
-func spell_toggle(spell: int) -> void:
-	var p := CrystalBinary.Packet.new()
-	p.packet_id = 69
-	p.write_fn = func(w) -> void:
-		w.write_u8(spell)
-	send(p)
-
 func fishing_cast() -> void:
 	var p := CrystalBinary.Packet.new()
 	p.packet_id = 102
@@ -719,13 +712,6 @@ func accept_reincarnation() -> void:
 func cancel_reincarnation() -> void:
 	var p := CrystalBinary.Packet.new()
 	p.packet_id = 109
-	send(p)
-
-func harvest(direction: int) -> void:
-	var p := CrystalBinary.Packet.new()
-	p.packet_id = 49
-	p.write_fn = func(w) -> void:
-		w.write_u8(direction)
 	send(p)
 
 func request_map_info() -> void:

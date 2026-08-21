@@ -152,74 +152,142 @@ func _get_generated_texture(key: String) -> Texture2D:
 	var image := Image.create(32, 32, false, Image.FORMAT_RGBA8)
 	image.fill(Color(0, 0, 0, 0))
 	match key:
-		"tile_dark":
-			image.fill(Color(0.10, 0.13, 0.18, 1.0))
-			_fill_px(image, 0, 0, 32, 2, Color(0.16, 0.20, 0.27, 1.0))
-			_fill_px(image, 0, 0, 2, 32, Color(0.16, 0.20, 0.27, 1.0))
-			_fill_px(image, 30, 0, 2, 32, Color(0.06, 0.08, 0.12, 1.0))
-			_fill_px(image, 0, 30, 32, 2, Color(0.06, 0.08, 0.12, 1.0))
-		"tile_light":
-			image.fill(Color(0.12, 0.16, 0.21, 1.0))
-			_fill_px(image, 0, 0, 32, 2, Color(0.19, 0.24, 0.31, 1.0))
-			_fill_px(image, 0, 0, 2, 32, Color(0.19, 0.24, 0.31, 1.0))
-			_fill_px(image, 30, 0, 2, 32, Color(0.07, 0.09, 0.13, 1.0))
-			_fill_px(image, 0, 30, 32, 2, Color(0.07, 0.09, 0.13, 1.0))
+		"tile_dirt", "tile_dark":
+			# 传奇经典泥土地/土路
+			image.fill(Color(0.38, 0.29, 0.19, 1.0))
+			_fill_px(image, 0, 0, 32, 1, Color(0.44, 0.35, 0.24, 1.0))
+			_fill_px(image, 0, 31, 32, 1, Color(0.30, 0.22, 0.14, 1.0))
+			_fill_px(image, 4, 6, 3, 2, Color(0.52, 0.44, 0.34, 1.0))
+			_fill_px(image, 18, 12, 4, 3, Color(0.55, 0.48, 0.38, 1.0))
+			_fill_px(image, 10, 22, 3, 2, Color(0.50, 0.42, 0.32, 1.0))
+			_fill_px(image, 25, 24, 2, 2, Color(0.32, 0.24, 0.15, 1.0))
+			_fill_px(image, 8, 14, 2, 2, Color(0.28, 0.20, 0.12, 1.0))
+			_fill_px(image, 22, 5, 2, 2, Color(0.48, 0.40, 0.30, 1.0))
+		"tile_grass", "tile_light":
+			# 传奇经典草地/草丛地表
+			image.fill(Color(0.26, 0.38, 0.18, 1.0))
+			_fill_px(image, 0, 0, 32, 1, Color(0.32, 0.48, 0.22, 1.0))
+			_fill_px(image, 0, 31, 32, 1, Color(0.20, 0.30, 0.13, 1.0))
+			_fill_px(image, 5, 8, 2, 4, Color(0.38, 0.58, 0.25, 1.0))
+			_fill_px(image, 7, 7, 2, 5, Color(0.35, 0.54, 0.24, 1.0))
+			_fill_px(image, 20, 18, 2, 4, Color(0.38, 0.58, 0.25, 1.0))
+			_fill_px(image, 22, 16, 2, 6, Color(0.35, 0.54, 0.24, 1.0))
+			_fill_px(image, 14, 24, 3, 2, Color(0.34, 0.26, 0.16, 1.0))
+		"tile_stone":
+			# 传奇经典新手村石板路
+			image.fill(Color(0.36, 0.36, 0.38, 1.0))
+			_fill_px(image, 0, 0, 32, 1, Color(0.48, 0.48, 0.52, 1.0))
+			_fill_px(image, 0, 0, 1, 32, Color(0.48, 0.48, 0.52, 1.0))
+			_fill_px(image, 0, 15, 32, 2, Color(0.22, 0.22, 0.24, 1.0))
+			_fill_px(image, 15, 0, 2, 16, Color(0.22, 0.22, 0.24, 1.0))
+			_fill_px(image, 24, 16, 2, 16, Color(0.22, 0.22, 0.24, 1.0))
+			_fill_px(image, 0, 30, 32, 2, Color(0.22, 0.22, 0.24, 1.0))
+			_fill_px(image, 30, 0, 2, 32, Color(0.22, 0.22, 0.24, 1.0))
 		"player_self":
-			_fill_px(image, 10, 3, 12, 8, Color(0.95, 0.80, 0.65, 1.0))
-			_fill_px(image, 8, 10, 16, 12, Color(0.20, 0.72, 0.30, 1.0))
-			_fill_px(image, 6, 11, 4, 10, Color(0.95, 0.80, 0.65, 1.0))
-			_fill_px(image, 22, 11, 4, 10, Color(0.95, 0.80, 0.65, 1.0))
-			_fill_px(image, 9, 22, 5, 8, Color(0.22, 0.24, 0.30, 1.0))
-			_fill_px(image, 18, 22, 5, 8, Color(0.22, 0.24, 0.30, 1.0))
-			_fill_px(image, 8, 9, 16, 3, Color(0.10, 0.22, 0.12, 1.0))
-			_fill_px(image, 12, 1, 8, 3, Color(0.85, 0.95, 0.30, 1.0))
+			# 经典传奇战士造型 (重甲 + 头盔 + 银剑 + 脚底阴影)
+			_fill_px(image, 6, 26, 20, 5, Color(0.0, 0.0, 0.0, 0.35))
+			_fill_px(image, 10, 22, 4, 6, Color(0.30, 0.22, 0.15, 1.0))
+			_fill_px(image, 18, 22, 4, 6, Color(0.30, 0.22, 0.15, 1.0))
+			_fill_px(image, 9, 17, 14, 6, Color(0.25, 0.28, 0.35, 1.0))
+			_fill_px(image, 8, 9, 16, 9, Color(0.72, 0.74, 0.82, 1.0))
+			_fill_px(image, 8, 16, 16, 2, Color(0.85, 0.25, 0.20, 1.0))
+			_fill_px(image, 5, 9, 4, 6, Color(0.90, 0.75, 0.20, 1.0))
+			_fill_px(image, 23, 9, 4, 6, Color(0.90, 0.75, 0.20, 1.0))
+			_fill_px(image, 11, 4, 10, 6, Color(0.95, 0.82, 0.68, 1.0))
+			_fill_px(image, 9, 1, 14, 5, Color(0.78, 0.80, 0.88, 1.0))
+			_fill_px(image, 14, 0, 4, 2, Color(0.90, 0.15, 0.15, 1.0))
+			_fill_px(image, 25, 5, 3, 16, Color(0.95, 0.95, 1.0, 1.0))
+			_fill_px(image, 24, 13, 5, 2, Color(0.85, 0.70, 0.20, 1.0))
 		"player_other":
-			_fill_px(image, 10, 3, 12, 8, Color(0.95, 0.80, 0.65, 1.0))
-			_fill_px(image, 8, 10, 16, 12, Color(0.28, 0.48, 0.90, 1.0))
-			_fill_px(image, 6, 11, 4, 10, Color(0.95, 0.80, 0.65, 1.0))
-			_fill_px(image, 22, 11, 4, 10, Color(0.95, 0.80, 0.65, 1.0))
-			_fill_px(image, 9, 22, 5, 8, Color(0.22, 0.24, 0.30, 1.0))
-			_fill_px(image, 18, 22, 5, 8, Color(0.22, 0.24, 0.30, 1.0))
-			_fill_px(image, 8, 9, 16, 3, Color(0.10, 0.14, 0.24, 1.0))
-			_fill_px(image, 11, 1, 10, 3, Color(0.65, 0.40, 0.16, 1.0))
+			# 经典传奇法师/道士造型 (法袍 + 法冠 + 法杖)
+			_fill_px(image, 6, 26, 20, 5, Color(0.0, 0.0, 0.0, 0.35))
+			_fill_px(image, 10, 23, 4, 5, Color(0.20, 0.15, 0.10, 1.0))
+			_fill_px(image, 18, 23, 4, 5, Color(0.20, 0.15, 0.10, 1.0))
+			_fill_px(image, 8, 9, 16, 15, Color(0.22, 0.42, 0.85, 1.0))
+			_fill_px(image, 10, 11, 12, 12, Color(0.18, 0.32, 0.70, 1.0))
+			_fill_px(image, 11, 4, 10, 6, Color(0.95, 0.82, 0.68, 1.0))
+			_fill_px(image, 9, 1, 14, 4, Color(0.15, 0.28, 0.65, 1.0))
+			_fill_px(image, 25, 2, 3, 22, Color(0.55, 0.40, 0.20, 1.0))
+			_fill_px(image, 24, 0, 5, 5, Color(0.30, 0.85, 1.0, 1.0))
 		"npc":
-			_fill_px(image, 10, 4, 12, 8, Color(0.95, 0.82, 0.66, 1.0))
-			_fill_px(image, 8, 12, 16, 12, Color(0.95, 0.75, 0.18, 1.0))
-			_fill_px(image, 7, 10, 18, 3, Color(0.42, 0.18, 0.05, 1.0))
-			_fill_px(image, 8, 24, 6, 6, Color(0.45, 0.28, 0.10, 1.0))
-			_fill_px(image, 18, 24, 6, 6, Color(0.45, 0.28, 0.10, 1.0))
-			_fill_px(image, 5, 6, 22, 3, Color(0.70, 0.10, 0.10, 1.0))
+			# 经典传奇老者/掌柜 (长袍 + 白须 + 幡布)
+			_fill_px(image, 6, 26, 20, 5, Color(0.0, 0.0, 0.0, 0.35))
+			_fill_px(image, 8, 10, 16, 16, Color(0.20, 0.52, 0.58, 1.0))
+			_fill_px(image, 11, 4, 10, 6, Color(0.95, 0.82, 0.68, 1.0))
+			_fill_px(image, 11, 9, 10, 6, Color(0.95, 0.95, 0.95, 1.0))
+			_fill_px(image, 9, 1, 14, 4, Color(0.12, 0.28, 0.35, 1.0))
+			_fill_px(image, 25, 6, 3, 20, Color(0.55, 0.38, 0.20, 1.0))
+			_fill_px(image, 23, 7, 7, 7, Color(0.92, 0.85, 0.60, 1.0))
 		"item":
-			_fill_px(image, 12, 16, 8, 8, Color(0.18, 0.62, 0.22, 1.0))
-			_fill_px(image, 10, 14, 12, 2, Color(0.80, 0.95, 0.30, 1.0))
-			_fill_px(image, 11, 24, 10, 3, Color(0.10, 0.18, 0.08, 1.0))
+			# 经典传奇金币堆 + 药水瓶
+			_fill_px(image, 6, 22, 20, 6, Color(0.0, 0.0, 0.0, 0.35))
+			_fill_px(image, 8, 16, 16, 9, Color(0.95, 0.78, 0.15, 1.0))
+			_fill_px(image, 10, 17, 4, 3, Color(1.0, 0.95, 0.50, 1.0))
+			_fill_px(image, 18, 18, 4, 3, Color(1.0, 0.95, 0.50, 1.0))
+			_fill_px(image, 12, 14, 8, 3, Color(0.85, 0.68, 0.10, 1.0))
+			_fill_px(image, 22, 10, 6, 9, Color(0.90, 0.18, 0.18, 1.0))
+			_fill_px(image, 24, 8, 2, 3, Color(0.60, 0.40, 0.20, 1.0))
 		_:
 			if key.begins_with("monster:"):
-				var variant: int = int(key.get_slice(":", 1)) % 4
-				var primary_colors: Array[Color] = [
-					Color(0.85, 0.22, 0.22, 1.0),
-					Color(0.62, 0.22, 0.82, 1.0),
-					Color(0.22, 0.70, 0.78, 1.0),
-					Color(0.84, 0.46, 0.18, 1.0),
-				]
-				var accent_colors: Array[Color] = [
-					Color(1.0, 0.85, 0.25, 1.0),
-					Color(0.90, 0.45, 1.0, 1.0),
-					Color(0.50, 1.0, 0.92, 1.0),
-					Color(1.0, 0.72, 0.24, 1.0),
-				]
-				var primary: Color = primary_colors[variant]
-				var accent: Color = accent_colors[variant]
-				_fill_px(image, 6, 10, 20, 14, primary)
-				_fill_px(image, 4, 14, 4, 10, primary.darkened(0.2))
-				_fill_px(image, 24, 14, 4, 10, primary.darkened(0.2))
-				_fill_px(image, 9, 4, 14, 8, primary.lightened(0.15))
-				_fill_px(image, 8, 2, 4, 4, accent)
-				_fill_px(image, 20, 2, 4, 4, accent)
-				_fill_px(image, 11, 13, 3, 3, Color.BLACK)
-				_fill_px(image, 18, 13, 3, 3, Color.BLACK)
-				_fill_px(image, 11, 24, 4, 6, primary.darkened(0.35))
-				_fill_px(image, 17, 24, 4, 6, primary.darkened(0.35))
+				var v: int = int(key.get_slice(":", 1)) % 6
+				_fill_px(image, 6, 26, 20, 5, Color(0.0, 0.0, 0.0, 0.35))
+				match v:
+					0:
+						# 鹿 (Deer): 棕身 + 白腹 + 鹿角
+						_fill_px(image, 8, 12, 16, 10, Color(0.68, 0.48, 0.28, 1.0))
+						_fill_px(image, 12, 15, 8, 7, Color(0.95, 0.92, 0.85, 1.0))
+						_fill_px(image, 9, 21, 3, 7, Color(0.55, 0.38, 0.22, 1.0))
+						_fill_px(image, 20, 21, 3, 7, Color(0.55, 0.38, 0.22, 1.0))
+						_fill_px(image, 10, 6, 8, 7, Color(0.68, 0.48, 0.28, 1.0))
+						_fill_px(image, 7, 1, 4, 6, Color(0.45, 0.32, 0.18, 1.0))
+						_fill_px(image, 17, 1, 4, 6, Color(0.45, 0.32, 0.18, 1.0))
+					1:
+						# 鸡 (Hen): 白身 + 鲜红鸡冠 + 金喙
+						_fill_px(image, 10, 14, 12, 10, Color(0.92, 0.90, 0.85, 1.0))
+						_fill_px(image, 6, 11, 5, 7, Color(0.20, 0.35, 0.30, 1.0))
+						_fill_px(image, 18, 9, 6, 6, Color(0.92, 0.90, 0.85, 1.0))
+						_fill_px(image, 19, 5, 4, 4, Color(0.90, 0.15, 0.15, 1.0))
+						_fill_px(image, 23, 11, 3, 2, Color(0.95, 0.75, 0.10, 1.0))
+						_fill_px(image, 13, 23, 2, 5, Color(0.85, 0.65, 0.10, 1.0))
+						_fill_px(image, 17, 23, 2, 5, Color(0.85, 0.65, 0.10, 1.0))
+					2:
+						# 稻草人 (Scarecrow): 斗笠 + 破衣 + 伸展木臂 + 红眼
+						_fill_px(image, 8, 2, 16, 5, Color(0.85, 0.70, 0.25, 1.0))
+						_fill_px(image, 11, 7, 10, 6, Color(0.35, 0.25, 0.15, 1.0))
+						_fill_px(image, 13, 9, 2, 2, Color(1.0, 0.1, 0.1, 1.0))
+						_fill_px(image, 17, 9, 2, 2, Color(1.0, 0.1, 0.1, 1.0))
+						_fill_px(image, 9, 13, 14, 10, Color(0.48, 0.32, 0.18, 1.0))
+						_fill_px(image, 2, 13, 28, 3, Color(0.40, 0.28, 0.14, 1.0))
+						_fill_px(image, 14, 22, 4, 8, Color(0.40, 0.28, 0.14, 1.0))
+					3:
+						# 钉耙猫 (Hook Cat): 虎纹猫 + 尖耳 + 铁耙
+						_fill_px(image, 8, 10, 16, 12, Color(0.95, 0.65, 0.15, 1.0))
+						_fill_px(image, 10, 12, 12, 2, Color(0.20, 0.15, 0.05, 1.0))
+						_fill_px(image, 10, 16, 12, 2, Color(0.20, 0.15, 0.05, 1.0))
+						_fill_px(image, 9, 3, 4, 5, Color(0.95, 0.65, 0.15, 1.0))
+						_fill_px(image, 19, 3, 4, 5, Color(0.95, 0.65, 0.15, 1.0))
+						_fill_px(image, 10, 6, 12, 6, Color(0.95, 0.65, 0.15, 1.0))
+						_fill_px(image, 24, 4, 3, 22, Color(0.60, 0.60, 0.65, 1.0))
+						_fill_px(image, 22, 2, 7, 3, Color(0.75, 0.78, 0.85, 1.0))
+					4:
+						# 骷髅 (Skeleton): 白骨 + 肋骨 + 盾牌 + 骨刀
+						_fill_px(image, 10, 3, 12, 8, Color(0.92, 0.92, 0.86, 1.0))
+						_fill_px(image, 12, 6, 2, 2, Color(0.1, 0.1, 0.1, 1.0))
+						_fill_px(image, 18, 6, 2, 2, Color(0.1, 0.1, 0.1, 1.0))
+						_fill_px(image, 10, 11, 12, 8, Color(0.88, 0.88, 0.82, 1.0))
+						_fill_px(image, 11, 19, 10, 8, Color(0.88, 0.88, 0.82, 1.0))
+						_fill_px(image, 4, 10, 6, 10, Color(0.55, 0.40, 0.20, 1.0))
+						_fill_px(image, 24, 6, 3, 18, Color(0.75, 0.78, 0.82, 1.0))
+					5, _:
+						# 沃玛教主/半兽人: 红色恶魔身躯 + 恶魔之角
+						_fill_px(image, 7, 9, 18, 14, Color(0.82, 0.22, 0.20, 1.0))
+						_fill_px(image, 10, 4, 12, 7, Color(0.70, 0.18, 0.15, 1.0))
+						_fill_px(image, 7, 1, 4, 5, Color(0.20, 0.15, 0.10, 1.0))
+						_fill_px(image, 21, 1, 4, 5, Color(0.20, 0.15, 0.10, 1.0))
+						_fill_px(image, 12, 6, 2, 2, Color(1.0, 0.9, 0.2, 1.0))
+						_fill_px(image, 18, 6, 2, 2, Color(1.0, 0.9, 0.2, 1.0))
+						_fill_px(image, 10, 22, 4, 6, Color(0.40, 0.12, 0.10, 1.0))
+						_fill_px(image, 18, 22, 4, 6, Color(0.40, 0.12, 0.10, 1.0))
 			else:
 				image.fill(Color(1.0, 0.0, 1.0, 1.0))
 	var texture := _image_to_texture(image)
@@ -614,21 +682,66 @@ func _ready() -> void:
 	$"LoginPanel/VBox/NewCharRow/CreateButton".pressed.connect(_on_create_pressed)
 	$"LoginPanel/VBox/ConnectRow/WalletLoginButton".pressed.connect(_on_wallet_login_pressed)
 	$"LoginPanel/VBox/CharButtonRow/DeleteCharButton".pressed.connect(_on_delete_char_pressed)
-	$GameView/LogoutButton.pressed.connect(_on_logout_pressed)
+	$"GameView/MiniMapPanel/VBox/MapHeader/LogoutButton".pressed.connect(_on_logout_pressed)
 	$GameView/NPCDialog/CloseButton.pressed.connect(func(): npc_dialog.hide())
 	$GameView/ShopPanel/CloseButton.pressed.connect(func(): shop_panel.hide())
 	$GameView/ShopPanel/VBox/ItemList.item_activated.connect(_on_shop_buy_pressed)
 	$GameView/InventoryPanel/VBox/ItemList.item_activated.connect(_on_inventory_item_activated)
+	$"GameView/HUD/HUDBox/MenuRow1/CharBtn".pressed.connect(func(): _toggle_char_panel())
+	$"GameView/HUD/HUDBox/MenuRow1/InvBtn".pressed.connect(func(): inventory_panel.visible = not inventory_panel.visible)
+	$"GameView/HUD/HUDBox/MenuRow1/SkillBtn".pressed.connect(func(): _toggle_skills_panel())
+	$"GameView/HUD/HUDBox/MenuRow2/AModeBtn".pressed.connect(func(): client.change_attack_mode())
+	$"GameView/HUD/HUDBox/MenuRow2/GroupBtn".pressed.connect(func(): client.request_group())
+	$"GameView/HUD/HUDBox/MenuRow2/ReviveBtn".pressed.connect(func(): client.town_revive())
+	$GameView/CharacterPanel/CloseCharButton.pressed.connect(func(): $GameView/CharacterPanel.hide())
+	$GameView/SkillsPanel/CloseSkillButton.pressed.connect(func(): $GameView/SkillsPanel.hide())
 	chat_input.text_submitted.connect(_on_chat_submitted)
 	_show_login()
+
+func _toggle_char_panel() -> void:
+	var panel: PanelContainer = $GameView/CharacterPanel
+	panel.visible = not panel.visible
+	if panel.visible:
+		_refresh_char_panel()
+
+func _refresh_char_panel() -> void:
+	var class_names: Array[String] = ["战士", "法师", "道士", "刺客", "弓手"]
+	var cn: String = class_names[0]
+	var text: String = "[b]%s[/b]  %s  Lv.[color=yellow]%d[/color]\n" % [my_name, cn, my_level]
+	text += "────────────────────\n"
+	text += "[color=red]HP[/color]  %d / %d\n" % [my_hp, my_max_hp]
+	text += "[color=cyan]MP[/color]  %d / %d\n" % [my_mp, my_max_mp]
+	text += "[color=yellow]经验[/color]  %d / %d\n" % [my_experience, my_max_experience]
+	text += "[color=gold]金币[/color]  %d\n" % my_gold
+	text += "────────────────────\n"
+	text += "[color=gray](按 C 关闭)[/color]"
+	$"GameView/CharacterPanel/VBox/CharInfoText".text = text
+
+func _toggle_skills_panel() -> void:
+	var panel: PanelContainer = $GameView/SkillsPanel
+	panel.visible = not panel.visible
+	if panel.visible:
+		_refresh_skills_panel()
+
+func _refresh_skills_panel() -> void:
+	var list: ItemList = $"GameView/SkillsPanel/VBox/SkillList"
+	list.clear()
+	for magic in _my_magics:
+		var name_str: String = magic.get("name", "技能")
+		var level_str: int = magic.get("level", 0)
+		list.add_item("%s  Lv.%d  (F%d)" % [name_str, level_str, list.item_count])
 
 func _process(delta: float) -> void:
 	_input_cooldown = max(0.0, _input_cooldown - delta)
 	if not game_view.visible:
 		return
 	_handle_movement_input()
-	if Input.is_key_pressed(KEY_I):
+	if Input.is_action_just_pressed("ui_inventory"):
 		inventory_panel.visible = not inventory_panel.visible
+	if Input.is_action_just_pressed("ui_char"):
+		_toggle_char_panel()
+	if Input.is_action_just_pressed("ui_skills"):
+		_toggle_skills_panel()
 	_update_world_animations()
 	camera.position = Vector2(my_pos.x * TILE + TILE / 2.0, my_pos.y * TILE + TILE / 2.0)
 	_update_hud()
@@ -791,9 +904,12 @@ func _on_entered_world(ui: Dictionary) -> void:
 	my_dir = ui.get("direction", 0)
 	my_hp = ui.get("hp", 100)
 	my_mp = ui.get("mp", 50)
-	my_max_hp = ui.get("hp", 100)
-	my_max_mp = ui.get("mp", 50)
 	my_level = ui.get("level", 1)
+	var cid: int = ui.get("class", 0)
+	var base_hp := _calc_base_max_hp(cid, my_level)
+	var base_mp := _calc_base_max_mp(cid, my_level)
+	my_max_hp = max(base_hp, my_hp)
+	my_max_mp = max(base_mp, my_mp)
 	my_experience = ui.get("experience", 0)
 	my_max_experience = ui.get("max_experience", 10)
 	my_gold = ui.get("gold", 0)
@@ -814,12 +930,22 @@ func _render_grid() -> void:
 	var info: Dictionary = _map_info
 	var w: int = info.get("width", 100)
 	var h: int = info.get("height", 100)
-	var dark_tile := _get_generated_texture("tile_dark")
-	var light_tile := _get_generated_texture("tile_light")
-	for x in range(max(0, my_pos.x - 30), min(w, my_pos.x + 31)):
-		for y in range(max(0, my_pos.y - 20), min(h, my_pos.y + 21)):
+	var grass_tile := _get_generated_texture("tile_grass")
+	var dirt_tile := _get_generated_texture("tile_dirt")
+	var stone_tile := _get_generated_texture("tile_stone")
+	# 在 NPC 聚集区域（出生地附近）铺石板路，其余区域混合草地/泥土
+	var cx := my_pos.x
+	var cy := my_pos.y
+	for x in range(max(0, cx - 30), min(w, cx + 31)):
+		for y in range(max(0, cy - 20), min(h, cy + 21)):
 			var cell := Sprite2D.new()
-			cell.texture = dark_tile if (x + y) % 2 == 0 else light_tile
+			var dist := abs(x - 400) + abs(y - 400)
+			if dist <= 12:
+				cell.texture = stone_tile
+			elif (x * 3 + y * 7) % 8 < 2:
+				cell.texture = dirt_tile
+			else:
+				cell.texture = grass_tile
 			cell.centered = false
 			cell.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
 			cell.position = Vector2(x * TILE, y * TILE)
@@ -853,7 +979,11 @@ var _map_info: Dictionary = {}
 # ---------------------------------------------------------------------------
 
 func _update_hud() -> void:
-	$GameView/StatusBar.text = "位置: (%d, %d)  Lv.%d %s  金:%d" % [my_pos.x, my_pos.y, my_level, my_name, my_gold]
+	var map_name: String = _map_info.get("filename", _map_info.get("name", "新手村"))
+	$GameView/StatusBar.text = "%s  Lv.%d %s  金:%d" % [map_name, my_level, my_name, my_gold]
+	# 小地图面板
+	$"GameView/MiniMapPanel/VBox/MapHeader/MapName".text = "%s" % map_name
+	$"GameView/MiniMapPanel/VBox/CoordsLabel".text = "坐标: (%d, %d)" % [my_pos.x, my_pos.y]
 	$"GameView/HUD/HUDBox/HPRow/HPLabel".text = "HP: %d/%d" % [my_hp, my_max_hp]
 	$"GameView/HUD/HUDBox/MPRow/MPLabel".text = "MP: %d/%d" % [my_mp, my_max_mp]
 	$"GameView/HUD/HUDBox/XPRow/XPLabel".text = "EXP: %d/%d" % [my_experience, my_max_experience]
@@ -980,9 +1110,29 @@ func _on_user_location(loc: Vector2i, dir: int) -> void:
 # HP/MP/经验值/等级 变化
 # ---------------------------------------------------------------------------
 
+func _calc_base_max_hp(class_id: int, lvl: int) -> int:
+	match class_id:
+		0: return 100 + lvl * 15 # Warrior
+		1: return 60 + lvl * 8   # Wizard
+		2: return 80 + lvl * 10  # Taoist
+		3: return 90 + lvl * 12  # Assassin
+		4: return 85 + lvl * 11  # Archer
+		_: return 100 + lvl * 10
+
+func _calc_base_max_mp(class_id: int, lvl: int) -> int:
+	match class_id:
+		0: return 20 + lvl * 5   # Warrior
+		1: return 60 + lvl * 20  # Wizard
+		2: return 40 + lvl * 15  # Taoist
+		3: return 25 + lvl * 6   # Assassin
+		4: return 25 + lvl * 6   # Archer
+		_: return 30 + lvl * 10
+
 func _on_health_changed(hp: int, mp: int) -> void:
 	my_hp = hp
 	my_mp = mp
+	my_max_hp = max(my_max_hp, my_hp)
+	my_max_mp = max(my_max_mp, my_mp)
 
 func _on_gained_experience(amount: int) -> void:
 	my_experience += amount
