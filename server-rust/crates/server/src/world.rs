@@ -99,6 +99,8 @@ pub struct Player {
     pub dead: bool,
     /// 攻击模式（AttackMode：0=和平 1=编组 2=行会 3=敌对行会 4=红名 5=全体）
     pub a_mode: u8,
+    /// 是否允许组队邀请（C# AllowGroup，默认允许）
+    pub allow_group: bool,
 }
 
 /// 地面掉落物
@@ -2321,6 +2323,7 @@ mod tests {
             pending_marriage: None,
             dead: false,
             a_mode: 0,
+            allow_group: true,
         };
         world.players.lock().await.insert(1, player);
 
@@ -2412,6 +2415,7 @@ mod tests {
                 pending_marriage: None,
                 dead: false,
                 a_mode: 0,
+                allow_group: true,
             },
         );
     }

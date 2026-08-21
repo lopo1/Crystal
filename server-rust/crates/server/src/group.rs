@@ -6,6 +6,9 @@
 
 use std::collections::HashMap;
 
+/// 队伍人数上限（同 C# Globals.MaxGroup）
+pub const MAX_GROUP: usize = 8;
+
 /// 组队管理器（纯逻辑，无 IO，可单元测试）
 #[derive(Debug, Default, Clone)]
 pub struct GroupManager {
@@ -27,6 +30,10 @@ pub enum GroupError {
     /// 不是队伍成员 / 非队长操作
     NotMember,
     GroupNotFound,
+    /// 目标已有他人发出的待处理邀请
+    AlreadyInvited,
+    /// 队伍已满
+    GroupFull,
 }
 
 impl GroupManager {
@@ -70,15 +77,27 @@ impl GroupManager {
         true
     }
 
-    /// 邀请玩家加入队长的队伍。仅队长可邀请，目标须不在任何队伍。
+    /// 邀请玩家加入队伍。仅队长可邀请；队长无队时自动建队（同 C# 首邀即组）。
+    /// 目标须不在任何队伍、且没有他人发出的待处理邀请。
     pub fn invite(&mut self, host: &str, target: &str) -> Result<u32, GroupError> {
         if target == host {
             return Err(GroupError::NotMember);
         }
-        let gid = *self.member_of.get(host).ok_or(GroupError::NotMember)?;
+        if self.pending_invites.contains_key(target) {
+            return Err(GroupError::AlreadyInvited);
+        }
+        // 队长尚无队伍：自动创建（C# 中首次邀请时队伍在 accept 才真正建立，
+        // 这里提前建队以便统一走 gid 流程）
+        let gid = match self.member_of.get(host).copied() {
+            Some(gid) => gid,
+            None => self.create(host),
+        };
         let members = self.groups.get(&gid).ok_or(GroupError::GroupNotFound)?;
         if members.first().map(|s| s.as_str()) != Some(host) {
             return Err(GroupError::NotMember); // 仅队长
+        }
+        if members.len() >= MAX_GROUP {
+            return Err(GroupError::GroupFull);
         }
         if self.member_of.contains_key(target) {
             return Err(GroupError::AlreadyInGroup);
@@ -96,6 +115,9 @@ impl GroupManager {
             return Err(GroupError::AlreadyInGroup);
         }
         let members = self.groups.get_mut(&gid).ok_or(GroupError::GroupNotFound)?;
+        if members.len() >= MAX_GROUP {
+            return Err(GroupError::GroupFull);
+        }
         members.push(invitee.to_string());
         self.member_of.insert(invitee.to_string(), gid);
         Ok(members.clone())
@@ -134,6 +156,20 @@ impl GroupManager {
     /// 某玩家所在队伍 ID。
     pub fn group_of(&self, member: &str) -> Option<u32> {
         self.member_of.get(member).copied()
+    }
+
+    /// 某玩家是否为其队伍的队长。
+    pub fn is_leader(&self, member: &str) -> bool {
+        self.group_of(member)
+            .and_then(|gid| self.groups.get(&gid).cloned())
+            .and_then(|m| m.first().cloned())
+            .map(|first| first == member)
+            .unwrap_or(false)
+    }
+
+    /// 待处理邀请的发起者名（若有）。
+    pub fn pending_inviter(&self, invitee: &str) -> Option<String> {
+        self.pending_invites.get(invitee).map(|(h, _)| h.clone())
     }
 
     /// 队伍成员列表。
@@ -196,11 +232,47 @@ mod tests {
     fn errors_for_bad_cases() {
         let mut mgr = GroupManager::new();
         mgr.create("A");
-        // 无队伍者不能邀请
-        assert_eq!(mgr.invite("X", "B"), Err(GroupError::NotMember));
+        // 自己邀请自己失败
+        assert_eq!(mgr.invite("A", "A"), Err(GroupError::NotMember));
         // 无邀请者接受报错
         assert_eq!(mgr.accept("B"), Err(GroupError::NoInvite));
         // 拒绝不存在的邀请返回 false
         assert!(!mgr.decline("nobody"));
+    }
+
+    #[test]
+    fn first_invite_creates_group() {
+        let mut mgr = GroupManager::new();
+        // 队长无队时首次邀请：自动建队
+        assert!(mgr.invite("A", "B").is_ok());
+        assert!(mgr.is_leader("A"));
+        let members = mgr.accept("B").unwrap();
+        assert_eq!(members, vec!["A".to_string(), "B".to_string()]);
+    }
+
+    #[test]
+    fn pending_invite_conflict() {
+        let mut mgr = GroupManager::new();
+        assert!(mgr.invite("A", "C").is_ok());
+        // C 已有 A 的待处理邀请，B 再邀失败
+        assert!(mgr.invite("B", "C").is_err());
+        assert_eq!(mgr.pending_inviter("C"), Some("A".to_string()));
+        mgr.decline("C");
+        assert_eq!(mgr.pending_inviter("C"), None);
+        // 拒绝后 B 可再邀
+        assert!(mgr.invite("B", "C").is_ok());
+    }
+
+    #[test]
+    fn group_size_capped() {
+        let mut mgr = GroupManager::new();
+        for i in 1..MAX_GROUP {
+            let name = format!("m{}", i);
+            mgr.invite("A", &name).unwrap();
+            mgr.accept(&name).unwrap();
+        }
+        assert_eq!(mgr.members(mgr.group_of("A").unwrap()).len(), MAX_GROUP);
+        // 满员后再邀失败
+        assert_eq!(mgr.invite("A", "extra"), Err(GroupError::GroupFull));
     }
 }

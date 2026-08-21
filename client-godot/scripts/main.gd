@@ -64,6 +64,7 @@ var my_experience: int = 0
 var my_max_experience: int = 10
 var my_gold: int = 0
 var my_name := ""
+var _allow_group := true
 
 var players := {}   # object_id -> {sprite, label, pos, name}
 var monsters := {}  # object_id -> {sprite, label, pos, name}
@@ -1064,6 +1065,7 @@ func _on_magic_leveled(spell: int, level: int, experience: int) -> void:
 			break
 
 func _on_switch_group(allow: bool) -> void:
+	_allow_group = allow
 	chat_log.append_text("[color=gray]组队邀请: %s[/color]\n" % ["允许" if allow else "禁止"])
 
 func _on_delete_member(name: String) -> void:
@@ -1211,7 +1213,7 @@ func _handle_chat_command(text: String) -> void:
 		"/leave", "/离队":
 			client.del_group_member(my_name)
 		"/group", "/组队":
-			client.switch_group()
+			client.switch_group(not _allow_group)
 		"/invite", "/邀请":
 			if parts.size() > 1:
 				client.add_group_member(parts[1])

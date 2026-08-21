@@ -117,6 +117,10 @@ const ClientPacketId := {
 	"TRADE_GOLD": 98,
 	"TRADE_CONFIRM": 99,
 	"TRADE_CANCEL": 100,
+	"SWITCH_GROUP": 59,
+	"ADD_MEMBER": 60,
+	"DEL_MEMBER": 61,
+	"GROUP_INVITE": 62,
 	"MAGIC": 58,
 	"MAGIC_KEY": 59,
 	"PICK_UP": 35,
@@ -576,28 +580,30 @@ func repair_item(unique_id: int) -> void:
 		w.write_u64(unique_id)
 	send(p)
 
-func switch_group() -> void:
+func switch_group(allow_group: bool) -> void:
 	var p := CrystalBinary.Packet.new()
-	p.packet_id = 59
+	p.packet_id = ClientPacketId.SWITCH_GROUP
+	p.write_fn = func(w) -> void:
+		w.write_bool(allow_group)
 	send(p)
 
 func add_group_member(name: String) -> void:
 	var p := CrystalBinary.Packet.new()
-	p.packet_id = 60
+	p.packet_id = ClientPacketId.ADD_MEMBER
 	p.write_fn = func(w) -> void:
 		w.write_string(name)
 	send(p)
 
 func del_group_member(name: String) -> void:
 	var p := CrystalBinary.Packet.new()
-	p.packet_id = 61
+	p.packet_id = ClientPacketId.DEL_MEMBER
 	p.write_fn = func(w) -> void:
 		w.write_string(name)
 	send(p)
 
 func group_invite_response(accept: bool) -> void:
 	var p := CrystalBinary.Packet.new()
-	p.packet_id = 62
+	p.packet_id = ClientPacketId.GROUP_INVITE
 	p.write_fn = func(w) -> void:
 		w.write_bool(accept)
 	send(p)

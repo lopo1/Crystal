@@ -120,6 +120,11 @@ pub async fn handle_connection(
     if let Some(oid) = object_id {
         // 进行中的交易自动取消并通知对方（物品未转移、金币未预扣，无需返还）
         handle_trade_cancel(&world, oid, false).await;
+        // 在队伍中则自动退队并通知剩余成员（同 C# 断线离队）
+        let name = world.get_player(oid).await.map(|p| p.name);
+        if let Some(name) = name {
+            group_leave_broadcast(&world, &name).await;
+        }
         persist_player(&world, &db, oid).await;
         world.remove_player(oid).await;
     }
@@ -291,73 +296,156 @@ async fn handle_client_packet(
             }
         }
         ClientPacket::AddMember(am) => {
-            // 队长按名字邀请玩家入队：向被邀请者发 S.GroupInvite
+            // 队长按名字邀请玩家入队（同 C# PlayerObject.AddMember）
             if let Some(oid) = *object_id {
                 let inviter = world.get_player(oid).await.map(|p| p.name).unwrap_or_default();
-                let mut g = world.group.lock().await;
-                match g.invite(&inviter, &am.name) {
-                    Ok(_) => {
-                        if let Some(t_oid) = player_oid_by_name(world, &am.name).await {
-                            let frame = encode_packet(&s::GroupInvite { name: inviter.clone() });
-                            world.send_to(t_oid, frame).await;
+                let t_oid = player_oid_by_name(world, &am.name).await;
+                // 校验与入队登记（锁内不做 IO）
+                let check: Result<(), &str> = {
+                    let mut g = world.group.lock().await;
+                    match t_oid {
+                        None => Err("对方不在线或不存在"),
+                        Some(t) if t == oid => Err("不能邀请自己"),
+                        Some(t) => {
+                            let allow = world
+                                .players
+                                .lock()
+                                .await
+                                .get(&t)
+                                .map(|p| p.allow_group)
+                                .unwrap_or(false);
+                            if !allow {
+                                Err("对方未开放组队")
+                            } else {
+                                g.invite(&inviter, &am.name)
+                                    .map(|_| ())
+                                    .map_err(|e| match e {
+                                    crate::group::GroupError::AlreadyInGroup => "对方已在其他队伍",
+                                    crate::group::GroupError::AlreadyInvited => "对方已有待处理的邀请",
+                                    crate::group::GroupError::GroupFull => "队伍已满",
+                                    _ => "无法邀请：你不是队长",
+                                })
+                            }
                         }
-                        drop(g);
-                        send_sys(world, oid, &format!("已邀请 {} 加入队伍", am.name)).await;
                     }
-                    Err(_) => {
-                        drop(g);
-                        send_sys(world, oid, "无法邀请：对方已在队伍或你不是队长").await;
+                };
+                match check {
+                    Err(msg) => send_sys(world, oid, msg).await,
+                    Ok(()) => {
+                        // 邀请方强制开启允许组队并回执（C# SwitchGroup(true)）
+                        {
+                            let mut players = world.players.lock().await;
+                            if let Some(p) = players.get_mut(&oid) {
+                                p.allow_group = true;
+                            }
+                        }
+                        tx.send(encode_packet(&s::SwitchGroup { allow_group: true }))
+                            .await
+                            .ok();
+                        if let Some(t) = t_oid {
+                            let frame = encode_packet(&s::GroupInvite { name: inviter.clone() });
+                            world.send_to(t, frame).await;
+                        }
+                        send_sys(world, oid, &format!("已邀请 {} 加入队伍", am.name)).await;
                     }
                 }
             }
         }
         ClientPacket::GroupInvite(gi) => {
-            // 响应邀请：accept=true 入队并广播 AddMember；false 拒绝
+            // 响应邀请（同 C# PlayerObject.GroupInvite）：accept=true 入队并双向广播 AddMember
             if let Some(oid) = *object_id {
-                let name = world.get_player(oid).await.map(|p| p.name).unwrap_or_default();
-                if gi.accept_invite {
-                    let members = { world.group.lock().await.accept(&name) };
-                    match members {
-                        Ok(list) => {
-                            for m in &list {
-                                if let Some(m_oid) = player_oid_by_name(world, m).await {
-                                    let frame = encode_packet(&s::AddMember { name: name.clone() });
-                                    world.send_to(m_oid, frame).await;
-                                }
-                            }
-                            send_sys(world, oid, &format!("已加入队伍，成员 {} 人", list.len())).await;
-                        }
-                        Err(_) => send_sys(world, oid, "没有待接受的队伍邀请").await,
+                let me = world.get_player(oid).await.map(|p| p.name).unwrap_or_default();
+                let inviter = { world.group.lock().await.pending_inviter(&me) };
+                if inviter.is_none() {
+                    send_sys(world, oid, "没有待处理的组队邀请").await;
+                } else if !gi.accept_invite {
+                    world.group.lock().await.decline(&me);
+                    let host_oid = match inviter.as_ref() {
+                        Some(h) => player_oid_by_name(world, h).await,
+                        None => None,
+                    };
+                    if let Some(host_oid) = host_oid {
+                        send_sys(world, host_oid, &format!("{} 拒绝了你的组队邀请", me)).await;
                     }
                 } else {
-                    world.group.lock().await.decline(&name);
+                    let joined = { world.group.lock().await.accept(&me) };
+                    match joined {
+                        Err(_) => send_sys(world, oid, "邀请已失效或队伍已满").await,
+                        Ok(list) => {
+                            // 新成员收到全队名单；老成员收到新成员加入
+                            for m in &list {
+                                if m != &me {
+                                    let frame = encode_packet(&s::AddMember { name: m.clone() });
+                                    world.send_to(oid, frame).await;
+                                }
+                            }
+                            let frame = encode_packet(&s::AddMember { name: me.clone() });
+                            for m in &list {
+                                if let Some(m_oid) = player_oid_by_name(world, m).await {
+                                    world.send_to(m_oid, frame.clone()).await;
+                                }
+                            }
+                            send_sys(world, oid, &format!("已加入 {} 的队伍", inviter.unwrap_or_default())).await;
+                        }
+                    }
                 }
             }
         }
         ClientPacket::DelMember(dm) => {
-            // 离开/移除成员：向剩余成员广播 DeleteMember
+            // 空名字=自己退队；否则队长移除成员（同 C# DelMember+LeaveGroup）
             if let Some(oid) = *object_id {
-                let name = world.get_player(oid).await.map(|p| p.name).unwrap_or_default();
-                let removed = if dm.name.is_empty() { name.clone() } else { dm.name.clone() };
-                let members = world.group.lock().await.leave(&removed);
-                if let Ok(list) = members {
-                    for m in &list {
-                        if let Some(m_oid) = player_oid_by_name(world, m).await {
-                            let frame = encode_packet(&s::DeleteMember { name: removed.clone() });
-                            world.send_to(m_oid, frame).await;
+                let me = world.get_player(oid).await.map(|p| p.name).unwrap_or_default();
+                let target = if dm.name.is_empty() { me.clone() } else { dm.name.clone() };
+                let mut allowed = true;
+                if target != me {
+                    let is_leader = { world.group.lock().await.is_leader(&me) };
+                    if !is_leader {
+                        send_sys(world, oid, "只有队长可以移除成员").await;
+                        allowed = false;
+                    } else {
+                        let in_my_group = {
+                            let mut g = world.group.lock().await;
+                            match g.group_of(&target) {
+                                Some(gid) => g.members(gid).contains(&me),
+                                None => false,
+                            }
+                        };
+                        if !in_my_group {
+                            send_sys(world, oid, &format!("{} 不在你的队伍中", target)).await;
+                            allowed = false;
                         }
                     }
+                    if allowed {
+                        // 被踢者收 DeleteGroup，其余走统一离队广播
+                        if let Some(t_oid) = player_oid_by_name(world, &target).await {
+                            world.send_to(t_oid, encode_packet(&s::DeleteGroup)).await;
+                            send_sys(world, t_oid, &format!("你已被 {} 移出队伍", me)).await;
+                        }
+                    }
+                }
+                if allowed {
+                    group_leave_broadcast(world, &target).await;
                 }
             }
         }
         ClientPacket::SwitchGroup(sg) => {
-            // 切换是否接收邀请：回执
+            // 切换是否接收邀请：存储 + 回执；关闭时若在队中则立即退队（C# 语义）
             if let Some(oid) = *object_id {
+                {
+                    let mut players = world.players.lock().await;
+                    if let Some(p) = players.get_mut(&oid) {
+                        p.allow_group = sg.allow_group;
+                    }
+                }
                 tx.send(encode_packet(&s::SwitchGroup {
                     allow_group: sg.allow_group,
                 }))
                 .await
                 .ok();
+                if !sg.allow_group {
+                    let name = world.get_player(oid).await.map(|p| p.name).unwrap_or_default();
+                    group_leave_broadcast(world, &name).await;
+                }
             }
         }
         ClientPacket::NewCharacter(nc) => {
@@ -1137,6 +1225,7 @@ async fn enter_world(
         pending_marriage: None,
         dead: ch.hp <= 0,
         a_mode: 0,
+        allow_group: true,
     };
     // 穿戴装备后重算攻击/防御
     recompute_stats(&mut player);
@@ -1204,6 +1293,12 @@ async fn enter_world(
         tx.send(encode_packet(&s::ChangeAMode { mode: p.a_mode }))
             .await
             .ok();
+        // 同步组队开关状态（同 C# Enqueue S.SwitchGroup）
+        tx.send(encode_packet(&s::SwitchGroup {
+            allow_group: p.allow_group,
+        }))
+        .await
+        .ok();
     }
     // 下发收件箱（客户端邮件面板数据源）
     send_mailbox(world, db, object_id).await;
@@ -1309,6 +1404,38 @@ async fn send_sys(world: &World, oid: u32, msg: &str) {
             }),
         )
         .await;
+}
+
+/// 玩家离队广播（退队/被踢/关邀请/断线共用，同 C# LeaveGroup）：
+/// 离队者收 DeleteGroup；剩余 >1 人收 DeleteMember{leaver}；剩 1 人（原队长）收 DeleteGroup。
+async fn group_leave_broadcast(world: &World, leaver: &str) {
+    let snapshot = {
+        let mut g = world.group.lock().await;
+        let Some(gid) = g.group_of(leaver) else { return };
+        let members = g.members(gid);
+        let _ = g.leave(leaver);
+        members
+    };
+    if snapshot.len() < 2 {
+        return; // 本就不成队
+    }
+    if let Some(oid) = player_oid_by_name(world, leaver).await {
+        world.send_to(oid, encode_packet(&s::DeleteGroup)).await;
+    }
+    let rest: Vec<String> = snapshot.into_iter().filter(|m| m != leaver).collect();
+    if rest.len() > 1 {
+        let frame = encode_packet(&s::DeleteMember { name: leaver.to_string() });
+        for m in rest {
+            if let Some(oid) = player_oid_by_name(world, &m).await {
+                world.send_to(oid, frame.clone()).await;
+            }
+        }
+    } else if rest.len() == 1 {
+        // 只剩队长一人：队伍 UI 解散
+        if let Some(oid) = player_oid_by_name(world, &rest[0]).await {
+            world.send_to(oid, encode_packet(&s::DeleteGroup)).await;
+        }
+    }
 }
 
 /// 按角色名查找玩家 object_id；不在线则 None。
