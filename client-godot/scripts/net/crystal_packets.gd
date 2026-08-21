@@ -620,6 +620,8 @@ const S_MARKET_SUCCESS := 159
 const S_RECEIVE_MAIL := 231
 const S_MAIL_SENT := 234
 const S_PARCEL_COLLECTED := 235
+const S_MAIL_COST := 236
+const S_USER_NAME := 164
 # 城门
 const S_OPENDOOR := 253
 const S_BASE_STATS_INFO := 162
@@ -1020,6 +1022,10 @@ static func decode_server_packet(id: int, payload: PackedByteArray) -> Dictionar
 			return {"id": id, "data": {"mails": mails}}
 		S_MAIL_SENT, S_PARCEL_COLLECTED:
 			return {"id": id, "data": {"result": r.read_i8()}}
+		S_MAIL_COST:
+			return {"id": id, "data": {"cost": r.read_u32()}}
+		S_USER_NAME:
+			return {"id": id, "data": {"id": r.read_u32(), "name": r.read_string()}}
 		S_NPC_REFINE:
 			return {"id": id, "data": {
 				"rate": r.read_f32(),

@@ -28,6 +28,7 @@ pub struct Mail {
     pub gold: i64,
     pub item_uid: i64,
     pub is_read: bool,
+    pub locked: bool,
     pub created_at: i64,
 }
 
@@ -187,6 +188,7 @@ impl Database {
             "ALTER TABLE inventory ADD COLUMN refines INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE equipment ADD COLUMN refines INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE characters ADD COLUMN reincarnations INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE mail ADD COLUMN locked INTEGER NOT NULL DEFAULT 0",
         ] {
             let _ = conn.execute(stmt, []);
         }
@@ -535,7 +537,7 @@ impl Database {
     pub fn mail_inbox(&self, char_index: i32) -> anyhow::Result<Vec<Mail>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id,from_name,title,body,gold,item_uid,is_read,created_at FROM mail
+            "SELECT id,from_name,title,body,gold,item_uid,is_read,locked,created_at FROM mail
              WHERE to_char=?1 ORDER BY created_at DESC, id DESC",
         )?;
         let rows = stmt.query_map([char_index], |r| {
@@ -547,7 +549,8 @@ impl Database {
                 gold: r.get(4)?,
                 item_uid: r.get(5)?,
                 is_read: r.get::<_, i64>(6)? != 0,
-                created_at: r.get(7)?,
+                locked: r.get::<_, i64>(7)? != 0,
+                created_at: r.get(8)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -558,6 +561,16 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         conn.execute("UPDATE mail SET is_read=1 WHERE id=?1", params![id])?;
         Ok(())
+    }
+
+    /// 设置邮件锁定标记（锁定的邮件不可删除，同 C# LockMail）
+    pub fn set_mail_locked(&self, id: i64, to_char: i32, lock: bool) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE mail SET locked=?3 WHERE id=?1 AND to_char=?2",
+            params![id, to_char, lock as i64],
+        )?;
+        Ok(n > 0)
     }
 
     /// 删除邮件
@@ -572,7 +585,7 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let row = conn
             .query_row(
-                "SELECT id,from_name,title,body,gold,item_uid,is_read,created_at FROM mail
+                "SELECT id,from_name,title,body,gold,item_uid,is_read,locked,created_at FROM mail
                  WHERE id=?1 AND to_char=?2",
                 params![id, to_char],
                 |r| {
@@ -584,7 +597,8 @@ impl Database {
                         gold: r.get(4)?,
                         item_uid: r.get(5)?,
                         is_read: r.get::<_, i64>(6)? != 0,
-                        created_at: r.get(7)?,
+                        locked: r.get::<_, i64>(7)? != 0,
+                        created_at: r.get(8)?,
                     })
                 },
             )
@@ -814,6 +828,37 @@ impl Database {
             }
         }
         Ok(slots)
+    }
+
+    /// 部分扣减背包物品数量（DeleteItem 拆分删除），返回扣减后的剩余数量；物品不存在则 None。
+    pub fn reduce_inventory_item_count(
+        &self,
+        character_index: i32,
+        unique_id: u64,
+        delta: u16,
+    ) -> anyhow::Result<Option<u16>> {
+        let conn = self.conn.lock().unwrap();
+        let count: Option<u16> = conn
+            .query_row(
+                "SELECT count FROM inventory WHERE character_index=?1 AND unique_id=?2",
+                params![character_index, unique_id as i64],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(count) = count else { return Ok(None) };
+        let rest = count.saturating_sub(delta);
+        if rest == 0 {
+            conn.execute(
+                "DELETE FROM inventory WHERE character_index=?1 AND unique_id=?2",
+                params![character_index, unique_id as i64],
+            )?;
+        } else {
+            conn.execute(
+                "UPDATE inventory SET count=?3 WHERE character_index=?1 AND unique_id=?2",
+                params![character_index, unique_id as i64, rest],
+            )?;
+        }
+        Ok(Some(rest))
     }
 
     /// 按 unique_id 查找背包物品，返回 (槽位, UserItem)。
@@ -2434,5 +2479,42 @@ mod tests {
         assert_eq!(db.read_refines("inventory", ci, uid), 0);
         db.set_refines("inventory", ci, uid, 3).unwrap();
         assert_eq!(db.read_refines("inventory", ci, uid), 3);
+    }
+
+    #[test]
+    fn reduce_inventory_item_count_partial_and_full() {
+        let (db, _p) = temp_db();
+        db.register("tester").unwrap();
+        let info = db
+            .add_character("tester", "扣减", crystal_protocol::types::MirClass::Warrior, crystal_protocol::types::MirGender::Male)
+            .unwrap()
+            .unwrap();
+        // 初始金创药 x5（槽1）
+        let uid = db.inventory_slots(info.index).unwrap()[1].as_ref().unwrap().unique_id;
+        // 部分扣减
+        assert_eq!(db.reduce_inventory_item_count(info.index, uid, 2).unwrap(), Some(3));
+        assert_eq!(db.find_inventory_item(info.index, uid).unwrap().unwrap().1.count, 3);
+        // 全部扣减后物品消失
+        assert_eq!(db.reduce_inventory_item_count(info.index, uid, 3).unwrap(), Some(0));
+        assert!(db.find_inventory_item(info.index, uid).unwrap().is_none());
+        // 不存在的物品返回 None
+        assert_eq!(db.reduce_inventory_item_count(info.index, 99999, 1).unwrap(), None);
+    }
+
+    #[test]
+    fn mail_lock_prevents_nothing_but_flags() {
+        let (db, _p) = temp_db();
+        db.register("tester").unwrap();
+        let b = db
+            .add_character("tester", "收锁", crystal_protocol::types::MirClass::Warrior, crystal_protocol::types::MirGender::Male)
+            .unwrap()
+            .unwrap();
+        let id = db.send_mail(b.index, "寄锁", "", "", 0, 0).unwrap();
+        // 锁定 -> 标记生效；他人/不存在 id 返回 false
+        assert!(db.set_mail_locked(id, b.index, true).unwrap());
+        assert!(db.get_mail(id, b.index).unwrap().unwrap().locked);
+        assert!(!db.set_mail_locked(id, b.index + 7, false).unwrap());
+        db.set_mail_locked(id, b.index, false).unwrap();
+        assert!(!db.get_mail(id, b.index).unwrap().unwrap().locked);
     }
 }

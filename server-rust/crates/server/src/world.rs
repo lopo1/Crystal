@@ -101,6 +101,10 @@ pub struct Player {
     pub a_mode: u8,
     /// 是否允许组队邀请（C# AllowGroup，默认允许）
     pub allow_group: bool,
+    /// 和平模式（PeaceMode：PK 保护开关状态值，同 C# PMode）
+    pub p_mode: u8,
+    /// 法术快捷键绑定：spell -> key（MagicKey 包，会话内有效）
+    pub magic_keys: std::collections::HashMap<u8, u8>,
 }
 
 /// 地面掉落物
@@ -2324,6 +2328,8 @@ mod tests {
             dead: false,
             a_mode: 0,
             allow_group: true,
+            p_mode: 0,
+            magic_keys: std::collections::HashMap::new(),
         };
         world.players.lock().await.insert(1, player);
 
@@ -2416,6 +2422,8 @@ mod tests {
                 dead: false,
                 a_mode: 0,
                 allow_group: true,
+                p_mode: 0,
+                magic_keys: std::collections::HashMap::new(),
             },
         );
     }

@@ -613,10 +613,38 @@ async fn handle_client_packet(
                     .ok();
             }
         }
+        ClientPacket::ChangePMode(pm) => {
+            // 和平模式切换：存储 + 回执（同 C# MirConnection.ChangePMode）
+            if let Some(oid) = *object_id {
+                {
+                    let mut players = world.players.lock().await;
+                    if let Some(p) = players.get_mut(&oid) {
+                        p.p_mode = pm.mode;
+                    }
+                }
+                tx.send(encode_packet(&s::ChangePMode { mode: pm.mode }))
+                    .await
+                    .ok();
+            }
+        }
         ClientPacket::Magic(m) => {
             if let Some(oid) = *object_id {
                 let dir = MirDirection::from_u8(m.direction);
                 player_magic_attack(world, db, oid, dir, m.spell).await;
+            }
+        }
+        ClientPacket::MagicKey(mk) => {
+            // 法术快捷键绑定（会话内有效）：先清掉占用同一按键的其他法术，再绑定
+            if let Some(oid) = *object_id {
+                let mut players = world.players.lock().await;
+                if let Some(p) = players.get_mut(&oid) {
+                    if mk.key == 0 {
+                        p.magic_keys.remove(&mk.spell);
+                    } else {
+                        p.magic_keys.retain(|_, k| *k != mk.key);
+                        p.magic_keys.insert(mk.spell, mk.key);
+                    }
+                }
             }
         }
         ClientPacket::PickUp(_) => {
@@ -919,6 +947,12 @@ async fn handle_client_packet(
                 handle_market_buy(world, db, oid, mb.auction_id, mb.bid_price).await;
             }
         }
+        // 固定一口价市场：立即购买与竞价购买同路径
+        ClientPacket::MarketSellNow(msn) => {
+            if let Some(oid) = *object_id {
+                handle_market_buy(world, db, oid, msn.auction_id, 0).await;
+            }
+        }
         ClientPacket::MarketGetBack(mg) => {
             if let Some(oid) = *object_id {
                 handle_market_get_back(world, db, oid, mg.auction_id).await;
@@ -944,6 +978,36 @@ async fn handle_client_packet(
             if let Some(oid) = *object_id {
                 handle_delete_mail(world, db, oid, dm.mail_id).await;
             }
+        }
+        ClientPacket::LockMail(lm) => {
+            // 锁定/解锁邮件（锁定的邮件不可删除，同 C# LockMail）
+            if let Some(oid) = *object_id {
+                if let Some(me) = world.get_player(oid).await {
+                    match db.set_mail_locked(lm.mail_id as i64, me.character_index, lm.lock) {
+                        Ok(true) => {
+                            send_sys(
+                                world,
+                                oid,
+                                if lm.lock { "邮件已锁定" } else { "邮件已解锁" },
+                            )
+                            .await;
+                        }
+                        _ => send_sys(world, oid, "邮件不存在").await,
+                    }
+                }
+            }
+        }
+        ClientPacket::MailCost(_) => {
+            // 邮资查询：当前邮寄免费（同 C# GetMailCost，费率参数均为 0）
+            tx.send(encode_packet(&s::MailCost { cost: 0 })).await.ok();
+        }
+        ClientPacket::MailLockedItem(_) => {
+            // 写信界面的附件锁定切换：纯客户端状态，服务端无需处理
+        }
+        ClientPacket::SpellToggle(st) => {
+            // 战士剑术/心法类 buff 切换（Thusting/HalfMoon 等）：战斗系统未实装，先接受不处理
+            let _ = st;
+            tracing::debug!("SpellToggle 暂未实装（spell={}）", st.spell);
         }
         // 师徒
         ClientPacket::MentorReply(mr) => {
@@ -1134,6 +1198,35 @@ async fn handle_client_packet(
                 }
             }
         }
+        ClientPacket::DeleteItem(di) => {
+            // 删除背包物品（部分或全部，同 C# PlayerObject.DeleteItem）：回执 S.DeleteItem
+            if let Some(oid) = *object_id {
+                if let Some(me) = world.get_player(oid).await {
+                    let count = if di.count == 0 { 1 } else { di.count };
+                    match db.find_inventory_item(me.character_index, di.unique_id) {
+                        Ok(Some((_, item))) => {
+                            let take = count.min(item.count.max(1));
+                            let _ = db.reduce_inventory_item_count(me.character_index, di.unique_id, take);
+                            tx.send(encode_packet(&s::DeleteItem {
+                                unique_id: di.unique_id,
+                                count: take,
+                            }))
+                            .await
+                            .ok();
+                            send_slots_refresh(world, db, oid, me.character_index, tx).await;
+                        }
+                        _ => {
+                            tx.send(encode_packet(&s::DeleteItem {
+                                unique_id: di.unique_id,
+                                count: 0,
+                            }))
+                            .await
+                            .ok();
+                        }
+                    }
+                }
+            }
+        }
         ClientPacket::Disconnect(_) => {}
         _ => {
             tracing::warn!("未处理的客户端包: {:?}", std::mem::discriminant(packet));
@@ -1226,6 +1319,8 @@ async fn enter_world(
         dead: ch.hp <= 0,
         a_mode: 0,
         allow_group: true,
+        p_mode: 0,
+        magic_keys: std::collections::HashMap::new(),
     };
     // 穿戴装备后重算攻击/防御
     recompute_stats(&mut player);
@@ -2084,7 +2179,7 @@ async fn build_client_mail(
         sender_name: m.from_name.clone(),
         message: m.body.clone(),
         opened: m.is_read,
-        locked: false,
+        locked: m.locked,
         can_reply: false,
         collected,
         date_sent: m.created_at,
@@ -2172,6 +2267,11 @@ async fn handle_delete_mail(world: &World, db: &Database, oid: u32, mail_id: u64
     let has_attachment = m.gold > 0 || db.mail_attachment(m.id).ok().flatten().is_some();
     if has_attachment {
         send_sys(world, oid, "请先领取邮件附件").await;
+        return;
+    }
+    // 锁定的邮件不允许删除
+    if m.locked {
+        send_sys(world, oid, "邮件已锁定，无法删除").await;
         return;
     }
     let _ = db.delete_mail(m.id);

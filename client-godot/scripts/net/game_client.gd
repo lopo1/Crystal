@@ -48,6 +48,8 @@ signal market_success(message: String)
 signal mailbox_loaded(mails: Array)
 signal mail_sent(result: int)
 signal parcel_collected(result: int)
+signal mail_cost(cost: int)
+signal user_name_resolved(id: int, name: String)
 signal npc_refine(rate: float, refining: bool)
 signal object_magic(data: Dictionary)
 signal range_attack(target_id: int, target: Vector2i, spell: int)
@@ -112,6 +114,11 @@ const ClientPacketId := {
 	"READ_MAIL": 118,
 	"COLLECT_PARCEL": 119,
 	"DELETE_MAIL": 120,
+	"LOCK_MAIL": 121,
+	"MAIL_LOCKED_ITEM": 122,
+	"MAIL_COST": 123,
+	"DELETE_ITEM": 149,
+	"REQUEST_USER_NAME": 77,
 	"TRADE_REQUEST": 96,
 	"TRADE_REPLY": 97,
 	"TRADE_GOLD": 98,
@@ -122,7 +129,8 @@ const ClientPacketId := {
 	"DEL_MEMBER": 61,
 	"GROUP_INVITE": 62,
 	"MAGIC": 58,
-	"MAGIC_KEY": 59,
+	"MAGIC_KEY": 57,
+	"SPELL_TOGGLE": 69,
 	"PICK_UP": 35,
 	"EQUIP_ITEM": 18,
 	"REMOVE_ITEM": 19,
@@ -421,6 +429,55 @@ func delete_mail(mail_id: int) -> void:
 	p.packet_id = ClientPacketId.DELETE_MAIL
 	p.write_fn = func(w) -> void:
 		w.write_u64(mail_id)
+	send(p)
+
+## 锁定/解锁邮件（锁定的邮件不可删除）
+func lock_mail(mail_id: int, lock: bool) -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = ClientPacketId.LOCK_MAIL
+	p.write_fn = func(w) -> void:
+		w.write_u64(mail_id)
+		w.write_bool(lock)
+	send(p)
+
+## 查询邮寄费用（当前免费，服务端回 0）
+func mail_cost(gold: int, item_uids: Array = []) -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = ClientPacketId.MAIL_COST
+	p.write_fn = func(w) -> void:
+		w.write_u32(gold)
+		for i in range(5):
+			var uid: int = item_uids[i] if i < item_uids.size() else 0
+			w.write_u64(uid)
+		w.write_bool(false)
+	send(p)
+
+## 写信界面附件锁定切换（纯客户端状态）
+func mail_locked_item(unique_id: int, locked: bool) -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = ClientPacketId.MAIL_LOCKED_ITEM
+	p.write_fn = func(w) -> void:
+		w.write_u64(unique_id)
+		w.write_bool(locked)
+	send(p)
+
+## 删除背包物品（count=0 表示全部）
+func delete_item(unique_id: int, count: int = 0) -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = ClientPacketId.DELETE_ITEM
+	p.write_fn = func(w) -> void:
+		w.write_u64(unique_id)
+		w.write_u16(count)
+		w.write_bool(false)
+	send(p)
+
+## 战士剑术 buff 切换（服务端暂未实装战斗效果）
+func spell_toggle(spell: int, can_use: int = 0) -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = ClientPacketId.SPELL_TOGGLE
+	p.write_fn = func(w) -> void:
+		w.write_u8(spell)
+		w.write_i8(can_use)
 	send(p)
 
 func magic(direction: int, spell_id: int, target_id: int = 0) -> void:
@@ -884,6 +941,10 @@ func _dispatch(id: int, payload: PackedByteArray) -> void:
 			mail_sent.emit(data.get("result", 0))
 		Packets.S_PARCEL_COLLECTED:
 			parcel_collected.emit(data.get("result", 0))
+		Packets.S_MAIL_COST:
+			mail_cost.emit(data.get("cost", 0))
+		Packets.S_USER_NAME:
+			user_name_resolved.emit(data.get("id", 0), data.get("name", ""))
 		Packets.S_NPC_REFINE:
 			npc_refine.emit(data.get("rate", 0.0), data.get("refining", false))
 		Packets.S_OBJECT_MAGIC:
