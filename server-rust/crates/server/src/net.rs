@@ -18,8 +18,8 @@ use crate::items;
 use crate::web3::Web3Auth;
 use crate::world::{
     drop_ground_item, drop_gold, equipment_slots, gain_experience, gain_gold, npc_name, npc_shop,
-    persist_player, player_attack, player_gold, player_magic_attack, pick_up, recompute_stats,
-    remove_gold, use_consumable, Player, World,
+    persist_player, player_attack, player_gold, player_harvest, player_magic_attack,
+    player_range_attack, pick_up, recompute_stats, remove_gold, use_consumable, Player, World,
 };
 
 /// 连接所处的游戏阶段（对应 C# `GameStage`）
@@ -118,6 +118,8 @@ pub async fn handle_connection(
 
     // 断线清理：先持久化进度（金币/经验/等级/位置/血量），再移除在线实体
     if let Some(oid) = object_id {
+        // 进行中的交易自动取消并通知对方（物品未转移、金币未预扣，无需返还）
+        handle_trade_cancel(&world, oid, false).await;
         persist_player(&world, &db, oid).await;
         world.remove_player(oid).await;
     }
@@ -444,10 +446,14 @@ async fn handle_client_packet(
             move_player(world, object_id, tx, t.direction, 0).await;
         }
         ClientPacket::Walk(wk) => {
-            move_player(world, object_id, tx, wk.direction, 1).await;
+            if !is_dead(world, *object_id).await {
+                move_player(world, object_id, tx, wk.direction, 1).await;
+            }
         }
         ClientPacket::Run(r) => {
-            move_player(world, object_id, tx, r.direction, 2).await;
+            if !is_dead(world, *object_id).await {
+                move_player(world, object_id, tx, r.direction, 2).await;
+            }
         }
         ClientPacket::Chat(chat) => {
             if let Some(oid) = *object_id {
@@ -479,6 +485,46 @@ async fn handle_client_packet(
                 }
             }
         }
+        // 远程攻击（弓手，对应 C# MirConnection.RangeAttack -> Player.RangeAttack）
+        ClientPacket::RangeAttack(ra) => {
+            if let Some(oid) = *object_id {
+                let dir = MirDirection::from_u8(ra.direction);
+                player_range_attack(world, db, oid, dir, ra.target_id, ra.target_location).await;
+            }
+        }
+        // 采集（割肉，对应 C# PlayerObject.Harvest）
+        ClientPacket::Harvest(h) => {
+            if let Some(oid) = *object_id {
+                if !is_dead(world, Some(oid)).await {
+                    let dir = MirDirection::from_u8(h.direction);
+                    player_harvest(world, db, oid, dir).await;
+                }
+            }
+        }
+        // 开城门（对应 C# PlayerObject.Opendoor：自发 + 广播；门体数据待地图资源接入）
+        ClientPacket::Opendoor(od) => {
+            if let Some(oid) = *object_id {
+                let frame = encode_packet(&s::Opendoor { door_index: od.door_index, close: false });
+                tx.send(frame.clone()).await.ok();
+                if let Some(p) = world.get_player(oid).await {
+                    world.broadcast_on_except(p.map_index, frame, oid).await;
+                }
+            }
+        }
+        // 攻击模式（和平/编组/行会/全体…，对应 C# MirConnection.ChangeAMode）
+        ClientPacket::ChangeAMode(am) => {
+            if let Some(oid) = *object_id {
+                {
+                    let mut players = world.players.lock().await;
+                    if let Some(p) = players.get_mut(&oid) {
+                        p.a_mode = am.mode;
+                    }
+                }
+                tx.send(encode_packet(&s::ChangeAMode { mode: am.mode }))
+                    .await
+                    .ok();
+            }
+        }
         ClientPacket::Magic(m) => {
             if let Some(oid) = *object_id {
                 let dir = MirDirection::from_u8(m.direction);
@@ -487,7 +533,9 @@ async fn handle_client_packet(
         }
         ClientPacket::PickUp(_) => {
             if let Some(oid) = *object_id {
-                pick_up(world, oid, db).await;
+                if !is_dead(world, Some(oid)).await {
+                    pick_up(world, oid, db).await;
+                }
             }
         }
         ClientPacket::CallNPC(c) => {
@@ -721,6 +769,94 @@ async fn handle_client_packet(
                 handle_refine_cancel(world, oid).await;
             }
         }
+        // ------------------------- 面对面交易 -------------------------
+        ClientPacket::TradeRequest(_) => {
+            if let Some(oid) = *object_id {
+                handle_trade_request(world, db, oid).await;
+            }
+        }
+        ClientPacket::TradeReply(tr) => {
+            if let Some(oid) = *object_id {
+                handle_trade_reply(world, oid, tr.accept_invite).await;
+            }
+        }
+        ClientPacket::TradeGold(tg) => {
+            if let Some(oid) = *object_id {
+                handle_trade_gold(world, db, oid, tg.amount).await;
+            }
+        }
+        ClientPacket::DepositTradeItem(dt) => {
+            if let Some(oid) = *object_id {
+                handle_trade_deposit(world, db, oid, dt.from, dt.to).await;
+            }
+        }
+        ClientPacket::RetrieveTradeItem(rt) => {
+            if let Some(oid) = *object_id {
+                handle_trade_retrieve(world, db, oid, rt.from, rt.to).await;
+            }
+        }
+        ClientPacket::TradeConfirm(tc) => {
+            if let Some(oid) = *object_id {
+                handle_trade_confirm(world, db, oid, tc.locked).await;
+            }
+        }
+        ClientPacket::TradeCancel(_) => {
+            if let Some(oid) = *object_id {
+                handle_trade_cancel(world, oid, true).await;
+            }
+        }
+        // ------------------------- 寄售行（Market） -------------------------
+        ClientPacket::ConsignItem(ci) => {
+            if let Some(oid) = *object_id {
+                handle_market_consign(world, db, oid, ci.unique_id, ci.price).await;
+            }
+        }
+        ClientPacket::MarketPage(mp) => {
+            if let Some(oid) = *object_id {
+                handle_market_page(world, db, oid, mp.page, "").await;
+            }
+        }
+        ClientPacket::MarketSearch(ms) => {
+            if let Some(oid) = *object_id {
+                handle_market_page(world, db, oid, 0, &ms.r#match).await;
+            }
+        }
+        ClientPacket::MarketRefresh(_) => {
+            if let Some(oid) = *object_id {
+                handle_market_page(world, db, oid, 0, "").await;
+            }
+        }
+        ClientPacket::MarketBuy(mb) => {
+            if let Some(oid) = *object_id {
+                handle_market_buy(world, db, oid, mb.auction_id, mb.bid_price).await;
+            }
+        }
+        ClientPacket::MarketGetBack(mg) => {
+            if let Some(oid) = *object_id {
+                handle_market_get_back(world, db, oid, mg.auction_id).await;
+            }
+        }
+        // ------------------------- 邮件（Mail） -------------------------
+        ClientPacket::SendMail(sm) => {
+            if let Some(oid) = *object_id {
+                handle_send_mail(world, db, oid, sm).await;
+            }
+        }
+        ClientPacket::ReadMail(rm) => {
+            if let Some(oid) = *object_id {
+                handle_read_mail(world, db, oid, rm.mail_id).await;
+            }
+        }
+        ClientPacket::CollectParcel(cp) => {
+            if let Some(oid) = *object_id {
+                handle_collect_parcel(world, db, oid, cp.mail_id).await;
+            }
+        }
+        ClientPacket::DeleteMail(dm) => {
+            if let Some(oid) = *object_id {
+                handle_delete_mail(world, db, oid, dm.mail_id).await;
+            }
+        }
         // 师徒
         ClientPacket::MentorReply(mr) => {
             if let Some(oid) = *object_id {
@@ -838,7 +974,7 @@ async fn handle_client_packet(
                 handle_request_npc_info(world, tx, oid, rni.npc_index).await;
             }
         }
-        // 回城复活
+        // 回城复活（仅死亡状态生效，见 world::revive_player）
         ClientPacket::TownRevive(_) => {
             if let Some(oid) = *object_id {
                 crate::world::revive_player(world, oid).await;
@@ -974,7 +1110,8 @@ async fn enter_world(
         location: Point::new(sx, sy),
         direction: MirDirection::from_u8(ch.direction as u8),
         max_hp: base_hp,
-        hp: if ch.hp > 0 { ch.hp } else { base_hp },
+        // 存档血量 ≤0 视为死亡上线（死亡保留跨会话）
+        hp: ch.hp.max(0),
         max_mp: 20 + level as i32 * 5,
         mp: ch.mp,
         attack: base_attack,
@@ -998,6 +1135,8 @@ async fn enter_world(
         pending_mentor: None,
         can_be_mentor: false,
         pending_marriage: None,
+        dead: ch.hp <= 0,
+        a_mode: 0,
     };
     // 穿戴装备后重算攻击/防御
     recompute_stats(&mut player);
@@ -1060,7 +1199,34 @@ async fn enter_world(
         .ok();
 
     world.add_player(player).await;
+    // 登录同步攻击模式（同 C# 登录流程 Enqueue S.ChangeAMode）
+    if let Some(p) = world.get_player(object_id).await {
+        tx.send(encode_packet(&s::ChangeAMode { mode: p.a_mode }))
+            .await
+            .ok();
+    }
+    // 下发收件箱（客户端邮件面板数据源）
+    send_mailbox(world, db, object_id).await;
+    // 死亡上线：补发死亡表现，让客户端进入倒地状态（之后 TownRevive 复活）
+    if let Some(p) = world.get_player(object_id).await {
+        if p.dead {
+            tx.send(encode_packet(&s::Death {
+                location: p.location,
+                direction: p.direction,
+            }))
+            .await
+            .ok();
+        }
+    }
     Ok(object_id)
+}
+
+/// 玩家是否处于死亡状态（死亡保留期间禁止移动/攻击/拾取）
+async fn is_dead(world: &World, object_id: Option<u32>) -> bool {
+    match object_id {
+        Some(oid) => world.get_player(oid).await.map(|p| p.dead).unwrap_or(false),
+        None => false,
+    }
 }
 
 /// 移动/转身: 校验边界、更新世界、给自己发 UserLocation、广播给他人 Object*
@@ -1149,6 +1315,739 @@ async fn send_sys(world: &World, oid: u32, msg: &str) {
 async fn player_oid_by_name(world: &World, name: &str) -> Option<u32> {
     let players = world.players.lock().await;
     players.iter().find(|(_, p)| p.name == name).map(|(oid, _)| *oid)
+}
+
+// ---------------------------------------------------------------------------
+// 面对面交易（对应 C# PlayerObject.TradeRequest/Reply/Gold/Confirm/Cancel）
+// ---------------------------------------------------------------------------
+
+/// 找面前一格的玩家（同图、相邻）。返回 (object_id, 角色名)。
+async fn facing_player(world: &World, oid: u32) -> Option<(u32, String)> {
+    let me = world.get_player(oid).await?;
+    let (dx, dy) = crate::world::direction_offset(me.direction, 1);
+    let fx = me.location.x + dx;
+    let fy = me.location.y + dy;
+    let players = world.players.lock().await;
+    players
+        .iter()
+        .find(|(_, p)| {
+            p.object_id != oid && p.map_index == me.map_index
+                && p.location.x == fx && p.location.y == fy
+        })
+        .map(|(toid, p)| (*toid, p.name.clone()))
+}
+
+async fn handle_trade_request(world: &World, db: &Database, oid: u32) {
+    let me = match world.get_player(oid).await {
+        Some(p) => p,
+        None => return,
+    };
+    if me.dead {
+        send_sys(world, oid, "死亡状态无法交易").await;
+        return;
+    }
+    // 已在交易中
+    let in_trade = world.trade.lock().await.in_trade(&me.name);
+    if in_trade {
+        send_sys(world, oid, "你已经在交易中").await;
+        return;
+    }
+    // 面前必须有玩家（同 C# FaceToTrade）
+    let Some((toid, tname)) = facing_player(world, oid).await else {
+        send_sys(world, oid, "请面对要交易的玩家").await;
+        return;
+    };
+    let target = world.get_player(toid).await.unwrap();
+    if target.dead {
+        send_sys(world, oid, "对方处于死亡状态，无法交易").await;
+        return;
+    }
+    // 对方已在交易中 / 已有邀请
+    if world.trade.lock().await.in_trade(&tname) {
+        send_sys(world, oid, &format!("{}正在交易中", tname)).await;
+        return;
+    }
+    if !world.trade.lock().await.request(&me.name, &tname) {
+        send_sys(world, oid, &format!("{}已有待处理的交易邀请", tname)).await;
+        return;
+    }
+    let _ = db;
+    world
+        .send_to(toid, encode_packet(&s::TradeRequest { name: me.name.clone() }))
+        .await;
+}
+
+async fn handle_trade_reply(world: &World, oid: u32, accept: bool) {
+    let Some(me) = world.get_player(oid).await else { return };
+    if accept {
+        // 建立交易会话并取发起者名
+        let inviter = {
+            let mut mgr = world.trade.lock().await;
+            if mgr.accept(&me.name).is_ok() {
+                mgr.active_partner_of(&me.name)
+            } else {
+                None
+            }
+        };
+        let Some(inviter) = inviter else { return };
+        let Some(ioid) = player_oid_by_name(world, &inviter).await else {
+            // 发起者已掉线：取消
+            world.trade.lock().await.cancel(&me.name);
+            return;
+        };
+        world
+            .send_to(oid, encode_packet(&s::TradeAccept { name: inviter.clone() }))
+            .await;
+        world
+            .send_to(ioid, encode_packet(&s::TradeAccept { name: me.name.clone() }))
+            .await;
+    } else {
+        // 拒绝：移除 pending 并通知发起者
+        let inviter = world.trade.lock().await.reject(&me.name);
+        if let Some(inviter) = inviter {
+            if let Some(ioid) = player_oid_by_name(world, &inviter).await {
+                send_sys(world, ioid, &format!("{}拒绝了你的交易请求", me.name)).await;
+            }
+        }
+    }
+}
+
+async fn handle_trade_gold(world: &World, db: &Database, oid: u32, amount: u32) {
+    let _ = db;
+    let Some(me) = world.get_player(oid).await else { return };
+    if amount == 0 || me.gold < amount {
+        return;
+    }
+    // 累计放入不能超过持有金币
+    let already = world.trade.lock().await.side_gold(&me.name);
+    if already + amount > me.gold {
+        return;
+    }
+    if world.trade.lock().await.add_gold(&me.name, amount).is_err() {
+        return;
+    }
+    let total = world.trade.lock().await.side_gold(&me.name);
+    // 通知对方累计金额（同 C# S.TradeGold{Amount=累计}）
+    if let Some(partner) = trade_partner_oid(world, &me.name).await {
+        world
+            .send_to(partner, encode_packet(&s::TradeGold { amount: total }))
+            .await;
+    }
+}
+
+async fn handle_trade_deposit(world: &World, db: &Database, oid: u32, from: i32, to: i32) {
+    let Some(me) = world.get_player(oid).await else { return };
+    // 背包槽位 -> unique_id
+    let uid = match db.inventory_slots(me.character_index) {
+        Ok(slots) => slots
+            .get(from as usize)
+            .and_then(|o| o.as_ref())
+            .map(|it| it.unique_id),
+        Err(_) => None,
+    };
+    let Some(uid) = uid else {
+        tx_send(world, oid, &s::DepositTradeItem { from, to, success: false }).await;
+        return;
+    };
+    let ok = world.trade.lock().await.add_item(&me.name, uid).is_ok();
+    tx_send(
+        world,
+        oid,
+        &s::DepositTradeItem { from, to, success: ok },
+    )
+    .await;
+    if ok {
+        send_trade_items_to_partner(world, db, &me.name).await;
+    }
+}
+
+async fn handle_trade_retrieve(world: &World, db: &Database, oid: u32, from: i32, to: i32) {
+    let Some(me) = world.get_player(oid).await else { return };
+    // from = 已放入列表的下标（放入顺序）
+    let removed = if from >= 0 {
+        world.trade.lock().await.remove_item_at(&me.name, from as usize)
+    } else {
+        None
+    };
+    tx_send(
+        world,
+        oid,
+        &s::RetrieveTradeItem { from, to, success: removed.is_some() },
+    )
+    .await;
+    if removed.is_some() {
+        send_trade_items_to_partner(world, db, &me.name).await;
+    }
+}
+
+async fn handle_trade_confirm(world: &World, db: &Database, oid: u32, locked: bool) {
+    let Some(me) = world.get_player(oid).await else { return };
+    if !locked {
+        // 取消锁定：只解锁自己（对方保持），下次改动再联动解锁
+        let _ = world.trade.lock().await.confirm_cancel(&me.name);
+        return;
+    }
+    if world.trade.lock().await.confirm(&me.name).is_err() {
+        return;
+    }
+    // 对方未锁定：提示等待
+    let both_locked = {
+        let mgr = world.trade.lock().await;
+        mgr.both_locked(&me.name)
+    };
+    if !both_locked {
+        if let Some(partner) = trade_partner_name(world, &me.name).await {
+            if let Some(poid) = player_oid_by_name(world, &partner).await {
+                send_sys(world, poid, &format!("{}已确认交易，等待你确认", me.name)).await;
+            }
+        }
+        return;
+    }
+    // 双方已锁定 -> 结算
+    let settle = world.trade.lock().await.complete(&me.name).ok().flatten();
+    let Some(settle) = settle else { return };
+    execute_trade_settle(world, db, settle).await;
+}
+
+/// 结算中的物品转移：uid 从 from 背包移除，按模板重新入包到 to。
+async fn transfer_trade_items(
+    world: &World,
+    db: &Database,
+    uids: &[u64],
+    from_char: i32,
+    to_char: i32,
+    to_oid: u32,
+) {
+    for uid in uids {
+        let item = db
+            .find_inventory_item(from_char, *uid)
+            .ok()
+            .flatten()
+            .map(|(_, it)| it);
+        let Some(item) = item else { continue };
+        if db
+            .remove_from_inventory(from_char, *uid)
+            .ok()
+            .flatten()
+            .is_none()
+        {
+            continue;
+        }
+        if db
+            .add_item_to_inventory(to_char, item.item_index, item.count)
+            .unwrap_or(false)
+        {
+            world
+                .send_to(to_oid, encode_packet(&s::GainedItem { item }))
+                .await;
+        }
+    }
+}
+
+async fn handle_trade_cancel(world: &World, oid: u32, notify_self: bool) {
+    let Some(me) = world.get_player(oid).await else { return };
+    let partner = trade_partner_name(world, &me.name).await;
+    let cancelled = world.trade.lock().await.cancel(&me.name);
+    if !cancelled {
+        return;
+    }
+    // 物品从未离开背包、金币未预扣，无需返还
+    if let Some(pname) = partner {
+        if let Some(poid) = player_oid_by_name(world, &pname).await {
+            world
+                .send_to(poid, encode_packet(&s::TradeCancel { unlock: true }))
+                .await;
+            send_sys(world, poid, "对方取消了交易").await;
+        }
+    }
+    if notify_self {
+        world
+            .send_to(oid, encode_packet(&s::TradeCancel { unlock: true }))
+            .await;
+    }
+}
+
+/// 把某方已放入的交易物品列表发给其交易对象（同 C# S.TradeItem 全量刷新）
+async fn send_trade_items_to_partner(world: &World, db: &Database, who: &str) {
+    let uids = world.trade.lock().await.side_items(who);
+    let char_index = match player_oid_by_name(world, who).await {
+        Some(o) => world.get_player(o).await.map(|p| p.character_index),
+        None => None,
+    };
+    let Some(char_index) = char_index else { return };
+    let mut items: Vec<Option<UserItem>> = Vec::new();
+    for uid in uids {
+        let it = db
+            .find_inventory_item(char_index, uid)
+            .ok()
+            .flatten()
+            .map(|(_, item)| item);
+        items.push(it);
+    }
+    if let Some(partner) = trade_partner_oid(world, who).await {
+        world
+            .send_to(
+                partner,
+                encode_packet(&s::TradeItem { trade_items: items }),
+            )
+            .await;
+    }
+}
+
+/// 双方确认后的结算：转移物品与金币，通知双方。
+async fn execute_trade_settle(world: &World, db: &Database, settle: crate::trade::Settle) {
+    let a_oid = player_oid_by_name(world, &settle.a).await;
+    let b_oid = player_oid_by_name(world, &settle.b).await;
+    let (Some(a_oid), Some(b_oid)) = (a_oid, b_oid) else {
+        return; // 结算时必须双方在线（正常流程保证）
+    };
+    let a_char = world.get_player(a_oid).await.map(|p| p.character_index);
+    let b_char = world.get_player(b_oid).await.map(|p| p.character_index);
+    let (Some(a_char), Some(b_char)) = (a_char, b_char) else {
+        return;
+    };
+
+    // 物品交换（uid 从卖方背包移除，按模板重新入包到买方）
+    transfer_trade_items(world, db, &settle.a_items_to_b, a_char, b_char, b_oid).await;
+    transfer_trade_items(world, db, &settle.b_items_to_a, b_char, a_char, a_oid).await;
+
+    // 金币交换
+    if settle.a_gold_to_b > 0 && remove_gold(world, a_oid, settle.a_gold_to_b).await {
+        gain_gold(world, b_oid, settle.a_gold_to_b).await;
+    }
+    if settle.b_gold_to_a > 0 && remove_gold(world, b_oid, settle.b_gold_to_a).await {
+        gain_gold(world, a_oid, settle.b_gold_to_a).await;
+    }
+
+    // 完成表现
+    world.send_to(a_oid, encode_packet(&s::TradeConfirm)).await;
+    world.send_to(b_oid, encode_packet(&s::TradeConfirm)).await;
+    send_sys(world, a_oid, "交易成功").await;
+    send_sys(world, b_oid, "交易成功").await;
+}
+
+/// 某玩家当前交易对象的名字
+async fn trade_partner_name(world: &World, who: &str) -> Option<String> {
+    let mgr = world.trade.lock().await;
+    mgr.active_partner_of(who)
+}
+
+/// 某玩家当前交易对象的 object_id
+async fn trade_partner_oid(world: &World, who: &str) -> Option<u32> {
+    let partner = trade_partner_name(world, who).await?;
+    player_oid_by_name(world, &partner).await
+}
+
+/// 给指定玩家直接发送一个服务器包（内部小工具）
+async fn tx_send<T: crystal_protocol::frame::PacketCodec>(world: &World, oid: u32, pkt: &T) {
+    world.send_to(oid, encode_packet(pkt)).await;
+}
+
+// ---------------------------------------------------------------------------
+// 寄售行（Market）：挂单内存态（重启清空），物品在成交/取回时才真正转移，
+// remove_from_inventory 的原子性保证不会重复出售。
+// ---------------------------------------------------------------------------
+
+/// 寄售行每页条数
+const MARKET_PAGE_SIZE: usize = 10;
+
+/// 挂单：把背包物品上架。物品暂留背包，成交时才转移。
+async fn handle_market_consign(
+    world: &World,
+    db: &Database,
+    oid: u32,
+    unique_id: u64,
+    price: u32,
+) {
+    let Some(me) = world.get_player(oid).await else { return };
+    // 物品必须在背包中
+    let owned = db
+        .find_inventory_item(me.character_index, unique_id)
+        .ok()
+        .flatten()
+        .is_some();
+    let success = owned && world.market.lock().await.list(&me.name, unique_id, price).is_ok();
+    tx_send(world, oid, &s::ConsignItem { unique_id, success }).await;
+    if success {
+        send_sys(world, oid, &format!("物品已上架，要价 {} 金币", price)).await;
+    }
+}
+
+/// 构建一个挂单的客户端展示结构
+async fn market_order_to_auction(
+    db: &Database,
+    order: &crate::market::MarketOrder,
+) -> Option<crystal_protocol::types::ClientAuction> {
+    use crystal_protocol::types::ClientAuction;
+    let seller_char = db.char_index_by_name(&order.seller).ok().flatten()?;
+    let (_, item) = db.find_inventory_item(seller_char, order.item_uid).ok().flatten()?;
+    Some(ClientAuction {
+        auction_id: order.order_id,
+        item,
+        seller: order.seller.clone(),
+        price: order.price,
+        consignment_date: order.listed_at,
+        item_type: 0,
+    })
+}
+
+/// 挂单物品名（用于搜索过滤；查不到返回空）
+async fn market_order_item_name(db: &Database, order: &crate::market::MarketOrder) -> String {
+    let Some(seller_char) = db.char_index_by_name(&order.seller).ok().flatten() else {
+        return String::new();
+    };
+    let Some((_, item)) = db
+        .find_inventory_item(seller_char, order.item_uid)
+        .ok()
+        .flatten()
+    else {
+        return String::new();
+    };
+    crate::items::find(item.item_index)
+        .map(|t| t.name.to_string())
+        .unwrap_or_default()
+}
+
+/// 市场列表（page 从 0 起；`name_filter` 非空时按物品名模糊过滤）
+async fn handle_market_page(world: &World, db: &Database, oid: u32, page: i32, name_filter: &str) {
+    use crystal_protocol::types::ClientAuction;
+    let filter = name_filter.to_lowercase();
+    let orders: Vec<crate::market::MarketOrder> = {
+        let mgr = world.market.lock().await;
+        mgr.all_orders()
+    };
+    let mut auctions: Vec<ClientAuction> = Vec::new();
+    for o in &orders {
+        if !filter.is_empty() {
+            let name = market_order_item_name(db, o).await;
+            if !name.to_lowercase().contains(&filter) {
+                continue;
+            }
+        }
+        if let Some(a) = market_order_to_auction(db, o).await {
+            auctions.push(a);
+        }
+    }
+    let pages = auctions.len().div_ceil(MARKET_PAGE_SIZE) as i32;
+    let start = (page.max(0) as usize) * MARKET_PAGE_SIZE;
+    let slice: Vec<ClientAuction> = auctions
+        .into_iter()
+        .skip(start)
+        .take(MARKET_PAGE_SIZE)
+        .collect();
+    tx_send(
+        world,
+        oid,
+        &s::NPCMarket {
+            listings: slice,
+            pages,
+            user_mode: false,
+        },
+    )
+    .await;
+}
+
+/// 购买挂单
+async fn handle_market_buy(
+    world: &World,
+    db: &Database,
+    oid: u32,
+    auction_id: u64,
+    bid_price: u32,
+) {
+    let Some(me) = world.get_player(oid).await else { return };
+    if me.dead {
+        tx_send(world, oid, &s::MarketFail { reason: 0 }).await; // 已死
+        return;
+    }
+    let order = world.market.lock().await.orders.get(&auction_id).cloned();
+    let Some(order) = order else {
+        tx_send(world, oid, &s::MarketFail { reason: 2 }).await; // 已售/不存在
+        return;
+    };
+    if order.seller == me.name {
+        tx_send(world, oid, &s::MarketFail { reason: 6 }).await; // 不能买自己的
+        return;
+    }
+    if bid_price < order.price || me.gold < order.price {
+        tx_send(world, oid, &s::MarketFail { reason: 4 }).await; // 金币不足
+        return;
+    }
+    // 卖家角色（可离线）
+    let Some(seller_char) = db.char_index_by_name(&order.seller).ok().flatten() else {
+        tx_send(world, oid, &s::MarketFail { reason: 2 }).await;
+        return;
+    };
+    // 原子取物：从卖家背包移除（防重复出售）
+    let item = db
+        .find_inventory_item(seller_char, order.item_uid)
+        .ok()
+        .flatten()
+        .map(|(_, it)| it);
+    let Some(item) = item else {
+        tx_send(world, oid, &s::MarketFail { reason: 2 }).await; // 已售
+        return;
+    };
+    if db
+        .remove_from_inventory(seller_char, order.item_uid)
+        .ok()
+        .flatten()
+        .is_none()
+    {
+        tx_send(world, oid, &s::MarketFail { reason: 2 }).await;
+        return;
+    }
+    // 移除挂单 + 转金币
+    if world.market.lock().await.buy(auction_id).is_err() {
+        // 理论不可达（上面刚查过）；回滚物品
+        let _ = db.add_item_to_inventory(seller_char, item.item_index, item.count);
+        tx_send(world, oid, &s::MarketFail { reason: 2 }).await;
+        return;
+    }
+    let _ = db.add_char_gold(seller_char, order.price as i64);
+    // 卖家在线则同步世界侧金币并提示
+    if let Some(soid) = player_oid_by_name(world, &order.seller).await {
+        gain_gold(world, soid, order.price).await;
+        send_sys(world, soid, &format!("{} 购买了你的寄售物品，+{} 金币", me.name, order.price)).await;
+    }
+    // 买家扣金 + 入包
+    remove_gold(world, oid, order.price).await;
+    if db
+        .add_item_to_inventory(me.character_index, item.item_index, item.count)
+        .unwrap_or(false)
+    {
+        tx_send(world, oid, &s::GainedItem { item }).await;
+    }
+    tx_send(
+        world,
+        oid,
+        &s::MarketSuccess { message: "购买成功".to_string() },
+    )
+    .await;
+}
+
+/// 取回自己的挂单（物品一直在背包，仅撤单）
+async fn handle_market_get_back(world: &World, db: &Database, oid: u32, auction_id: u64) {
+    let _ = db;
+    let Some(me) = world.get_player(oid).await else { return };
+    let is_mine = world
+        .market
+        .lock()
+        .await
+        .orders
+        .get(&auction_id)
+        .map(|o| o.seller == me.name)
+        .unwrap_or(false);
+    if !is_mine {
+        tx_send(world, oid, &s::MarketFail { reason: 2 }).await;
+        return;
+    }
+    if world.market.lock().await.cancel(auction_id).is_ok() {
+        tx_send(
+            world,
+            oid,
+            &s::MarketSuccess { message: "已取回寄售物品".to_string() },
+        )
+        .await;
+    } else {
+        tx_send(world, oid, &s::MarketFail { reason: 2 }).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 邮件（Mail）：站内信 + 金币/单件物品附件。
+// 附件在寄出时即从寄件人背包移除（防复制），领取时入收件人背包；
+// 收件人可离线，金币直接落库（add_char_gold）。
+// ---------------------------------------------------------------------------
+
+/// MailSent 结果码：0 成功 / 1 收件人不存在 / 2 不能寄给自己 / 3 金币不足 / 4 附件无效
+async fn handle_send_mail(world: &World, db: &Database, oid: u32, sm: &c::SendMail) {
+    let Some(me) = world.get_player(oid).await else { return };
+    // 收件人校验
+    if sm.name == me.name {
+        tx_send(world, oid, &s::MailSent { result: 2 }).await;
+        return;
+    }
+    let Some(to_char) = db.char_index_by_name(&sm.name).ok().flatten() else {
+        tx_send(world, oid, &s::MailSent { result: 1 }).await;
+        return;
+    };
+    // 金币附件
+    if sm.gold > 0 && !remove_gold(world, oid, sm.gold).await {
+        tx_send(world, oid, &s::MailSent { result: 3 }).await;
+        return;
+    }
+    // 物品附件：取第一个非空槽位（数据模型一封一附件）
+    let first_uid = sm.items_idx.iter().find(|&&u| u != 0).copied();
+    let attached: Option<crystal_protocol::types::UserItem> = match first_uid {
+        None => None,
+        Some(uid) => {
+            let item = db
+                .find_inventory_item(me.character_index, uid)
+                .ok()
+                .flatten()
+                .map(|(_, it)| it);
+            let Some(item) = item else {
+                // 附件无效：回滚金币并失败
+                if sm.gold > 0 {
+                    gain_gold(world, oid, sm.gold).await;
+                }
+                tx_send(world, oid, &s::MailSent { result: 4 }).await;
+                return;
+            };
+            if db
+                .remove_from_inventory(me.character_index, uid)
+                .ok()
+                .flatten()
+                .is_none()
+            {
+                if sm.gold > 0 {
+                    gain_gold(world, oid, sm.gold).await;
+                }
+                tx_send(world, oid, &s::MailSent { result: 4 }).await;
+                return;
+            }
+            Some(item)
+        }
+    };
+    // 落库
+    let mail_id = match db.send_mail(to_char, &me.name, "", &sm.message, sm.gold as i64, 0) {
+        Ok(id) => id,
+        Err(_) => {
+            if sm.gold > 0 {
+                gain_gold(world, oid, sm.gold).await;
+            }
+            tx_send(world, oid, &s::MailSent { result: 1 }).await;
+            return;
+        }
+    };
+    if let Some(item) = &attached {
+        let _ = db.attach_mail_item(mail_id, item.item_index, item.count);
+    }
+    tx_send(world, oid, &s::MailSent { result: 0 }).await;
+    send_sys(world, oid, &format!("邮件已寄给 {}", sm.name)).await;
+    // 收件人在线则提示
+    if let Some(toid) = player_oid_by_name(world, &sm.name).await {
+        send_sys(world, toid, "收到新邮件").await;
+    }
+}
+
+/// 构建客户端邮件结构（含附件与已领取状态）
+async fn build_client_mail(
+    world: &World,
+    db: &Database,
+    m: &crate::db::Mail,
+) -> Option<crystal_protocol::types::ClientMail> {
+    use crystal_protocol::types::{ClientMail, UserItem};
+    let _ = world;
+    let attachment = db.mail_attachment(m.id).ok().flatten();
+    let collected = m.gold == 0 && attachment.is_none();
+    let items = attachment
+        .map(|(item_index, count)| {
+            vec![UserItem {
+                unique_id: 0,
+                item_index,
+                count,
+                ..Default::default()
+            }]
+        })
+        .unwrap_or_default();
+    Some(ClientMail {
+        mail_id: m.id as u64,
+        sender_name: m.from_name.clone(),
+        message: m.body.clone(),
+        opened: m.is_read,
+        locked: false,
+        can_reply: false,
+        collected,
+        date_sent: m.created_at,
+        gold: m.gold.max(0) as u32,
+        items,
+    })
+}
+
+/// 下发整个收件箱
+async fn send_mailbox(world: &World, db: &Database, oid: u32) {
+    let Some(me) = world.get_player(oid).await else { return };
+    let mails = db.mail_inbox(me.character_index).unwrap_or_default();
+    let mut list = Vec::new();
+    for m in &mails {
+        if let Some(cm) = build_client_mail(world, db, m).await {
+            list.push(cm);
+        }
+    }
+    tx_send(world, oid, &s::ReceiveMail { mail: list }).await;
+}
+
+async fn handle_read_mail(world: &World, db: &Database, oid: u32, mail_id: u64) {
+    let Some(me) = world.get_player(oid).await else { return };
+    let mail = db
+        .get_mail(mail_id as i64, me.character_index)
+        .ok()
+        .flatten();
+    let Some(m) = mail else { return };
+    let _ = db.mark_mail_read(m.id);
+    let m = crate::db::Mail { is_read: true, ..m };
+    if let Some(cm) = build_client_mail(world, db, &m).await {
+        tx_send(world, oid, &s::ReceiveMail { mail: vec![cm] }).await;
+    }
+}
+
+async fn handle_collect_parcel(world: &World, db: &Database, oid: u32, mail_id: u64) {
+    let Some(me) = world.get_player(oid).await else { return };
+    let mail = db
+        .get_mail(mail_id as i64, me.character_index)
+        .ok()
+        .flatten();
+    let Some(m) = mail else {
+        tx_send(world, oid, &s::ParcelCollected { result: 1 }).await;
+        return;
+    };
+    // 金币附件
+    if m.gold > 0 {
+        match db.claim_mail_gold(m.id) {
+            Ok(gold) if gold > 0 => gain_gold(world, oid, gold as u32).await,
+            _ => {}
+        }
+    }
+    // 物品附件
+    if let Ok(Some((item_index, count))) = db.claim_mail_attachment(m.id) {
+        if db
+            .add_item_to_inventory(me.character_index, item_index, count)
+            .unwrap_or(false)
+        {
+            tx_send(
+                world,
+                oid,
+                &s::GainedItem {
+                    item: crystal_protocol::types::UserItem {
+                        unique_id: 0,
+                        item_index,
+                        count,
+                        ..Default::default()
+                    },
+                },
+            )
+            .await;
+        }
+    }
+    tx_send(world, oid, &s::ParcelCollected { result: 0 }).await;
+}
+
+async fn handle_delete_mail(world: &World, db: &Database, oid: u32, mail_id: u64) {
+    let Some(me) = world.get_player(oid).await else { return };
+    let mail = db
+        .get_mail(mail_id as i64, me.character_index)
+        .ok()
+        .flatten();
+    let Some(m) = mail else { return };
+    // 有未领取附件不允许删除（同 C# 语义）
+    let has_attachment = m.gold > 0 || db.mail_attachment(m.id).ok().flatten().is_some();
+    if has_attachment {
+        send_sys(world, oid, "请先领取邮件附件").await;
+        return;
+    }
+    let _ = db.delete_mail(m.id);
 }
 
 // ---------------------------------------------------------------------------

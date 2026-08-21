@@ -20,13 +20,17 @@ pub struct MonsterTemplate {
     pub defence: i32,
     pub exp: u32,
     pub gold: u32,
+    /// true = 远程攻击怪（射程内发射弹体，ObjectRangeAttack 表现）
+    pub ranged: bool,
+    /// 采集所得物品 item_index（0=不可采集；Harvest 割肉）
+    pub harvest_item: i32,
 }
 
 /// 全部怪物模板
 pub const MONSTER_TEMPLATES: [MonsterTemplate; 3] = [
-    MonsterTemplate { image: 2, name: "稻草人", level: 1, hp: 12, attack: 1, defence: 0, exp: 5, gold: 3 },
-    MonsterTemplate { image: 3, name: "骷髅", level: 3, hp: 20, attack: 3, defence: 1, exp: 12, gold: 8 },
-    MonsterTemplate { image: 4, name: "蜘蛛", level: 4, hp: 26, attack: 5, defence: 2, exp: 20, gold: 12 },
+    MonsterTemplate { image: 2, name: "稻草人", level: 1, hp: 12, attack: 1, defence: 0, exp: 5, gold: 3, ranged: false, harvest_item: 0 },
+    MonsterTemplate { image: 3, name: "骷髅", level: 3, hp: 20, attack: 3, defence: 1, exp: 12, gold: 8, ranged: false, harvest_item: 6 },
+    MonsterTemplate { image: 4, name: "蜘蛛", level: 4, hp: 26, attack: 5, defence: 2, exp: 20, gold: 12, ranged: true, harvest_item: 0 },
 ];
 
 /// 一张地图的刷怪点列表

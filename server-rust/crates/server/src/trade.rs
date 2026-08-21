@@ -46,6 +46,8 @@ pub enum TradeError {
     NoPendingInvite,
     NotInTrade,
     AlreadyLocked,
+    /// 物品已在交易栏中（重复放入）
+    AlreadyDeposited,
 }
 
 /// 交易管理器
@@ -62,12 +64,19 @@ impl TradeManager {
         Self::default()
     }
 
-    /// 发起交易请求（from 邀请 to）
-    pub fn request(&mut self, from: &str, to: &str) {
-        if from == to {
-            return;
+    /// 发起交易请求（from 邀请 to）。
+    /// 返回 false 表示对方已有待处理的交易邀请（同 C# TradeInvitation 占用检查）。
+    pub fn request(&mut self, from: &str, to: &str) -> bool {
+        if from == to || self.pending.contains_key(to) {
+            return false;
         }
         self.pending.insert(to.to_string(), from.to_string());
+        true
+    }
+
+    /// 拒绝邀请：移除待处理项，返回发起者名（用于通知）。
+    pub fn reject(&mut self, invitee: &str) -> Option<String> {
+        self.pending.remove(invitee)
     }
 
     /// 对方接受：从 pending 创建一场交易
@@ -88,20 +97,58 @@ impl TradeManager {
         self.active.iter_mut().find(|t| t.a == who || t.b == who)
     }
 
-    /// 放入金币
+    /// 放入金币。任一方改动都会解锁双方（同 C# TradeUnlock 语义）。
     pub fn add_gold(&mut self, who: &str, amount: u32) -> Result<(), TradeError> {
         let t = self.find(who).ok_or(TradeError::NotInTrade)?;
         let me = if t.a == who { &mut t.side_a } else { &mut t.side_b };
         me.gold += amount;
+        t.lock_a = false;
+        t.lock_b = false;
         Ok(())
     }
 
-    /// 放入一件背包物品（unique_id）
+    /// 放入一件背包物品（unique_id）。任一方改动都会解锁双方。
     pub fn add_item(&mut self, who: &str, unique_id: u64) -> Result<(), TradeError> {
         let t = self.find(who).ok_or(TradeError::NotInTrade)?;
         let me = if t.a == who { &mut t.side_a } else { &mut t.side_b };
+        if me.items.contains(&unique_id) {
+            return Err(TradeError::AlreadyDeposited);
+        }
         me.items.push(unique_id);
+        t.lock_a = false;
+        t.lock_b = false;
         Ok(())
+    }
+
+    /// 取回一件已放入的物品（按放入顺序的下标）。返回被取回的 unique_id。
+    pub fn remove_item_at(&mut self, who: &str, index: usize) -> Option<u64> {
+        let t = self.find(who)?;
+        let me = if t.a == who { &mut t.side_a } else { &mut t.side_b };
+        if index >= me.items.len() {
+            return None;
+        }
+        let uid = me.items.remove(index);
+        t.lock_a = false;
+        t.lock_b = false;
+        Some(uid)
+    }
+
+    /// 我方已放入的金币总额
+    pub fn side_gold(&self, who: &str) -> u32 {
+        self.active
+            .iter()
+            .find(|t| t.a == who || t.b == who)
+            .map(|t| if t.a == who { t.side_a.gold } else { t.side_b.gold })
+            .unwrap_or(0)
+    }
+
+    /// 我方已放入的物品 unique_id 列表（按放入顺序）
+    pub fn side_items(&self, who: &str) -> Vec<u64> {
+        self.active
+            .iter()
+            .find(|t| t.a == who || t.b == who)
+            .map(|t| if t.a == who { t.side_a.items.clone() } else { t.side_b.items.clone() })
+            .unwrap_or_default()
     }
 
     /// 确认（锁定本方）
@@ -152,6 +199,34 @@ impl TradeManager {
     /// 某玩家是否在交易中
     pub fn in_trade(&self, who: &str) -> bool {
         self.active.iter().any(|t| t.a == who || t.b == who)
+    }
+
+    /// 某玩家当前交易对象的名字（不在交易中则 None）
+    pub fn active_partner_of(&self, who: &str) -> Option<String> {
+        self.active
+            .iter()
+            .find(|t| t.a == who || t.b == who)
+            .map(|t| if t.a == who { t.b.clone() } else { t.a.clone() })
+    }
+
+    /// 仅解锁自己（对应 C# TradeConfirm(false)）
+    pub fn confirm_cancel(&mut self, who: &str) -> Result<(), TradeError> {
+        let t = self.find(who).ok_or(TradeError::NotInTrade)?;
+        if t.a == who {
+            t.lock_a = false;
+        } else {
+            t.lock_b = false;
+        }
+        Ok(())
+    }
+
+    /// 双方是否都已确认锁定
+    pub fn both_locked(&self, who: &str) -> bool {
+        self.active
+            .iter()
+            .find(|t| t.a == who || t.b == who)
+            .map(|t| t.lock_a && t.lock_b)
+            .unwrap_or(false)
     }
 }
 
@@ -213,5 +288,60 @@ mod tests {
         mgr.confirm("B").unwrap();
         let s = mgr.complete("B").unwrap().unwrap();
         assert_eq!(s.a_items_to_b, vec![99]);
+    }
+
+    #[test]
+    fn request_fails_when_target_busy_or_self() {
+        let mut mgr = TradeManager::new();
+        assert!(mgr.request("A", "B"));
+        // B 已有邀请：C 再约 B 失败
+        assert!(!mgr.request("C", "B"));
+        // 自己约自己失败
+        assert!(!mgr.request("A", "A"));
+    }
+
+    #[test]
+    fn reject_returns_inviter_and_clears_pending() {
+        let mut mgr = TradeManager::new();
+        mgr.request("A", "B");
+        assert_eq!(mgr.reject("B"), Some("A".to_string()));
+        assert_eq!(mgr.reject("B"), None);
+        assert_eq!(mgr.accept("B"), Err(TradeError::NoPendingInvite));
+    }
+
+    #[test]
+    fn side_views_and_remove_item_at() {
+        let mut mgr = TradeManager::new();
+        mgr.request("A", "B");
+        mgr.accept("B").unwrap();
+        mgr.add_gold("A", 50).unwrap();
+        mgr.add_item("A", 11).unwrap();
+        mgr.add_item("A", 12).unwrap();
+        assert_eq!(mgr.side_gold("A"), 50);
+        assert_eq!(mgr.side_items("A"), vec![11, 12]);
+        assert_eq!(mgr.side_items("B"), Vec::<u64>::new());
+        // 取回下标 0 的物品
+        assert_eq!(mgr.remove_item_at("A", 0), Some(11));
+        assert_eq!(mgr.side_items("A"), vec![12]);
+        // 下标越界
+        assert_eq!(mgr.remove_item_at("A", 5), None);
+        // 重复放入被拒
+        assert_eq!(mgr.add_item("A", 12), Err(TradeError::AlreadyDeposited));
+    }
+
+    #[test]
+    fn change_unlocks_both_and_partner_lookup() {
+        let mut mgr = TradeManager::new();
+        mgr.request("A", "B");
+        mgr.accept("B").unwrap();
+        assert_eq!(mgr.active_partner_of("A"), Some("B".to_string()));
+        assert_eq!(mgr.active_partner_of("B"), Some("A".to_string()));
+        assert_eq!(mgr.active_partner_of("C"), None);
+        mgr.confirm("A").unwrap();
+        mgr.confirm("B").unwrap();
+        assert!(mgr.both_locked("A"));
+        // 任一方改动 -> 双方解锁
+        mgr.add_gold("B", 10).unwrap();
+        assert!(!mgr.both_locked("A"));
     }
 }

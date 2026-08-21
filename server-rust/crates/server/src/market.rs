@@ -17,6 +17,8 @@ pub struct MarketOrder {
     pub item_uid: u64,
     /// 要价（金币）
     pub price: u32,
+    /// 挂单时间（Unix 秒，供客户端展示）
+    pub listed_at: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +54,10 @@ impl MarketManager {
                 seller: seller.to_string(),
                 item_uid,
                 price,
+                listed_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0),
             },
         );
         Ok(order_id)

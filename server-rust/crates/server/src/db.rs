@@ -169,6 +169,13 @@ impl Database {
                 spouse_index  INTEGER NOT NULL,
                 date          INTEGER NOT NULL DEFAULT 0
             );
+
+            -- 邮件物品附件：一封邮件至多一件（领取后删除行）
+            CREATE TABLE IF NOT EXISTS mail_items (
+                mail_id    INTEGER PRIMARY KEY,
+                item_index INTEGER NOT NULL,
+                count      INTEGER NOT NULL DEFAULT 1
+            );
             "#,
         )?;
         // 旧库迁移：补 durability / refines / reincarnations 列（已存在则 ALTER 报错，忽略即可）
@@ -192,13 +199,14 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM items", [], |r| r.get(0))?;
         if count == 0 {
-            // 木剑(1) / 布衣(2) / 金创药(3) / 回城卷(4) / 铜币袋(5)
-            let demo: [(i32, &str, i32, i32, i32, i32, i32, i64); 5] = [
+            // 木剑(1) / 布衣(2) / 金创药(3) / 回城卷(4) / 铜币袋(5) / 肉(6)
+            let demo: [(i32, &str, i32, i32, i32, i32, i32, i64); 6] = [
                 (1, "木剑", 1, 100, 20, 1, 3, 50),
                 (2, "布衣", 1, 101, 25, 1, 4, 80),
                 (3, "金创药", 2, 120, 0, 5, 1, 20),
                 (4, "回城卷", 2, 121, 0, 5, 1, 60),
                 (5, "铜币袋", 0, 130, 0, 20, 1, 100),
+                (6, "肉", 0, 131, 0, 20, 1, 15),
             ];
             for (idx, name, ty, img, dur, stack, w, price) in demo {
                 conn.execute(
@@ -606,6 +614,39 @@ impl Database {
             params![id],
         )?;
         Ok(item_uid)
+    }
+
+    /// 给邮件附加一件物品（寄送时从寄件人背包移除后调用）。
+    pub fn attach_mail_item(&self, mail_id: i64, item_index: i32, count: u16) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO mail_items (mail_id,item_index,count) VALUES (?1,?2,?3)",
+            params![mail_id, item_index, count],
+        )?;
+        Ok(())
+    }
+
+    /// 查邮件的物品附件（未领取则 Some）。
+    pub fn mail_attachment(&self, mail_id: i64) -> anyhow::Result<Option<(i32, u16)>> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT item_index,count FROM mail_items WHERE mail_id=?1",
+                params![mail_id],
+                |r| Ok((r.get::<_, i32>(0)?, r.get::<_, u16>(1)?)),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// 领取邮件物品附件：删除附件行并返回内容（无则 None）。
+    pub fn claim_mail_attachment(&self, mail_id: i64) -> anyhow::Result<Option<(i32, u16)>> {
+        let att = self.mail_attachment(mail_id)?;
+        if att.is_some() {
+            let conn = self.conn.lock().unwrap();
+            conn.execute("DELETE FROM mail_items WHERE mail_id=?1", params![mail_id])?;
+        }
+        Ok(att)
     }
 
     /// 按角色名查 character_index（跨账号唯一）。无则 None。
@@ -1542,8 +1583,9 @@ impl Database {
     }
 
     pub fn clear_mentor(&self, c: i32) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        // 先在锁外查 mentor（get_mentor 内部也要拿同一把锁，锁内调用会死锁）
         let m = self.get_mentor(c);
+        let conn = self.conn.lock().unwrap();
         conn.execute(
             "DELETE FROM mentor_relations WHERE character_index=?1",
             params![c],
@@ -2000,6 +2042,25 @@ mod tests {
     }
 
     #[test]
+    fn mail_attachment_attach_claim_roundtrip() {
+        let (db, _p) = temp_db();
+        db.register("tester").unwrap();
+        let b = db
+            .add_character("tester", "收件", crystal_protocol::types::MirClass::Wizard, crystal_protocol::types::MirGender::Female)
+            .unwrap()
+            .unwrap();
+        let id = db.send_mail(b.index, "寄件", "", "带件", 0, 0).unwrap();
+        // 未附加时无附件
+        assert!(db.mail_attachment(id).unwrap().is_none());
+        // 附加 -> 可查 -> 领取后清除
+        db.attach_mail_item(id, 6, 3).unwrap();
+        assert_eq!(db.mail_attachment(id).unwrap(), Some((6, 3)));
+        assert_eq!(db.claim_mail_attachment(id).unwrap(), Some((6, 3)));
+        assert!(db.mail_attachment(id).unwrap().is_none());
+        assert_eq!(db.claim_mail_attachment(id).unwrap(), None);
+    }
+
+    #[test]
     fn mail_claim_gold_zeroes_attachment() {
         let (db, _p) = temp_db();
         db.register("tester").unwrap();
@@ -2348,7 +2409,7 @@ mod tests {
     fn next_refine_monotonic() {
         let (c0, cost0) = Database::next_refine(0);
         let (c1, cost1) = Database::next_refine(1);
-        let (c5, cost5) = Database::next_refine(5);
+        let (c5, _cost5) = Database::next_refine(5);
         // 成功率随精炼值递减
         assert!(c0 > c1);
         assert!(c1 >= c5);
@@ -2356,8 +2417,10 @@ mod tests {
         assert!(cost0 < cost1);
         assert_eq!(cost0, 50);
         assert_eq!(cost1, 100);
-        // 成功率收敛到 10% 下限
-        assert!((c5 - 0.1).abs() < 1e-6);
+        // 线性递减：cur=5 时为 0.15，cur=6 触及 10% 下限
+        assert!((c5 - 0.15).abs() < 1e-6);
+        let (c6, _) = Database::next_refine(6);
+        assert!((c6 - 0.1).abs() < 1e-6);
         // 精炼值爬取写入/读取
         let (db, _p) = temp_db();
         db.register("tester").unwrap();

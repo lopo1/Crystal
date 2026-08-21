@@ -131,6 +131,36 @@ static func read_user_item(r: Reader) -> Dictionary:
 	item["gm_made"] = r.read_bool()
 	return item
 
+## 寄售行挂单条目（ClientAuction）
+static func read_client_auction(r: Reader) -> Dictionary:
+	var a := {}
+	a["auction_id"] = r.read_u64()
+	a["item"] = read_user_item(r)
+	a["seller"] = r.read_string()
+	a["price"] = r.read_u32()
+	a["consignment_date"] = r.read_i64()
+	a["item_type"] = r.read_u8()
+	return a
+
+## 邮件条目（ClientMail）
+static func read_client_mail(r: Reader) -> Dictionary:
+	var m := {}
+	m["mail_id"] = r.read_u64()
+	m["sender_name"] = r.read_string()
+	m["message"] = r.read_string()
+	m["opened"] = r.read_bool()
+	m["locked"] = r.read_bool()
+	m["can_reply"] = r.read_bool()
+	m["collected"] = r.read_bool()
+	m["date_sent"] = r.read_i64()
+	m["gold"] = r.read_u32()
+	var items := []
+	var icount := r.read_i32()
+	for i in range(icount):
+		items.append(read_user_item(r))
+	m["items"] = items
+	return m
+
 static func write_user_item(w: Writer, item: Dictionary) -> void:
 	w.write_u64(item.get("unique_id", 0))
 	w.write_i32(item.get("item_index", 0))
@@ -553,7 +583,10 @@ const S_COLOUR_CHANGED := 82
 const S_GAIN_EXPERIENCE := 85
 const S_LEVEL_CHANGED := 87
 const S_OBJECT_HARVEST := 90
+const S_OBJECT_HARVESTED := 91
 const S_OBJECT_NPC := 92
+const S_DEPOSIT_TRADE_ITEM := 50
+const S_RETRIEVE_TRADE_ITEM := 51
 const S_NPC_GOODS := 102
 const S_NPC_SELL := 103
 const S_NPC_REPAIR := 104
@@ -562,14 +595,33 @@ const S_NPC_STORAGE := 110
 const S_NEW_MAGIC := 117
 const S_MAGIC_LEVELED := 119
 const S_OBJECT_MAGIC := 123
-const S_OBJECT_RANGE_ATTACK := 144
+const S_RANGE_ATTACK := 126
+const S_OBJECT_RANGE_ATTACK := 143
 const S_OBJECT_HIDDEN := 147
-const S_REVIVED := 137
-const S_OBJECT_REVIVED := 138
-const S_SWITCH_GROUP := 132
-const S_DELETE_MEMBER := 134
-const S_GROUP_INVITE := 135
-const S_ADD_MEMBER := 136
+const S_REVIVED := 136
+const S_OBJECT_REVIVED := 137
+const S_SWITCH_GROUP := 131
+const S_DELETE_MEMBER := 133
+const S_GROUP_INVITE := 134
+const S_ADD_MEMBER := 135
+# 交易（Trade）
+const S_TRADE_REQUEST := 192
+const S_TRADE_ACCEPT := 193
+const S_TRADE_GOLD := 194
+const S_TRADE_ITEM := 195
+const S_TRADE_CONFIRM := 196
+const S_TRADE_CANCEL := 197
+# 寄售行（Market）
+const S_NPC_MARKET := 155
+const S_CONSIGN_ITEM := 157
+const S_MARKET_FAIL := 158
+const S_MARKET_SUCCESS := 159
+# 邮件（Mail）
+const S_RECEIVE_MAIL := 231
+const S_MAIL_SENT := 234
+const S_PARCEL_COLLECTED := 235
+# 城门
+const S_OPENDOOR := 253
 const S_BASE_STATS_INFO := 162
 const S_MARRIAGE_REQUEST := 189
 const S_FISHING_UPDATE := 200
@@ -919,6 +971,55 @@ static func decode_server_packet(id: int, payload: PackedByteArray) -> Dictionar
 				"location": read_point(r),
 				"direction": r.read_u8(),
 			}}
+		S_OBJECT_HARVESTED:
+			return {"id": id, "data": {
+				"object_id": r.read_u32(),
+				"location": read_point(r),
+				"direction": r.read_u8(),
+			}}
+		S_OPENDOOR:
+			return {"id": id, "data": {"door_index": r.read_u8(), "close": r.read_bool()}}
+		S_DEPOSIT_TRADE_ITEM, S_RETRIEVE_TRADE_ITEM:
+			return {"id": id, "data": {"from": r.read_i32(), "to": r.read_i32(), "success": r.read_bool()}}
+		S_TRADE_REQUEST, S_TRADE_ACCEPT:
+			return {"id": id, "data": {"name": r.read_string()}}
+		S_TRADE_GOLD:
+			return {"id": id, "data": {"amount": r.read_u32()}}
+		S_TRADE_ITEM:
+			var items: Array = []
+			var tcount := r.read_i32()
+			for i in range(tcount):
+				if r.read_bool():
+					items.append(read_user_item(r))
+				else:
+					items.append(null)
+			return {"id": id, "data": {"trade_items": items}}
+		S_TRADE_CONFIRM:
+			return {"id": id, "data": {}}
+		S_TRADE_CANCEL:
+			return {"id": id, "data": {"unlock": r.read_bool()}}
+		S_NPC_MARKET:
+			var listings: Array = []
+			var lcount := r.read_i32()
+			for i in range(lcount):
+				listings.append(read_client_auction(r))
+			var pages := r.read_i32()
+			var user_mode := r.read_bool()
+			return {"id": id, "data": {"listings": listings, "pages": pages, "user_mode": user_mode}}
+		S_CONSIGN_ITEM:
+			return {"id": id, "data": {"unique_id": r.read_u64(), "success": r.read_bool()}}
+		S_MARKET_FAIL:
+			return {"id": id, "data": {"reason": r.read_u8()}}
+		S_MARKET_SUCCESS:
+			return {"id": id, "data": {"message": r.read_string()}}
+		S_RECEIVE_MAIL:
+			var mails: Array = []
+			var mcount := r.read_i32()
+			for i in range(mcount):
+				mails.append(read_client_mail(r))
+			return {"id": id, "data": {"mails": mails}}
+		S_MAIL_SENT, S_PARCEL_COLLECTED:
+			return {"id": id, "data": {"result": r.read_i8()}}
 		S_NPC_REFINE:
 			return {"id": id, "data": {
 				"rate": r.read_f32(),
@@ -941,6 +1042,12 @@ static func decode_server_packet(id: int, payload: PackedByteArray) -> Dictionar
 				sec_ids.append(r.read_u32())
 			om["secondary_target_ids"] = sec_ids
 			return {"id": id, "data": om}
+		S_RANGE_ATTACK:
+			return {"id": id, "data": {
+				"target_id": r.read_u32(),
+				"target": read_point(r),
+				"spell": r.read_u8(),
+			}}
 		S_OBJECT_RANGE_ATTACK:
 			return {"id": id, "data": {
 				"object_id": r.read_u32(),

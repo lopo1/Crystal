@@ -33,8 +33,25 @@ signal return_to_login()
 signal attack_mode_changed(mode: int)
 signal peace_mode_changed(mode: int)
 signal object_harvest(object_id: int)
+signal object_harvested(object_id: int)
+signal opendoor(door_index: int, close: bool)
+signal trade_request(name: String)
+signal trade_accept(name: String)
+signal trade_gold(amount: int)
+signal trade_items(items: Array)
+signal trade_confirmed()
+signal trade_cancelled(unlock: bool)
+signal market_list(listings: Array, pages: int, user_mode: bool)
+signal consign_result(unique_id: int, success: bool)
+signal market_fail(reason: int)
+signal market_success(message: String)
+signal mailbox_loaded(mails: Array)
+signal mail_sent(result: int)
+signal parcel_collected(result: int)
 signal npc_refine(rate: float, refining: bool)
 signal object_magic(data: Dictionary)
+signal range_attack(target_id: int, target: Vector2i, spell: int)
+signal object_range_attack(data: Dictionary)
 signal new_magic(magic: Dictionary)
 signal magic_leveled(spell: int, level: int, experience: int)
 signal group_switched(allow: bool)
@@ -79,6 +96,27 @@ const ClientPacketId := {
 	"CHAT": 13,
 	"ATTACK": 47,
 	"RANGE_ATTACK": 48,
+	"HARVEST": 49,
+	"CHANGE_A_MODE": 44,
+	"OPENDOOR": 136,
+	"DEPOSIT_TRADE_ITEM": 30,
+	"RETRIEVE_TRADE_ITEM": 31,
+	"CONSIGN_ITEM": 70,
+	"MARKET_SEARCH": 71,
+	"MARKET_REFRESH": 72,
+	"MARKET_PAGE": 73,
+	"MARKET_BUY": 74,
+	"MARKET_GET_BACK": 75,
+	"MARKET_SELL_NOW": 76,
+	"SEND_MAIL": 117,
+	"READ_MAIL": 118,
+	"COLLECT_PARCEL": 119,
+	"DELETE_MAIL": 120,
+	"TRADE_REQUEST": 96,
+	"TRADE_REPLY": 97,
+	"TRADE_GOLD": 98,
+	"TRADE_CONFIRM": 99,
+	"TRADE_CANCEL": 100,
 	"MAGIC": 58,
 	"MAGIC_KEY": 59,
 	"PICK_UP": 35,
@@ -207,6 +245,178 @@ func attack(direction: int, spell: int = 0) -> void:
 	p.write_fn = func(w) -> void:
 		w.write_u8(direction)
 		w.write_u8(spell)
+	send(p)
+
+## 远程攻击（弓手）：direction 朝向 + 目标对象与目标位置（同 C# C.RangeAttack）
+func range_attack(direction: int, target_id: int, location: Vector2i, target_location: Vector2i) -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = ClientPacketId.RANGE_ATTACK
+	p.write_fn = func(w) -> void:
+		w.write_u8(direction)
+		CrystalPackets.write_point(w, location)
+		w.write_u32(target_id)
+		CrystalPackets.write_point(w, target_location)
+	send(p)
+
+## 采集（割肉）：朝向方向割取尸体
+func harvest(direction: int) -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = ClientPacketId.HARVEST
+	p.write_fn = func(w) -> void:
+		w.write_u8(direction)
+	send(p)
+
+## 切换攻击模式（0和平/1编组/2行会/3敌对行会/4红名/5全体）
+func change_a_mode(mode: int) -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = ClientPacketId.CHANGE_A_MODE
+	p.write_fn = func(w) -> void:
+		w.write_u8(mode)
+	send(p)
+
+## 开城门
+func opendoor(door_index: int) -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = ClientPacketId.OPENDOOR
+	p.write_fn = func(w) -> void:
+		w.write_u8(door_index)
+	send(p)
+
+## 发起面对面交易（须面对目标玩家）
+func trade_request() -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = ClientPacketId.TRADE_REQUEST
+	send(p)
+
+## 回应交易邀请
+func trade_reply(accept: bool) -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = ClientPacketId.TRADE_REPLY
+	p.write_fn = func(w) -> void:
+		w.write_bool(accept)
+	send(p)
+
+## 放入交易金币
+func trade_gold(amount: int) -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = ClientPacketId.TRADE_GOLD
+	p.write_fn = func(w) -> void:
+		w.write_u32(amount)
+	send(p)
+
+## 放入/取回交易物品（from/to 为槽位）
+func trade_deposit_item(from_slot: int, to_slot: int) -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = ClientPacketId.DEPOSIT_TRADE_ITEM
+	p.write_fn = func(w) -> void:
+		w.write_i32(from_slot)
+		w.write_i32(to_slot)
+	send(p)
+
+func trade_retrieve_item(from_slot: int, to_slot: int) -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = ClientPacketId.RETRIEVE_TRADE_ITEM
+	p.write_fn = func(w) -> void:
+		w.write_i32(from_slot)
+		w.write_i32(to_slot)
+	send(p)
+
+## 确认/解锁交易
+func trade_confirm(locked: bool) -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = ClientPacketId.TRADE_CONFIRM
+	p.write_fn = func(w) -> void:
+		w.write_bool(locked)
+	send(p)
+
+func trade_cancel() -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = ClientPacketId.TRADE_CANCEL
+	send(p)
+
+## 寄售行：上架/浏览/购买/取回
+func consign_item(unique_id: int, price: int, panel_type: int = 0) -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = ClientPacketId.CONSIGN_ITEM
+	p.write_fn = func(w) -> void:
+		w.write_u64(unique_id)
+		w.write_u32(price)
+		w.write_u8(panel_type)
+	send(p)
+
+func market_search(match_text: String, item_type: int = 0) -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = ClientPacketId.MARKET_SEARCH
+	p.write_fn = func(w) -> void:
+		w.write_string(match_text)
+		w.write_u8(item_type)
+		w.write_bool(false)
+		w.write_i16(0)
+		w.write_i16(0)
+		w.write_u8(0)
+	send(p)
+
+func market_page(page: int) -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = ClientPacketId.MARKET_PAGE
+	p.write_fn = func(w) -> void:
+		w.write_i32(page)
+	send(p)
+
+func market_refresh() -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = ClientPacketId.MARKET_REFRESH
+	send(p)
+
+func market_buy(auction_id: int, bid_price: int) -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = ClientPacketId.MARKET_BUY
+	p.write_fn = func(w) -> void:
+		w.write_u64(auction_id)
+		w.write_u32(bid_price)
+	send(p)
+
+func market_get_back(auction_id: int, mode: int = 0) -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = ClientPacketId.MARKET_GET_BACK
+	p.write_fn = func(w) -> void:
+		w.write_u8(mode)
+		w.write_u64(auction_id)
+	send(p)
+
+## 邮件：寄送/阅读/领取/删除
+func send_mail(to_name: String, message: String, gold: int = 0, item_uids: Array = []) -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = ClientPacketId.SEND_MAIL
+	p.write_fn = func(w) -> void:
+		w.write_string(to_name)
+		w.write_string(message)
+		w.write_u32(gold)
+		for i in range(5):
+			var uid: int = item_uids[i] if i < item_uids.size() else 0
+			w.write_u64(uid)
+		w.write_bool(false)
+	send(p)
+
+func read_mail(mail_id: int) -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = ClientPacketId.READ_MAIL
+	p.write_fn = func(w) -> void:
+		w.write_u64(mail_id)
+	send(p)
+
+func collect_parcel(mail_id: int) -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = ClientPacketId.COLLECT_PARCEL
+	p.write_fn = func(w) -> void:
+		w.write_u64(mail_id)
+	send(p)
+
+func delete_mail(mail_id: int) -> void:
+	var p := CrystalBinary.Packet.new()
+	p.packet_id = ClientPacketId.DELETE_MAIL
+	p.write_fn = func(w) -> void:
+		w.write_u64(mail_id)
 	send(p)
 
 func magic(direction: int, spell_id: int, target_id: int = 0) -> void:
@@ -636,10 +846,46 @@ func _dispatch(id: int, payload: PackedByteArray) -> void:
 			peace_mode_changed.emit(data.get("mode", 0))
 		Packets.S_OBJECT_HARVEST:
 			object_harvest.emit(data.get("object_id", 0))
+		Packets.S_OBJECT_HARVESTED:
+			object_harvested.emit(data.get("object_id", 0))
+		Packets.S_OPENDOOR:
+			opendoor.emit(data.get("door_index", 0), data.get("close", false))
+		Packets.S_TRADE_REQUEST:
+			trade_request.emit(data.get("name", ""))
+		Packets.S_TRADE_ACCEPT:
+			trade_accept.emit(data.get("name", ""))
+		Packets.S_TRADE_GOLD:
+			trade_gold.emit(data.get("amount", 0))
+		Packets.S_TRADE_ITEM:
+			trade_items.emit(data.get("trade_items", []))
+		Packets.S_TRADE_CONFIRM:
+			trade_confirmed.emit()
+		Packets.S_TRADE_CANCEL:
+			trade_cancelled.emit(data.get("unlock", true))
+		Packets.S_DEPOSIT_TRADE_ITEM, Packets.S_RETRIEVE_TRADE_ITEM:
+			pass # 槽位回执：UI 层可经 server_packet 信号取用
+		Packets.S_NPC_MARKET:
+			market_list.emit(data.get("listings", []), data.get("pages", 0), data.get("user_mode", false))
+		Packets.S_CONSIGN_ITEM:
+			consign_result.emit(data.get("unique_id", 0), data.get("success", false))
+		Packets.S_MARKET_FAIL:
+			market_fail.emit(data.get("reason", 0))
+		Packets.S_MARKET_SUCCESS:
+			market_success.emit(data.get("message", ""))
+		Packets.S_RECEIVE_MAIL:
+			mailbox_loaded.emit(data.get("mails", []))
+		Packets.S_MAIL_SENT:
+			mail_sent.emit(data.get("result", 0))
+		Packets.S_PARCEL_COLLECTED:
+			parcel_collected.emit(data.get("result", 0))
 		Packets.S_NPC_REFINE:
 			npc_refine.emit(data.get("rate", 0.0), data.get("refining", false))
 		Packets.S_OBJECT_MAGIC:
 			object_magic.emit(data)
+		Packets.S_RANGE_ATTACK:
+			range_attack.emit(data.get("target_id", 0), data.get("target", Vector2i.ZERO), data.get("spell", 0))
+		Packets.S_OBJECT_RANGE_ATTACK:
+			object_range_attack.emit(data)
 		Packets.S_NEW_MAGIC:
 			new_magic.emit(data.get("magic", {}))
 		Packets.S_MAGIC_LEVELED:

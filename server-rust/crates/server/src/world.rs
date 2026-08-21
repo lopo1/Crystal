@@ -95,6 +95,10 @@ pub struct Player {
     pub can_be_mentor: bool,
     /// 待确认的结婚邀请（对方角色名）
     pub pending_marriage: Option<String>,
+    /// 是否处于死亡状态（死亡保留：直到 TownRevive 才复活）
+    pub dead: bool,
+    /// 攻击模式（AttackMode：0=和平 1=编组 2=行会 3=敌对行会 4=红名 5=全体）
+    pub a_mode: u8,
 }
 
 /// 地面掉落物
@@ -129,11 +133,17 @@ pub struct Monster {
     pub dead: bool,
     /// 死亡后的 tick 计数（到阈值则复活）
     pub dead_ticks: u32,
+    /// 尸体是否已被采集（Harvest 割肉，同 C# Harvested）
+    pub harvested: bool,
+    /// 采集所得物品 item_index（0=不可采集）
+    pub harvest_item: i32,
     /// 攻击目标玩家 / 攻击冷却
     pub target: Option<u32>,
     pub cooldown: u32,
     /// 怪物所在地图
     pub map_index: u32,
+    /// 攻击方式：false 近战（相邻格），true 远程（射程内发射弹体）
+    pub ranged: bool,
 }
 
 /// 静态 NPC（用 ObjectPlayer 显示）
@@ -405,7 +415,7 @@ impl World {
             weapon_effect: 0,
             armour: p.armour,
             poison: 0,
-            dead: false,
+            dead: p.dead,
             hidden: false,
             effect: 0,
             wing_effect: 0,
@@ -607,10 +617,23 @@ async fn seed_world(world: &World) {
         return;
     }
     // 刷怪点数据化：怪物模板 + 每图刷怪点来自 spawn_config（唯一数据源）
-    let defs: Vec<(u16, String, u16, i32, i32, i32, u32, u32)> =
+    let defs: Vec<(u16, String, u16, i32, i32, i32, u32, u32, bool, i32)> =
         crate::spawn_config::MONSTER_TEMPLATES
             .iter()
-            .map(|t| (t.image, t.name.to_string(), t.level, t.hp, t.attack, t.defence, t.exp, t.gold))
+            .map(|t| {
+                (
+                    t.image,
+                    t.name.to_string(),
+                    t.level,
+                    t.hp,
+                    t.attack,
+                    t.defence,
+                    t.exp,
+                    t.gold,
+                    t.ranged,
+                    t.harvest_item,
+                )
+            })
             .collect();
     let mut oid = world.next_object_id();
     // 遍历所有已注册地图的配置刷怪点
@@ -641,9 +664,12 @@ async fn seed_world(world: &World) {
                     drops: vec![1, 2, 3, 4, 5],
                     dead: false,
                     dead_ticks: 0,
+                    harvested: false,
+                    harvest_item: t.9,
                     target: None,
                     cooldown: 0,
                     map_index: mi,
+                    ranged: t.8,
                 })
                 .await;
             oid += 1;
@@ -692,7 +718,8 @@ async fn seed_world(world: &World) {
                 element_orb_max: 0,
                 buffs: vec![],
                 level_effects: crystal_protocol::types::LevelEffects(0),
-            }));
+            }))
+            .await;
         world.npcs.lock().await.push(npc);
 
         // 任务管理员 NPC：触碰它(CallNPC)可对话接任务（猎杀骷髅/除蜘蛛）
@@ -840,6 +867,7 @@ async fn respawn_monsters(world: &World) {
                 if m.dead_ticks >= 30 {
                     m.dead = false;
                     m.dead_ticks = 0;
+                    m.harvested = false; // 复活后尸体可重新采集
                     m.hp = m.max_hp;
                     m.target = None;
                     m.cooldown = 0;
@@ -853,15 +881,20 @@ async fn respawn_monsters(world: &World) {
     }
 }
 
-/// 怪物 AI：索敌（感知范围）→ 追击（贪心靠近）→ 相邻攻击；目标消失则放弃仇恨。
+/// 怪物 AI：索敌（感知范围）→ 追击（贪心靠近）→ 攻击分支；目标消失则放弃仇恨。
 ///
 /// - 感知半径 `MONSTER_PERCEPTION`：进入的玩家会被设为仇恨目标（主动索敌）。
 /// - `MONSTER_LEASH`：追击超过此距离则脱战，清空仇恨。
+/// - 攻击分支：近战怪相邻格平A（`ObjectAttack`）；远程怪射程内发射弹体
+///   （`ObjectRangeAttack`，同 C# 远程怪物覆写 Attack 的表现）。
 async fn monster_ai(world: &World, db: &crate::db::Database) {
     const PERCEPTION: i32 = 5;
     const LEASH: i32 = 12;
+    /// 远程怪攻击射程
+    const RANGE: i32 = 6;
 
-    let mut attacks: Vec<(u32, u32, i32)> = Vec::new();
+    // (怪物id, 玩家id, 伤害, 是否远程)
+    let mut attacks: Vec<(u32, u32, i32, bool)> = Vec::new();
     let mut moves: Vec<(u32, Point, MirDirection)> = Vec::new();
     {
         let mut mons = world.monsters.lock().await;
@@ -875,20 +908,27 @@ async fn monster_ai(world: &World, db: &crate::db::Database) {
             if m.dead {
                 continue;
             }
-            // 主动索敌：无目标时，感知范围内的最近玩家成为目标
+            // 主动索敌：无目标时，感知范围内的最近存活玩家成为目标
             let mut target_oid = m.target;
             let mut target_loc: Option<Point> = None;
             if target_oid.is_some() {
                 let tid = target_oid.unwrap();
-                if players.get(&tid).map(|p| p.map_index == m.map_index).unwrap_or(false) {
+                let alive = players
+                    .get(&tid)
+                    .map(|p| p.map_index == m.map_index && !p.dead)
+                    .unwrap_or(false);
+                if alive {
                     target_loc = players.get(&tid).map(|p| p.location);
                 } else {
-                    target_oid = None; // 目标消失或跨图，脱战
+                    target_oid = None; // 目标消失/跨图/死亡，脱战
                 }
             }
             if target_oid.is_none() {
                 let mut nearest: Option<(u32, i32)> = None;
-                for p in players.values().filter(|p| p.map_index == m.map_index) {
+                for p in players
+                    .values()
+                    .filter(|p| p.map_index == m.map_index && !p.dead)
+                {
                     let d = manhattan(m.location, p.location);
                     if d <= PERCEPTION && nearest.map(|(_, nd)| d < nd).unwrap_or(true) {
                         nearest = Some((p.object_id, d));
@@ -912,10 +952,15 @@ async fn monster_ai(world: &World, db: &crate::db::Database) {
 
             let dist = manhattan(m.location, tloc);
             if dist <= 1 {
-                // 相邻 -> 攻击
+                // 相邻 -> 近战分支
                 let dmg = (m.attack.max(1) - players.get(&tid).map(|p| p.defence / 2).unwrap_or(0))
                     .max(1);
-                attacks.push((m.object_id, tid, dmg));
+                attacks.push((m.object_id, tid, dmg, false));
+            } else if m.ranged && dist <= RANGE {
+                // 射程内 -> 远程分支（不移动，原地射击）
+                let dmg = (m.attack.max(1) - players.get(&tid).map(|p| p.defence / 4).unwrap_or(0))
+                    .max(1);
+                attacks.push((m.object_id, tid, dmg, true));
             } else {
                 // 不相邻 -> 选择最佳可行走邻格逼近目标（可绕开简单障碍）
                 if let Some((new_loc, dir)) = world.chase_step(m.location, tloc) {
@@ -942,7 +987,45 @@ async fn monster_ai(world: &World, db: &crate::db::Database) {
             }))
             .await;
     }
-    for (mid, pid, dmg) in attacks {
+    // 应用攻击：先广播攻击动画（近战 ObjectAttack / 远程 ObjectRangeAttack），再结算伤害
+    for (mid, pid, dmg, ranged) in attacks {
+        let (mloc, mi) = {
+            let mons = world.monsters.lock().await;
+            match mons.get(&mid) {
+                Some(m) => (m.location, m.map_index),
+                None => continue,
+            }
+        };
+        let Some(p) = world.get_player(pid).await else { continue };
+        let dir = dir_from_delta(
+            (p.location.x - mloc.x).signum(),
+            (p.location.y - mloc.y).signum(),
+        );
+        if ranged {
+            world
+                .broadcast_on(mi, encode_packet(&s::ObjectRangeAttack {
+                    object_id: mid,
+                    location: mloc,
+                    direction: dir,
+                    target_id: pid,
+                    target: p.location,
+                    r#type: 0,
+                    spell: 0,
+                    level: 0,
+                }))
+                .await;
+        } else {
+            world
+                .broadcast_on(mi, encode_packet(&s::ObjectAttack {
+                    object_id: mid,
+                    location: mloc,
+                    direction: dir,
+                    spell: 0,
+                    level: 0,
+                    r#type: 0,
+                }))
+                .await;
+        }
         monster_hit_player(world, db, mid, pid, dmg).await;
     }
 }
@@ -983,6 +1066,10 @@ async fn regen_players(world: &World, db: &crate::db::Database) {
     {
         let players = world.players.lock().await;
         for p in players.values() {
+            // 死亡保留：尸体不回血、不触发自动喝药
+            if p.dead {
+                continue;
+            }
             if p.hp < p.max_hp {
                 let nhp = (p.hp + 4).min(p.max_hp);
                 let nmp = (p.mp + 2).min(p.max_mp);
@@ -1046,6 +1133,9 @@ pub async fn player_attack(
     let Some(player) = world.get_player(player_id).await else {
         return false;
     };
+    if player.dead {
+        return false;
+    }
     world
         .broadcast_on(player.map_index, encode_packet(&s::ObjectAttack {
             object_id: player_id,
@@ -1106,6 +1196,9 @@ pub async fn player_magic_attack(
     let Some(player) = world.get_player(player_id).await else {
         return false;
     };
+    if player.dead {
+        return false;
+    }
     let Some(tmpl) = crate::magics::find(spell) else {
         return false;
     };
@@ -1120,7 +1213,10 @@ pub async fn player_magic_attack(
         let mons = world.monsters.lock().await;
         'line: for step in 1..=tmpl.range as i32 {
             let pos = Point::new(player.location.x + dx * step, player.location.y + dy * step);
-            for m in mons.values().filter(|m| !m.dead && m.map_index == player.map_index && m.location == pos) {
+            if let Some(m) = mons
+                .values()
+                .find(|m| !m.dead && m.map_index == player.map_index && m.location == pos)
+            {
                 target_monster = Some((m.object_id, m.location));
                 break 'line;
             }
@@ -1184,6 +1280,80 @@ pub async fn player_magic_attack(
     // 命中结算（复用物理近战的击杀/掉落/经验逻辑）
     let dmg = (tmpl.damage + player.attack / 2 - monster_defence(world, target_id).await.max(0)).max(1);
     player_hit_monster(world, db, player_id, target_id, dmg).await;
+    true
+}
+
+/// 弓箭手远程攻击最大射程（同 C# `Globals.MaxAttackRange`）
+pub const MAX_ATTACK_RANGE: i32 = 9;
+
+/// 玩家远程攻击（弓/弩，对应 C# `PlayerObject.RangeAttack`）：
+/// 按 target_id 寻找射程内的怪物，伤害随距离衰减；表现层为
+/// 自己收到 `RangeAttack` 回执、同图广播 `ObjectRangeAttack`。
+/// 返回是否命中目标。
+pub async fn player_range_attack(
+    world: &World,
+    db: &crate::db::Database,
+    player_id: u32,
+    direction: MirDirection,
+    target_id: u32,
+    target_location: Point,
+) -> bool {
+    let Some(player) = world.get_player(player_id).await else {
+        return false;
+    };
+    if player.dead {
+        return false;
+    }
+
+    // 目标校验：必须存活、同图、在最大射程内
+    let found = {
+        let mons = world.monsters.lock().await;
+        mons.get(&target_id)
+            .filter(|m| !m.dead && m.map_index == player.map_index)
+            .map(|m| (m.location, manhattan(player.location, m.location)))
+    };
+    let Some((target_pos, dist)) = found else {
+        return false;
+    };
+    if dist > MAX_ATTACK_RANGE {
+        return false;
+    }
+    // 客户端上报的目标位置仅作参考，以服务器实测位置为准（防作弊同步）
+    let _ = target_location;
+
+    // 表现：自己收到回执 + 同图广播（含未命中也广播动作）
+    world
+        .send_to(
+            player_id,
+            encode_packet(&s::RangeAttack {
+                target_id,
+                target: target_pos,
+                spell: 0,
+            }),
+        )
+        .await;
+    world
+        .broadcast_on_except(
+            player.map_index,
+            encode_packet(&s::ObjectRangeAttack {
+                object_id: player_id,
+                location: player.location,
+                direction,
+                target_id,
+                target: target_pos,
+                r#type: 0,
+                spell: 0,
+                level: 0,
+            }),
+            player_id,
+        )
+        .await;
+
+    // 命中率随距离线性下降（同 C# chanceToHit），简化为距离越远伤害越低
+    let falloff = 1 + (MAX_ATTACK_RANGE - dist) / 3;
+    let dmg = (player.attack * falloff.max(1) + rand_range(1, 3)).max(1);
+    player_hit_monster(world, db, player_id, target_id, dmg).await;
+    damage_equipment(world, db, player_id, 0, 1).await; // 武器耐久消耗
     true
 }
 
@@ -1322,11 +1492,11 @@ async fn monster_hit_player(
             m.cooldown = 3;
         }
     }
-    let (loc, mut killer, mut hp, mut mp) = {
+    let (loc, dir, map_index, mut killer, mut hp, mut mp) = {
         let players = world.players.lock().await;
         let p = players.get(&player_id);
         match p {
-            Some(p) => (p.location, false, p.hp, p.mp),
+            Some(p) => (p.location, p.direction, p.map_index, false, p.hp, p.mp),
             None => return,
         }
     };
@@ -1355,12 +1525,22 @@ async fn monster_hit_player(
     world
         .send_to(player_id, encode_packet(&s::HealthChanged { hp, mp }))
         .await;
-    world.broadcast(encode_packet(&s::ObjectStruck {
-        object_id: monster_id,
-        attacker_id: player_id,
-        location: loc,
-        direction: MirDirection::Up,
-    }));
+    // 被击表现：自己收 Struck（同 C#），同图广播 ObjectStruck（object_id=被打者）
+    world
+        .send_to(player_id, encode_packet(&s::Struck { attacker_id: monster_id }))
+        .await;
+    world
+        .broadcast_on_except(
+            map_index,
+            encode_packet(&s::ObjectStruck {
+                object_id: player_id,
+                attacker_id: monster_id,
+                location: loc,
+                direction: dir,
+            }),
+            player_id,
+        )
+        .await;
     // 被击中：护甲耐久消耗
     damage_equipment(world, db, player_id, 1, 1).await;
     if killer {
@@ -1368,50 +1548,87 @@ async fn monster_hit_player(
     }
 }
 
-/// 玩家死亡：回城复活
+/// 玩家死亡（死亡保留）：原地倒地，不自动复活、不回城。
+/// 表现同 C# `PlayerObject.Die`：自己收 `Death`，同图广播 `ObjectDied`。
+/// 之后由玩家主动 TownRevive（或登录恢复死亡态）处理。
 pub async fn player_died(world: &World, player_id: u32) {
-    revive_player(world, player_id).await;
-}
-
-/// 复活：回城传送回出生点并恢复部分 HP/MP（死亡后自动调用，或收到 TownRevive 时调用）。
-pub async fn revive_player(world: &World, player_id: u32) {
-    // 回城：传送到可通行的出生点（在地图上找到可走的格子）
-    let spawn = {
-        let s = world.nearest_walkable(SPAWN.x, SPAWN.y);
-        Point::new(s.0, s.1)
+    let (loc, dir, map_index) = {
+        let mut players = world.players.lock().await;
+        match players.get_mut(&player_id) {
+            Some(p) => {
+                p.hp = 0;
+                p.dead = true;
+                (p.location, p.direction, p.map_index)
+            }
+            None => return,
+        }
     };
     world
         .send_to(
             player_id,
             encode_packet(&s::Death {
-                location: spawn,
-                direction: MirDirection::Up,
+                location: loc,
+                direction: dir,
             }),
         )
         .await;
-    world.broadcast(encode_packet(&s::ObjectDied {
-        object_id: player_id,
-        location: spawn,
-        direction: MirDirection::Up,
-        r#type: 0,
-    }));
-    {
-        let mut players = world.players.lock().await;
-        if let Some(p) = players.get_mut(&player_id) {
-            p.location = spawn;
-            p.hp = p.max_hp / 2;
-            p.mp = p.max_mp;
-        }
-    }
     world
-        .send_to(
-            player_id,
-            encode_packet(&s::UserLocation {
-                location: spawn,
-                direction: MirDirection::Up,
+        .broadcast_on(
+            map_index,
+            encode_packet(&s::ObjectDied {
+                object_id: player_id,
+                location: loc,
+                direction: dir,
+                r#type: 0,
             }),
         )
         .await;
+}
+
+/// 回城复活（对应 C# `PlayerObject.TownRevive`）：仅对死亡玩家生效。
+/// 传送回出生点（复用传送门的地图信息下发），满血满蓝复活；
+/// 表现：自己收 `Revived`，同图广播 `ObjectRevived`。未死亡返回 false。
+pub async fn revive_player(world: &World, player_id: u32) -> bool {
+    let is_dead = world
+        .get_player(player_id)
+        .await
+        .map(|p| p.dead)
+        .unwrap_or(false);
+    if !is_dead {
+        return false;
+    }
+
+    // 回城：传送到出生点附近可通行格
+    let (sx, sy) = world.nearest_walkable_on(0, SPAWN.x, SPAWN.y);
+    world.teleport_player(player_id, 0, sx, sy).await;
+
+    let (map_index, hp, mp) = {
+        let mut players = world.players.lock().await;
+        match players.get_mut(&player_id) {
+            Some(p) => {
+                p.dead = false;
+                p.hp = p.max_hp;
+                p.mp = p.max_mp;
+                (p.map_index, p.hp, p.mp)
+            }
+            None => return false,
+        }
+    };
+    world
+        .send_to(player_id, encode_packet(&s::HealthChanged { hp, mp }))
+        .await;
+    world.send_to(player_id, encode_packet(&s::Revived)).await;
+    world
+        .broadcast_on_except(
+            map_index,
+            encode_packet(&s::ObjectRevived {
+                object_id: player_id,
+                effect: true,
+            }),
+            player_id,
+        )
+        .await;
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -1720,6 +1937,109 @@ pub async fn pick_up(world: &World, player_id: u32, db: &crate::db::Database) {
     // 背包变化需刷新（简化：用 UserSlotsRefresh 提示，此处先发 GainedItem 即可）
 }
 
+/// 采集（Harvest）：朝向方向割取尸体，获得怪物模板配置的采集物（如肉）。
+/// 同 C# PlayerObject.Harvest：转身 → 自发 UserLocation + 广播 ObjectHarvest →
+/// 在面前一圈找 dead 且未采集的同图尸体 → 直接入包并广播 ObjectHarvested。
+pub async fn player_harvest(
+    world: &World,
+    db: &crate::db::Database,
+    player_id: u32,
+    direction: MirDirection,
+) -> bool {
+    let Some(player) = world.get_player(player_id).await else {
+        return false;
+    };
+    if player.dead {
+        return false;
+    }
+    // 转身 + 表现
+    {
+        let mut players = world.players.lock().await;
+        if let Some(p) = players.get_mut(&player_id) {
+            p.direction = direction;
+        }
+    }
+    let (loc, map_index) = {
+        let p = world.get_player(player_id).await.unwrap();
+        (p.location, p.map_index)
+    };
+    world
+        .send_to(
+            player_id,
+            encode_packet(&s::UserLocation { location: loc, direction }),
+        )
+        .await;
+    world
+        .broadcast_on_except(
+            map_index,
+            encode_packet(&s::ObjectHarvest { object_id: player_id, location: loc, direction }),
+            player_id,
+        )
+        .await;
+
+    // 在面前 3x3 范围找可采集尸体（同 C# front 周围 d=0..1）
+    let (dx, dy) = direction_offset(direction, 1);
+    let mut target: Option<(u32, i32)> = None; // (monster_id, harvest_item)
+    {
+        let mons = world.monsters.lock().await;
+        'outer: for oy in -1..=1 {
+            for ox in -1..=1 {
+                let px = loc.x + dx + ox;
+                let py = loc.y + dy + oy;
+                if let Some(m) = mons.values().find(|m| {
+                    m.dead && !m.harvested && m.map_index == map_index
+                        && m.location.x == px && m.location.y == py
+                }) {
+                    if m.harvest_item > 0 {
+                        target = Some((m.object_id, m.harvest_item));
+                        break 'outer;
+                    }
+                }
+            }
+        }
+    }
+    let Some((mid, item_index)) = target else {
+        // 没有可采集的尸体：系统提示（同 C# NoNearbyOwnedCarcasses 的简化版）
+        world
+            .send_to(
+                player_id,
+                encode_packet(&s::ObjectChat {
+                    object_id: player_id,
+                    text: "附近没有可采集的尸体".to_string(),
+                    r#type: 1,
+                }),
+            )
+            .await;
+        return false;
+    };
+
+    // 标记已采集 + 发采集物
+    if let Some(m) = world.monsters.lock().await.get_mut(&mid) {
+        m.harvested = true;
+    }
+    if db.add_item_to_inventory(player.character_index, item_index, 1).is_err() {
+        return false;
+    }
+    let item = UserItem {
+        unique_id: 0,
+        item_index,
+        count: 1,
+        ..Default::default()
+    };
+    world.send_to(player_id, encode_packet(&s::GainedItem { item })).await;
+    let (mloc, mdir) = {
+        let mons = world.monsters.lock().await;
+        mons.get(&mid).map(|m| (m.location, m.direction)).unwrap()
+    };
+    world
+        .broadcast_on(
+            map_index,
+            encode_packet(&s::ObjectHarvested { object_id: mid, location: mloc, direction: mdir }),
+        )
+        .await;
+    true
+}
+
 /// 丢弃：把背包物品丢到玩家脚下（生成地面掉落物）。成功后返回 true。
 /// `item` 为被丢弃物品的原始信息（由调用方先做 DB 扣减）。
 pub async fn drop_ground_item(world: &World, player_id: u32, item: UserItem) -> bool {
@@ -1999,6 +2319,8 @@ mod tests {
             pending_mentor: None,
             can_be_mentor: false,
             pending_marriage: None,
+            dead: false,
+            a_mode: 0,
         };
         world.players.lock().await.insert(1, player);
 
@@ -2032,14 +2354,336 @@ mod tests {
             drops: vec![],
             dead: false,
             dead_ticks: 0,
+            harvested: false,
+            harvest_item: 0,
             target: None,
             cooldown: 0,
             map_index: mi,
+            ranged: false,
         };
         world.add_monster(mk(1, 0)).await;
         world.add_monster(mk(2, 100)).await;
         let mons = world.monsters.lock().await.clone();
         assert_eq!(mons.get(&1).unwrap().map_index, 0);
         assert_eq!(mons.get(&2).unwrap().map_index, 100);
+    }
+
+    // ------------------------------------------------------------------
+    // 死亡保留 / 复活 / 远程攻击
+    // ------------------------------------------------------------------
+
+    async fn add_test_player(world: &World, oid: u32, loc: Point) {
+        let (tx, _rx) = mpsc::channel(64);
+        world.players.lock().await.insert(
+            oid,
+            Player {
+                object_id: oid,
+                account_id: "t".into(),
+                name: format!("P{oid}"),
+                class: MirClass::Warrior,
+                gender: MirGender::Male,
+                level: 5,
+                location: loc,
+                direction: MirDirection::Up,
+                max_hp: 100,
+                hp: 100,
+                max_mp: 50,
+                mp: 50,
+                attack: 10,
+                defence: 2,
+                experience: 0,
+                gold: 0,
+                weapon: 0,
+                armour: 0,
+                character_index: oid as i32,
+                sender: tx,
+                hp_changed: false,
+                equipment: std::collections::BTreeMap::new(),
+                map_index: 0,
+                auto_pot_item: 0,
+                auto_pot_hp: 0,
+                recently_sold: vec![],
+                fishing: false,
+                fishing_progress: 0,
+                auto_fish: false,
+                storage_unlocked: false,
+                pending_mentor: None,
+                can_be_mentor: false,
+                pending_marriage: None,
+                dead: false,
+                a_mode: 0,
+            },
+        );
+    }
+
+    fn test_db() -> Arc<crate::db::Database> {
+        let path = std::env::temp_dir().join(format!(
+            "crystal_world_test_{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        crate::db::Database::open(path).expect("测试数据库创建失败")
+    }
+
+    #[tokio::test]
+    async fn death_retention_keeps_corpse_until_town_revive() {
+        let world = World::new();
+        let db = test_db();
+        add_test_player(&world, 1, Point::new(420, 420)).await;
+
+        // 死亡：原地倒地，不回城不复活
+        player_died(&world, 1).await;
+        {
+            let p = world.players.lock().await.get(&1).cloned().unwrap();
+            assert!(p.dead, "死亡后应保持死亡状态");
+            assert_eq!(p.hp, 0);
+            assert_eq!(p.location, Point::new(420, 420), "尸体应留在原地");
+        }
+
+        // 死亡期间不自动回血（regen 跳过尸体）
+        regen_players(&world, &db).await;
+        let p = world.players.lock().await.get(&1).cloned().unwrap();
+        assert_eq!(p.hp, 0, "死亡期间不应回血");
+
+        // TownRevive：满状态回城复活
+        let ok = revive_player(&world, 1).await;
+        assert!(ok);
+        let p = world.players.lock().await.get(&1).cloned().unwrap();
+        assert!(!p.dead);
+        assert_eq!(p.hp, p.max_hp, "回城复活应满血");
+        assert_eq!(
+            p.location,
+            Point::new(SPAWN.x, SPAWN.y),
+            "复活应回到出生点"
+        );
+    }
+
+    #[tokio::test]
+    async fn revive_rejects_alive_player() {
+        let world = World::new();
+        add_test_player(&world, 1, Point::new(400, 400)).await;
+        assert!(!revive_player(&world, 1).await, "活人不应能回城复活");
+    }
+
+    #[tokio::test]
+    async fn range_attack_hits_within_max_range_only() {
+        let world = World::new();
+        let db = test_db();
+        add_test_player(&world, 1, Point::new(400, 400)).await;
+
+        let mk_monster = |oid: u32, loc: Point| Monster {
+            object_id: oid,
+            name: "靶子".into(),
+            image: 3,
+            location: loc,
+            direction: MirDirection::Up,
+            level: 1,
+            max_hp: 1000,
+            hp: 1000,
+            attack: 0,
+            defence: 0,
+            exp_reward: 0,
+            gold_reward: 0,
+            drops: vec![],
+            dead: false,
+            dead_ticks: 0,
+            harvested: false,
+            harvest_item: 0,
+            target: None,
+            cooldown: 0,
+            map_index: 0,
+            ranged: false,
+        };
+        // 射程内（距离 5）
+        world.add_monster(mk_monster(10, Point::new(405, 400))).await;
+        let hit = player_range_attack(&world, &db, 1, MirDirection::Right, 10, Point::new(405, 400)).await;
+        assert!(hit, "射程内的远程攻击应命中");
+        let hp = world.monsters.lock().await.get(&10).unwrap().hp;
+        assert!(hp < 1000, "命中后怪物应掉血");
+
+        // 超射程（距离 > MAX_ATTACK_RANGE）
+        world.add_monster(mk_monster(11, Point::new(400 + MAX_ATTACK_RANGE + 2, 400))).await;
+        let miss = player_range_attack(
+            &world,
+            &db,
+            1,
+            MirDirection::Right,
+            11,
+            Point::new(400 + MAX_ATTACK_RANGE + 2, 400),
+        )
+        .await;
+        assert!(!miss, "超射程的远程攻击不应命中");
+        assert_eq!(
+            world.monsters.lock().await.get(&11).unwrap().hp,
+            1000,
+            "未命中不掉血"
+        );
+    }
+
+    #[tokio::test]
+    async fn ranged_monster_shoots_without_moving() {
+        let world = World::new();
+        let db = test_db();
+        add_test_player(&world, 1, Point::new(400, 400)).await;
+        // 远程怪距玩家 4 格（>1 相邻、<=6 射程）
+        world
+            .add_monster(Monster {
+                object_id: 7,
+                name: "远程蛛".into(),
+                image: 4,
+                location: Point::new(404, 400),
+                direction: MirDirection::Left,
+                level: 4,
+                max_hp: 26,
+                hp: 26,
+                attack: 5,
+                defence: 2,
+                exp_reward: 20,
+                gold_reward: 12,
+                drops: vec![],
+                dead: false,
+                dead_ticks: 0,
+                harvested: false,
+                harvest_item: 0,
+                target: None,
+                cooldown: 0,
+                map_index: 0,
+                ranged: true,
+            })
+            .await;
+
+        monster_ai(&world, &db).await;
+
+        let p = world.players.lock().await.get(&1).cloned().unwrap();
+        assert!(p.hp < p.max_hp, "远程怪应在射程内打到玩家");
+        let m = world.monsters.lock().await.get(&7).cloned().unwrap();
+        assert_eq!(m.location, Point::new(404, 400), "远程怪射击时不应移动");
+        assert_eq!(m.target, Some(1), "应锁定仇恨目标");
+    }
+
+    #[tokio::test]
+    async fn monsters_ignore_dead_players() {
+        let world = World::new();
+        let db = test_db();
+        add_test_player(&world, 1, Point::new(400, 400)).await;
+        world
+            .add_monster(Monster {
+                object_id: 7,
+                name: "近战骷".into(),
+                image: 3,
+                location: Point::new(401, 400),
+                direction: MirDirection::Left,
+                level: 3,
+                max_hp: 20,
+                hp: 20,
+                attack: 3,
+                defence: 1,
+                exp_reward: 12,
+                gold_reward: 8,
+                drops: vec![],
+                dead: false,
+                dead_ticks: 0,
+                harvested: false,
+                harvest_item: 0,
+                target: None,
+                cooldown: 0,
+                map_index: 0,
+                ranged: false,
+            })
+            .await;
+        // 玩家死亡 -> 怪不应索敌/攻击
+        player_died(&world, 1).await;
+        monster_ai(&world, &db).await;
+        let m = world.monsters.lock().await.get(&7).cloned().unwrap();
+        assert_eq!(m.target, None, "死亡玩家不应被索敌");
+        let p = world.players.lock().await.get(&1).cloned().unwrap();
+        assert_eq!(p.hp, 0, "尸体不应再被打");
+    }
+
+    #[tokio::test]
+    async fn harvest_dead_monster_grants_item_and_marks_harvested() {
+        let world = World::new();
+        let db = test_db();
+        add_test_player(&world, 1, Point::new(400, 400)).await;
+        // 面前一格（Right -> 401,400）的可采集尸体
+        world
+            .add_monster(Monster {
+                object_id: 10,
+                name: "骷髅".into(),
+                image: 3,
+                location: Point::new(401, 400),
+                direction: MirDirection::Up,
+                level: 3,
+                max_hp: 20,
+                hp: 0,
+                attack: 0,
+                defence: 0,
+                exp_reward: 0,
+                gold_reward: 0,
+                drops: vec![],
+                dead: true,
+                dead_ticks: 1,
+                harvested: false,
+                harvest_item: 6,
+                target: None,
+                cooldown: 0,
+                map_index: 0,
+                ranged: false,
+            })
+            .await;
+        let ok = player_harvest(&world, &db, 1, MirDirection::Right).await;
+        assert!(ok, "采集可采集尸体应成功");
+        assert!(
+            world.monsters.lock().await.get(&10).unwrap().harvested,
+            "尸体应标记为已采集"
+        );
+        // 背包应出现肉(item 6)
+        let slots = db.inventory_slots(1).unwrap();
+        assert!(slots
+            .iter()
+            .any(|s| s.as_ref().map(|it| it.item_index == 6).unwrap_or(false)));
+        // 已采集的尸体不能再采
+        let again = player_harvest(&world, &db, 1, MirDirection::Right).await;
+        assert!(!again, "重复采集应失败");
+    }
+
+    #[tokio::test]
+    async fn harvest_ignores_alive_monsters_and_empty_cells() {
+        let world = World::new();
+        let db = test_db();
+        add_test_player(&world, 1, Point::new(400, 400)).await;
+        // 面前一格是活怪：不可采集
+        world
+            .add_monster(Monster {
+                object_id: 11,
+                name: "蜘蛛".into(),
+                image: 4,
+                location: Point::new(401, 400),
+                direction: MirDirection::Up,
+                level: 4,
+                max_hp: 26,
+                hp: 26,
+                attack: 5,
+                defence: 2,
+                exp_reward: 20,
+                gold_reward: 12,
+                drops: vec![],
+                dead: false,
+                dead_ticks: 0,
+                harvested: false,
+                harvest_item: 6,
+                target: None,
+                cooldown: 0,
+                map_index: 0,
+                ranged: true,
+            })
+            .await;
+        let ok = player_harvest(&world, &db, 1, MirDirection::Right).await;
+        assert!(!ok, "活怪不可采集");
+        // 空地同样失败
+        let none = player_harvest(&world, &db, 1, MirDirection::Left).await;
+        assert!(!none, "无尸体处采集应失败");
     }
 }
