@@ -562,13 +562,14 @@ const S_NPC_STORAGE := 110
 const S_NEW_MAGIC := 117
 const S_MAGIC_LEVELED := 119
 const S_OBJECT_MAGIC := 123
+const S_OBJECT_RANGE_ATTACK := 144
 const S_OBJECT_HIDDEN := 147
-const S_REVIVED := 136
-const S_OBJECT_REVIVED := 137
-const S_SWITCH_GROUP := 131
-const S_DELETE_MEMBER := 133
-const S_GROUP_INVITE := 134
-const S_ADD_MEMBER := 135
+const S_REVIVED := 137
+const S_OBJECT_REVIVED := 138
+const S_SWITCH_GROUP := 132
+const S_DELETE_MEMBER := 134
+const S_GROUP_INVITE := 135
+const S_ADD_MEMBER := 136
 const S_BASE_STATS_INFO := 162
 const S_MARRIAGE_REQUEST := 189
 const S_FISHING_UPDATE := 200
@@ -577,9 +578,9 @@ const S_FRIEND_UPDATE := 245
 const S_LOVER_UPDATE := 246
 const S_MENTOR_UPDATE := 247
 const S_DELETE_ITEM := 79
-const S_PLAYER_INSPECT := 57
-const S_LOG_OUT_SUCCESS := 58
-const S_RETURN_TO_LOGIN := 60
+const S_PLAYER_INSPECT := 58
+const S_LOG_OUT_SUCCESS := 59
+const S_RETURN_TO_LOGIN := 61
 const S_CHANGE_A_MODE := 62
 const S_CHANGE_P_MODE := 63
 const S_EQUIP_ITEM := 38
@@ -940,6 +941,17 @@ static func decode_server_packet(id: int, payload: PackedByteArray) -> Dictionar
 				sec_ids.append(r.read_u32())
 			om["secondary_target_ids"] = sec_ids
 			return {"id": id, "data": om}
+		S_OBJECT_RANGE_ATTACK:
+			return {"id": id, "data": {
+				"object_id": r.read_u32(),
+				"location": read_point(r),
+				"direction": r.read_u8(),
+				"target_id": r.read_u32(),
+				"target": read_point(r),
+				"type": r.read_u8(),
+				"spell": r.read_u8(),
+				"level": r.read_u8(),
+			}}
 		S_NEW_MAGIC:
 			return {"id": id, "data": {"magic": read_client_magic(r)}}
 		S_MAGIC_LEVELED:

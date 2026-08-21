@@ -1,0 +1,33 @@
+;Pots + Other
+
+
+;Weapons
+
+
+;Armour
+
+
+;Helmets
+
+
+;Necklace
+
+
+;Bracelets
+
+
+;Rings
+
+
+;Shoes
+
+
+;Belts
+
+
+;Stone
+
+;Quest
+
+1/1RedDagger Q
+1/1 HeartOfDead Q

@@ -1,0 +1,11 @@
+[Recipe]
+Amount 2
+Chance 50
+Gold 10
+
+[Tools]
+
+
+[Ingredients]
+Chicken 1
+CannibalLeaf 2

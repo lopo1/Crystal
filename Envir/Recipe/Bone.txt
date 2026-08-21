@@ -1,0 +1,10 @@
+[Recipe]
+Amount 10
+Chance 100
+Gold 10
+
+[Tools]
+
+
+[Ingredients]
+LargeBone 1

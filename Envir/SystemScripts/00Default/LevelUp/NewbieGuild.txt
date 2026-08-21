@@ -1,0 +1,7 @@
+[@Main]
+{
+#IF
+INGUILD NewbieGuild
+#ACT
+REMOVEFROMGUILD
+}
